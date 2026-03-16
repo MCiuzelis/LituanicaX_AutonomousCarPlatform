@@ -64,10 +64,8 @@ class ConeVisionCfg:
     min_detect_width: int = 384
     min_detect_height: int = 216
 
-    crop_top_fraction: float = 0.45    # fraction of frame rows to discard from top (sky)
-    crop_bottom_fraction: float = 0.275  # fraction of frame rows to discard from bottom (near ground)
-    near_field_fraction: float = 0.35  # bottom fraction of the CROPPED image treated as "near field"
-
+    crop_top_fraction: float = 0.5    # fraction of frame rows to discard from top (sky)
+    crop_bottom_fraction: float = 0.35  # fraction of frame rows to discard from bottom (near ground)
     # MORPH_OPEN kernel applied to each colour mask individually to remove noise.
     # 2×2 (not 3×3) so that 2-pixel wide stripes on distant cones survive.
     # A 3×3 open would erase any cluster < 9 pixels — killing small far stripes.
@@ -184,16 +182,14 @@ class ConeVisionProcessor:
         batch     = frames_np.shape[0]
 
         policy_obs = np.zeros((batch, self.obs_size), dtype=np.float32)
-        near_ratio = np.zeros(batch, dtype=np.float32)
         coverage   = np.zeros(batch, dtype=np.float32)
         debug_images: dict[str, np.ndarray] | None = None
 
         for env_id in range(batch):
-            obs_flat, near, cov, overlay_bgr, mask_bgr = self._process_frame(
+            obs_flat, cov, overlay_bgr, mask_bgr = self._process_frame(
                 frames_np[env_id]
             )
             policy_obs[env_id] = obs_flat
-            near_ratio[env_id] = near
             coverage[env_id]   = cov
 
             if debug_env_id is not None and env_id == debug_env_id:
@@ -201,7 +197,6 @@ class ConeVisionProcessor:
 
         return (
             torch.from_numpy(policy_obs),
-            torch.from_numpy(near_ratio),
             torch.from_numpy(coverage),
             debug_images,
         )
@@ -354,11 +349,9 @@ class ConeVisionProcessor:
         _, right_out = cv2.threshold(right_out, 64, 255, cv2.THRESH_BINARY)
         _, ramp_out  = cv2.threshold(ramp_out,  64, 255, cv2.THRESH_BINARY)
 
-        # 9. Coverage metrics on the combined cone output mask
-        combined   = cv2.bitwise_or(left_out, right_out)
-        near_row   = int((1.0 - self.cfg.near_field_fraction) * out_h)
-        near_ratio = float(combined[near_row:, :].mean() / 255.0)
-        coverage   = float(combined.mean() / 255.0)
+        # 9. Coverage metric on the combined cone output mask
+        combined = cv2.bitwise_or(left_out, right_out)
+        coverage = float(combined.mean() / 255.0)
 
         # 10. Policy observation: [left_channel, right_channel, ramp_channel] flattened
         obs_flat = np.stack([
@@ -375,14 +368,13 @@ class ConeVisionProcessor:
         color_layer[right_out > 0] = (255,   0,   0)    # blue   → right cones
         color_layer[ramp_out  > 0] = (180,   0, 180)    # purple → ramps
         overlay = cv2.addWeighted(out_bgr, 0.5, color_layer, 0.5, 0.0)
-        cv2.line(overlay, (0, near_row), (out_w - 1, near_row), (0, 0, 255), 1)
 
         mask_bgr = np.zeros((out_h, out_w, 3), dtype=np.uint8)
         mask_bgr[left_out  > 0] = (0,   255,   0)
         mask_bgr[right_out > 0] = (255,   0,   0)
         mask_bgr[ramp_out  > 0] = (180,   0, 180)
 
-        return obs_flat, near_ratio, coverage, overlay, mask_bgr
+        return obs_flat, coverage, overlay, mask_bgr
 
     # --------------------------------------------------------
 

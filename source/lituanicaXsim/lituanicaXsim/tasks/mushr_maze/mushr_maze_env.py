@@ -1,8 +1,9 @@
 """MuSHR nano v2 RC car — cone-track navigation environment (DirectRLEnv).
 
 Observation space:
-    [0:N]   flattened 2-channel OpenCV cone mask (left + right) from front camera
+    [0:N]   flattened 3-channel OpenCV cone mask (left / right cones + ramp) from front camera
     [N]     normalized forward linear velocity  (v / vel_cap) — vel_cap grows with curriculum
+    [N+1]   normalized body-frame yaw rate  (ang_vel_z / IMU_ANG_VEL_NORM)
 
 Camera profile (Pi Camera Module 3 Wide — VRAM-optimised training resolution):
     - Sensor: Sony IMX708, 1/2.43" format (6.45 mm × 3.63 mm at 2304×1296 mode)
@@ -178,7 +179,7 @@ POLICY_IMAGE_HEIGHT = 144
 # sub-step (force ≈ penetration_depth × PhysX_stiffness); with a high threshold the
 # robot "eases into" the wall for many sub-steps before detection triggers (~100 ms).
 # 0.05 N catches any genuine first-touch while staying above PhysX numerical noise.
-WALL_CONTACT_FORCE_THRESH = 0.0   # N
+WALL_CONTACT_FORCE_THRESH = 15.0  # N
 
 # Backup distance threshold: if the robot drifts more than this from the nearest
 
@@ -222,14 +223,14 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     # Core env parameters
     # ------------------------------------------------------------------
     decimation: int = 4                # policy at ~30 Hz (sim 120 Hz)
-    # 1200 s × 30 Hz = 36 000 steps — long enough for many laps even at low speed.
-    episode_length_s: float = 1200.0
+    # 900 s × 30 Hz = 27 000 steps — long enough for many laps even at low speed.
+    episode_length_s: float = 900.0
 
     action_space:      int = 2
     # observation_space is patched in MushrMazeEnv.__init__ using ConeVisionProcessor.
     # The placeholder below keeps @configclass happy; the real value is set before
     # super().__init__() allocates observation buffers.
-    observation_space: int = 3 * POLICY_IMAGE_WIDTH * POLICY_IMAGE_HEIGHT + 1  # 3 vision channels + 1 vel
+    observation_space: int = 3 * POLICY_IMAGE_WIDTH * POLICY_IMAGE_HEIGHT + 2  # 3 vision channels + lin_vel + yaw_rate
     state_space:       int = 0
 
     # Crop fractions are defined once in ConeVisionCfg (cone_vision.py) and used
@@ -364,7 +365,7 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     # Distance reward: rewards physical metres covered each step (v * dt), naturally
     # summing to total odometry over the episode.  Works correctly on a circular track
     # because it integrates incremental progress rather than straight-line displacement.
-    distance_weight:    float = 3   # reward per metre of forward travel
+    distance_weight:    float = 3.5   # reward per metre of forward travel
     forward_weight:     float = 1.5
 
     # Extra one-time penalty specifically for wall contact (on top of collision_penalty).
@@ -379,21 +380,28 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
 
     # Rear-wheel slip penalty: discourages wheel-locking hard braking.
     # slip_speed = |mean_rear_wheel_tangential_vel − body_forward_vel| / MAX_LIN_VEL
-    slip_weight:        float = 4.0
+    # Suppressed while on the ramp (suspension load shift makes wheel speeds noisy).
+    slip_weight:        float = 1.5
 
-    # Steering magnitude penalty using a fifth-root curve.
-    # reward = steer_shape_weight * (|steer_angle| / MAX_STEER)^(1/5)
-    # The fifth root is concave — it strongly penalises even small steering angles
-    # while the penalty saturates gently at large angles.
-    # Set negative to penalise; set to 0.0 to disable.
-    steer_shape_weight: float = 4
+    # Steering penalty with deadzone: only penalises steering beyond the deadzone,
+    # so small corrections are free but sustained large lock is penalised.
+    # Formula: -steer_deadzone_weight * max(0, |steer_norm| - deadzone) / (1 - deadzone)
+    steer_deadzone_weight: float = 0.3
+    steer_deadzone:        float = 0.05   # fraction of MAX_STEER that is penalty-free
+
+    # Dense per-step reward for closing the gap to the next sector gate.
+    # reward = sector_proximity_weight * max(0, 1 - dist / sector_proximity_max_dist)
+    # Gives a gradient toward the next gate even before it is crossed, helping
+    # agents discover the full circuit before any sector reward fires.
+    sector_proximity_weight:   float = 0.25
+    sector_proximity_max_dist: float = 10.0   # metres — reward fades to 0 beyond this
 
     # One-time bonus awarded the moment an agent completes a full lap.
     lap_completion_reward: float = 500.0
 
     # Ramp reward: per-step bonus while any robot link contacts the ramp AND forward vel > 0.
     # Reward = ramp_reward_weight * clamp(v_fwd / INITIAL_VEL_CAP, 0, 1) per step on ramp.
-    ramp_reward_weight: float = 3
+    ramp_reward_weight: float = 1.5
 
     # Slow-driving penalty: applied every step the robot is below SLOW_SPEED_FRACTION × vel_cap.
     slow_penalty_weight: float = 2 #3.0
@@ -487,8 +495,8 @@ class MushrMazeEnv(DirectRLEnv):
             )
         )
         cfg.policy_image_height = _tmp_vision.output_height
-        # 3 vision channels (left cones, right cones, ramp) + forward vel
-        cfg.observation_space   = _tmp_vision.obs_size + 1
+        # 3 vision channels (left cones, right cones, ramp) + forward vel + yaw rate
+        cfg.observation_space   = _tmp_vision.obs_size + 2
 
         super().__init__(cfg, render_mode, **kwargs)
 
@@ -1034,7 +1042,7 @@ class MushrMazeEnv(DirectRLEnv):
 
         rgb = self.camera.data.output["rgb"]  # [N, H, W, C]
         debug_env = self.cfg.camera_debug_env_id if self.cfg.show_camera_debug else None
-        camera_obs, _, _, debug_imgs = self._vision_processor.process_batch(rgb, debug_env)
+        camera_obs, _, debug_imgs = self._vision_processor.process_batch(rgb, debug_env)
 
         self._camera_obs = camera_obs.to(self.device)
 
@@ -1051,7 +1059,11 @@ class MushrMazeEnv(DirectRLEnv):
         # Forward velocity — normalised by current vel_cap (curriculum-aware)
         lin_vel_b = self.robot.data.root_lin_vel_b[:, 0:1] / self._vel_cap   # [N, 1]
 
-        obs = torch.cat([self._camera_obs, lin_vel_b], dim=-1)
+        # Body-frame yaw rate — normalised by IMU_ANG_VEL_NORM (fixed ceiling)
+        # Z-axis of body frame = yaw; positive = turning left
+        yaw_rate = self.robot.data.root_ang_vel_b[:, 2:3] / IMU_ANG_VEL_NORM  # [N, 1]
+
+        obs = torch.cat([self._camera_obs, lin_vel_b, yaw_rate], dim=-1)
         return {"policy": obs}
 
     # ------------------------------------------------------------------
@@ -1199,14 +1211,23 @@ class MushrMazeEnv(DirectRLEnv):
         ], dim=-1)                                                                 # [N, 4] rad/s
         wheel_vel    = all_wheel_omega.mean(dim=-1) * WHEEL_RADIUS                # [N] m/s
         slip_speed   = torch.abs(wheel_vel - lin_vel_b)                           # [N] m/s
-        r_slip       = -self.cfg.slip_weight * slip_speed / INITIAL_VEL_CAP
+        # Suppress slip penalty on the ramp — suspension load shift makes wheel speeds noisy.
+        r_slip       = -self.cfg.slip_weight * slip_speed / INITIAL_VEL_CAP * (~self._on_ramp).float()
 
+        # ── Steering deadzone penalty ─────────────────────────────────────────────────
+        # Steering within ±deadzone is penalty-free; beyond that a linear penalty applies.
+        # This allows small corrections without cost while discouraging sustained large lock.
+        steer_norm = torch.abs(self._filtered_steer).clamp(0.0, 1.0)
+        steer_excess = (steer_norm - self.cfg.steer_deadzone).clamp(min=0.0)
+        steer_excess_norm = steer_excess / max(1.0 - self.cfg.steer_deadzone, 1e-6)
+        r_steer_shape = -self.cfg.steer_deadzone_weight * steer_excess_norm
 
-        # ── Steering magnitude penalty (fifth-root curve) ─────────────────────────────
-        # (|steer_angle| / MAX_STEER)^(1/5) is concave: penalises small angles
-        # proportionally more than a linear term while saturating toward 1 at full lock.
-        steer_norm = torch.abs(self._filtered_steer).clamp(0.0, 1.0) < 0.05
-        r_steer_shape = self.cfg.steer_shape_weight * steer_norm
+        # ── Next-sector proximity reward ──────────────────────────────────────────────
+        # Dense per-step reward that scales with how close the agent is to the next gate.
+        # Provides a gradient toward the circuit before any sector crossing fires.
+        dist_to_gate = torch.linalg.vector_norm(pos_xy - gate_pts, dim=-1)        # [N] metres
+        proximity = (1.0 - dist_to_gate / self.cfg.sector_proximity_max_dist).clamp(0.0, 1.0)
+        r_proximity = self.cfg.sector_proximity_weight * proximity
 
 
         # ── Ramp contact reward ───────────────────────────────────────────────────────
@@ -1239,6 +1260,7 @@ class MushrMazeEnv(DirectRLEnv):
             + r_sector
             + r_ramp
             + r_lap
+            + r_proximity
         )
 
         # Accumulate per-episode return for fixed→random spawn threshold check.

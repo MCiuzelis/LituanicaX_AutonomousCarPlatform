@@ -168,7 +168,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.log_dir = log_dir
 
     # create isaac environment
-    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    # When --fpv --video: cameras are already enabled by the fpv flag; render_mode not needed.
+    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if (args_cli.video and not args_cli.fpv) else None)
 
     # Hide wall geometry in play mode — walls are only used during training to
     # penalise boundary contact; they serve no purpose during inference.
@@ -184,8 +185,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
 
-    # wrap for video recording
-    if args_cli.video:
+    # wrap for video recording (Isaac viewport — skipped when --fpv, which records the raw camera instead)
+    if args_cli.video and not args_cli.fpv:
         video_kwargs = {
             "video_folder": os.path.join(log_dir, "videos", "play"),
             "step_trigger": lambda step: step == 0,
@@ -237,7 +238,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     dt = env.unwrapped.step_dt
 
     # ── FPV setup ─────────────────────────────────────────────────────────────
-    _fpv_proc = None
+    _fpv_proc   = None
+    _fpv_writer = None
     _fpv_out_dir = "/tmp/mushr_debug"
     if args_cli.fpv:
         os.makedirs(_fpv_out_dir, exist_ok=True)
@@ -251,6 +253,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             print(f"[FPV] Display subprocess started (PID {_fpv_proc.pid})")
         else:
             print("[FPV] No $DISPLAY — writing frames to /tmp/mushr_debug/ (use feh --reload 0.25)")
+
+        if args_cli.video:
+            import time as _time
+            _cam_h = _mushr_env.cfg.camera_cfg.height
+            _cam_w = _mushr_env.cfg.camera_cfg.width
+            _fps   = round(1.0 / (env.unwrapped.cfg.decimation * env.unwrapped.cfg.sim.dt))
+            os.makedirs(os.path.join(log_dir, "videos", "play"), exist_ok=True)
+            _video_path = os.path.join(
+                log_dir, "videos", "play",
+                f"fpv_{_time.strftime('%Y%m%d_%H%M%S')}.mp4",
+            )
+            _fpv_writer = cv2.VideoWriter(
+                _video_path,
+                cv2.VideoWriter_fourcc(*"mp4v"),
+                _fps,
+                (_cam_w, _cam_h),
+            )
+            print(f"[FPV] Recording to {_video_path}  ({_cam_w}×{_cam_h} @ {_fps} fps)")
 
     def _write_atomic(path: str, img: np.ndarray) -> None:
         base, ext = os.path.splitext(path)
@@ -273,7 +293,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         raw_bgr = cv2.cvtColor(raw_np, cv2.COLOR_RGB2BGR)
         _write_atomic(os.path.join(_fpv_out_dir, "raw.png"), raw_bgr)
 
-        _, _, _, debug_imgs = _vision.process_batch(rgb, debug_env_id=0)
+        if _fpv_writer is not None:
+            _fpv_writer.write(raw_bgr)
+
+        _, _, debug_imgs = _vision.process_batch(rgb, debug_env_id=0)
         if debug_imgs is not None:
             _write_atomic(os.path.join(_fpv_out_dir, "mask.png"), debug_imgs["mask_bgr"])
     # ──────────────────────────────────────────────────────────────────────────
@@ -294,7 +317,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             policy_nn.reset(dones)
         if args_cli.fpv:
             _fpv_step()
-        if args_cli.video:
+            if args_cli.video:
+                timestep += 1
+                if timestep >= args_cli.video_length:
+                    break
+        elif args_cli.video:
             timestep += 1
             # Exit the play loop after recording one video
             if timestep == args_cli.video_length:
@@ -307,6 +334,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # close the simulator
     env.close()
+    if _fpv_writer is not None:
+        _fpv_writer.release()
+        print(f"[FPV] Video saved.")
     if args_cli.fpv and _fpv_proc is not None and _fpv_proc.poll() is None:
         _fpv_proc.terminate()
         _fpv_proc.wait()
