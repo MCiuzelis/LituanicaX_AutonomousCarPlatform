@@ -268,13 +268,12 @@ def main():
             raw_np = _to_uint8_rgb(rgb_tensor[0].cpu().numpy())
 
             # Run cone-vision pipeline
-            _, near_ratio, coverage, debug_imgs = vision.process_batch(
+            _, coverage, debug_imgs = vision.process_batch(
                 rgb_tensor, debug_env_id=0
             )
 
-            near  = float(near_ratio[0].item())
             cov   = float(coverage[0].item())
-            label = f"near={near:.3f}  cov={cov:.3f}"
+            label = f"cov={cov:.3f}"
 
             # Write frames atomically (tmp → rename) so the display subprocess
             # never reads a partially-written PNG (avoids libpng read errors).
