@@ -125,8 +125,8 @@ BASE_WIDTH      = 0.2      # m  (track width between left/right wheels)
 # vel_cap starts at INITIAL_VEL_CAP and advances toward VEL_CAP_MAX as the
 # rolling mean episode return exceeds VEL_CAP_REWARD_THRESHOLD.
 # ---------------------------------------------------------------------------
-INITIAL_VEL_CAP = 2.5    # m/s — starting velocity ceiling
-VEL_CAP_MAX     = 2.5    # m/s — absolute maximum
+INITIAL_VEL_CAP = 5    # m/s — starting velocity ceiling
+VEL_CAP_MAX     = 5    # m/s — absolute maximum
 VEL_CAP_STEP    = 0.05  # m/s — increment per curriculum advancement
 
 # ---------------------------------------------------------------------------
@@ -187,7 +187,7 @@ WALL_CONTACT_FORCE_THRESH = 15.0  # N
 # Ramp contact detection uses a lower horizontal-force threshold so shallow ramp
 # normals are still picked up while flat-ground contacts remain filtered out.
 
-SLOW_SPEED_FRACTION = 0.3
+SLOW_SPEED_FRACTION = 0.15
 
 # Robot links monitored for wall contact.
 WALL_CONTACT_LINKS = (
@@ -284,7 +284,8 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
         ),
         init_state=ArticulationCfg.InitialStateCfg(
             # TUNE: adjust pos after first run if car spawns outside the track
-            pos=(15.15, 5, 0.02),
+            pos=(7.6168, -1.31077, 0.02),
+            # pos=(15.15, 5, 0.02),
             joint_pos={
                 "back_left_wheel_throttle":    0.0,
                 "back_right_wheel_throttle":   0.0,
@@ -365,8 +366,8 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     # Distance reward: rewards physical metres covered each step (v * dt), naturally
     # summing to total odometry over the episode.  Works correctly on a circular track
     # because it integrates incremental progress rather than straight-line displacement.
-    distance_weight:    float = 3.5   # reward per metre of forward travel
-    forward_weight:     float = 1.5
+    distance_weight:    float = 6   # reward per metre of forward travel
+    forward_weight:     float = 0.5
 
     # Extra one-time penalty specifically for wall contact (on top of collision_penalty).
     wall_penalty:       float = 100
@@ -376,43 +377,52 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     # reference lap (best time per sector seen so far).  Once the reference is set,
     # any subsequent crossing that beats the reference time earns:
     #   reward = sector_gain_weight * (ref_time - sector_time) / ref_time
-    sector_gain_weight: float = 10.0
+    sector_gain_weight: float = 0
 
     # Rear-wheel slip penalty: discourages wheel-locking hard braking.
     # slip_speed = |mean_rear_wheel_tangential_vel − body_forward_vel| / MAX_LIN_VEL
     # Suppressed while on the ramp (suspension load shift makes wheel speeds noisy).
-    slip_weight:        float = 1.5
+    slip_weight:        float = 1
 
     # Steering penalty with deadzone: only penalises steering beyond the deadzone,
     # so small corrections are free but sustained large lock is penalised.
     # Formula: -steer_deadzone_weight * max(0, |steer_norm| - deadzone) / (1 - deadzone)
-    steer_deadzone_weight: float = 0.3
+    steer_deadzone_weight: float = 0.4
     steer_deadzone:        float = 0.05   # fraction of MAX_STEER that is penalty-free
 
     # Dense per-step reward for closing the gap to the next sector gate.
     # reward = sector_proximity_weight * max(0, 1 - dist / sector_proximity_max_dist)
     # Gives a gradient toward the next gate even before it is crossed, helping
     # agents discover the full circuit before any sector reward fires.
-    sector_proximity_weight:   float = 0.25
+    sector_proximity_weight:   float = 1
     sector_proximity_max_dist: float = 10.0   # metres — reward fades to 0 beyond this
 
     # One-time bonus awarded the moment an agent completes a full lap.
+    # The actual reward is scaled by (target_lap_time_s / actual_lap_time_s), clamped to
+    # [lap_time_reward_min_scale, lap_time_reward_max_scale].  A lap completed exactly at
+    # target_lap_time_s earns exactly lap_completion_reward; faster laps earn more.
     lap_completion_reward: float = 500.0
+    # Reference lap time used to normalise the completion bonus (seconds).
+    # Set to a representative "decent" lap time.  Agents faster than this earn > base reward.
+    target_lap_time_s: float = 40.0
+    # Clamp bounds on the time-based scale factor to prevent extreme values.
+    lap_time_reward_min_scale: float = 0.25   # slowest possible multiplier
+    lap_time_reward_max_scale: float = 4.0    # fastest possible multiplier
 
     # Ramp reward: per-step bonus while any robot link contacts the ramp AND forward vel > 0.
     # Reward = ramp_reward_weight * clamp(v_fwd / INITIAL_VEL_CAP, 0, 1) per step on ramp.
     ramp_reward_weight: float = 1.5
 
     # Slow-driving penalty: applied every step the robot is below SLOW_SPEED_FRACTION × vel_cap.
-    slow_penalty_weight: float = 2 #3.0
+    slow_penalty_weight: float = 1 #3.0
 
     # Fixed spawn → random spawn transition.
     # All agents spawn at fixed_spawn_pos with fixed_spawn_yaw until the rolling mean
     # episode return (over fixed_spawn_history_len episodes) exceeds fixed_spawn_reward_threshold,
     # after which random CSV-gate spawning is used for the rest of training.
-    fixed_spawn_pos:              tuple = (15.239, 5)   # world XY (Z taken from USD default)
-    fixed_spawn_yaw:              float = -math.pi / 2.0     # -90° = facing negative Y (track direction)
-    fixed_spawn_reward_threshold: float = 10.0              # mean episode return to unlock random spawning
+    fixed_spawn_pos:              tuple = (7.6168, -1.31077) #(15.239, 5)   # world XY (Z taken from USD default)
+    fixed_spawn_yaw:              float = math.radians(114.0) #-math.pi / 2.0     # -90° = facing negative Y (track direction)
+    fixed_spawn_reward_threshold: float = 9999999              # mean episode return to unlock random spawning
     fixed_spawn_history_len:      int   = 50                # rolling window size (episodes)
 
     # Low-pass filter (EMA) for steering — simulates servo bandwidth (~100 ms).
@@ -584,6 +594,12 @@ class MushrMazeEnv(DirectRLEnv):
         # Also reset to 0 mid-episode when the agent completes a full lap, so each lap
         # is counted independently and the curriculum trigger fires at most once per lap.
         self._sectors_this_ep = torch.zeros(
+            self.num_envs, dtype=torch.int32, device=self.device
+        )
+        # episode_length_buf step count at which the current lap started [N].
+        # Reset to 0 on episode reset; updated to episode_length_buf on each lap completion
+        # so multi-lap episodes measure each individual lap time, not episode time.
+        self._lap_start_step = torch.zeros(
             self.num_envs, dtype=torch.int32, device=self.device
         )
         # vel_cap that was active when each env last reset.  Curriculum only advances
@@ -1153,14 +1169,22 @@ class MushrMazeEnv(DirectRLEnv):
                 # Count laps first so the print shows the correct running total.
                 self._total_laps_completed += int(lap_agents.sum().item())
 
-                # Print each lap completion with env id, episode time, and running total.
+                # Print each lap completion with env id, lap time, reward scale, and running total.
+                dt_policy_print = self.cfg.decimation * self.cfg.sim.dt
                 for eid in lap_agents.nonzero(as_tuple=False).squeeze(-1).tolist():
-                    ep_steps = int(self.episode_length_buf[eid].item())
-                    lap_time_s = ep_steps * self.cfg.decimation * self.cfg.sim.dt
+                    ep_steps  = int(self.episode_length_buf[eid].item())
+                    lap_steps = ep_steps - int(self._lap_start_step[eid].item())
+                    lap_time_s = max(lap_steps, 1) * dt_policy_print
+                    scale = float(
+                        torch.tensor(self.cfg.target_lap_time_s / lap_time_s).clamp(
+                            self.cfg.lap_time_reward_min_scale,
+                            self.cfg.lap_time_reward_max_scale,
+                        )
+                    )
                     print(
-                        f"[Lap] env={eid:>3d}  step={ep_steps:>6d}  "
-                        f"time={lap_time_s:.1f}s  "
-                        f"total_laps={self._total_laps_completed}"
+                        f"[Lap] env={eid:>3d}  lap_time={lap_time_s:.1f}s  "
+                        f"reward={self.cfg.lap_completion_reward * scale:.0f}  "
+                        f"(×{scale:.2f})  total_laps={self._total_laps_completed}"
                     )
 
                 if not self._reference_established:
@@ -1184,9 +1208,23 @@ class MushrMazeEnv(DirectRLEnv):
                 #     self._enable_ramp()
                 #     # self._swap_walls()  # WALLS.usd is active from the start; no swap needed
 
-        # ── Lap completion bonus ───────────────────────────────────────────────────────
+        # ── Lap completion bonus (scaled by lap time) ─────────────────────────────────
         r_lap = torch.zeros(self.num_envs, device=self.device)
-        r_lap[lap_agents] = self.cfg.lap_completion_reward
+        if lap_agents.any():
+            dt_policy = self.cfg.decimation * self.cfg.sim.dt          # seconds per step
+            lap_steps = (
+                self.episode_length_buf[lap_agents].float()
+                - self._lap_start_step[lap_agents].float()
+            ).clamp(min=1.0)                                            # avoid div-by-zero
+            lap_time_s = lap_steps * dt_policy                         # [K] seconds
+            time_scale = (self.cfg.target_lap_time_s / lap_time_s).clamp(
+                self.cfg.lap_time_reward_min_scale,
+                self.cfg.lap_time_reward_max_scale,
+            )
+            r_lap[lap_agents] = self.cfg.lap_completion_reward * time_scale
+
+            # Update lap start step for the next lap (mid-episode multi-lap support).
+            self._lap_start_step[lap_agents] = self.episode_length_buf[lap_agents].int()
 
         if not self._reference_established:
             r_sector = torch.zeros(self.num_envs, device=self.device)
@@ -1364,7 +1402,7 @@ class MushrMazeEnv(DirectRLEnv):
         default_root_state = self.robot.data.default_root_state[env_ids].clone()
         default_root_state[:, :3] += self.scene.env_origins[env_ids]
 
-        SPAWN_SPEED = 2   # m/s
+        SPAWN_SPEED = 3   # m/s
 
         fx, fy = self.cfg.fixed_spawn_pos
         diff         = self._sector_gates - torch.tensor([[fx, fy]], dtype=torch.float32, device=self.device)
@@ -1376,8 +1414,8 @@ class MushrMazeEnv(DirectRLEnv):
         yaw      = torch.empty(n,    device=self.device)
 
         # ── Fixed spawn: all agents at (15.15, 6.06, 0.002) ──────────────────
-        FIXED_SPAWN_X = 15.15
-        FIXED_SPAWN_Y = 6.06
+        FIXED_SPAWN_X = 7.6168#15.15
+        FIXED_SPAWN_Y = -1.31077#6.06
         FIXED_SPAWN_Z = 0.002
         spawn_xy[:] = torch.tensor([[FIXED_SPAWN_X, FIXED_SPAWN_Y]], dtype=torch.float32, device=self.device)
         yaw[:]      = self.cfg.fixed_spawn_yaw
@@ -1421,6 +1459,7 @@ class MushrMazeEnv(DirectRLEnv):
         self._agent_spawn_vel_cap[env_ids]    = self._vel_cap
 
         self._sector_entry_step[env_ids] = 0  # fresh start for this episode
+        self._lap_start_step[env_ids]    = 0  # lap timer restarts at episode start
 
         # Signed distance from spawn to NEXT gate, clamped ≤ 0 — prevents a false
         # crossing on the very first step.
