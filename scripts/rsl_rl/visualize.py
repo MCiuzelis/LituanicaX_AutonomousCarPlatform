@@ -1,4 +1,4 @@
-"""Visualize MuSHR camera streams from Isaac Sim without running any policy.
+"""Visualize MuSHR ArduCam TOF depth stream from Isaac Sim without running any policy.
 
 The robot is spawned at its start position.  WASD keys drive it manually
 (requires pynput — install with: pip install pynput).
@@ -9,14 +9,17 @@ a second QApplication in the same process silently blocks imshow.  Running the
 display in a child process avoids the conflict entirely.
 
 Two windows are shown:
-  "Raw Camera"  — full 1152×648 RGB frame from Isaac Sim
-  "Cone Mask"   — full 1152×648 binary mask (processed from camera feed)
+  "Raw Depth"      — full-resolution depth frame, false-coloured with COLORMAP_JET
+                     (blue = far / safe, red = close / danger)
+  "Policy Depth"   — cropped + noised depth at exactly the resolution the policy
+                     network receives, also false-coloured
 
 Frames are exchanged via PNG files written to /tmp/mushr_debug/.
 Press  Ctrl+C  in this terminal  OR  Q  in any display window to stop.
 
 Usage:
-    python /home/matasciuzelis/Documents/lituanicaXsim/scripts/rsl_rl/visualize.py --task Mushr
+    python .../visualize.py --task Mushr
+    python .../visualize.py --task Mushr --crop_top 0.2 --crop_bottom 0.15
 """
 
 import argparse
@@ -25,7 +28,7 @@ import subprocess
 import sys
 import threading
 
-# Re-exec with conda's libstdc++ in LD_PRELOAD — same rationale as train.py.
+# Re-exec with conda's libstdc++ in LD_PRELOAD
 if "ISAACLAB_LIBSTDCPP_FIXED" not in os.environ:
     _conda_prefix = os.environ.get("CONDA_PREFIX")
     if _conda_prefix:
@@ -37,15 +40,15 @@ if "ISAACLAB_LIBSTDCPP_FIXED" not in os.environ:
 
 from isaaclab.app import AppLauncher
 
-parser = argparse.ArgumentParser(description="Visualize MuSHR camera streams (no policy).")
+parser = argparse.ArgumentParser(description="Visualize MuSHR TOF depth streams (no policy).")
 parser.add_argument("--task", type=str, default="Mushr", help="Gym task name.")
 parser.add_argument(
     "--crop_top", type=float, default=None,
-    help="Fraction of camera rows to discard from the top (sky). Defaults to ConeVisionCfg value.",
+    help="Override depth_crop_top_fraction (e.g. 0.15).",
 )
 parser.add_argument(
     "--crop_bottom", type=float, default=None,
-    help="Fraction of camera rows to discard from the bottom (near ground). Defaults to ConeVisionCfg value.",
+    help="Override depth_crop_bottom_fraction (e.g. 0.10).",
 )
 
 AppLauncher.add_app_launcher_args(parser)
@@ -53,35 +56,23 @@ args_cli = parser.parse_args()
 args_cli.enable_cameras = True
 
 # ── display subprocess ─────────────────────────────────────────────────────────
-# Spawned HERE — before AppLauncher initialises Isaac Sim's Qt application —
-# so it gets its own clean QApplication and cv2.imshow works normally.
-#
-# The subprocess just polls /tmp/mushr_debug/ for PNG files written by the main
-# process and calls imshow.  No shared memory or IPC needed.
 _CONDA_SP = "/home/matasciuzelis/miniconda3/envs/isaac/lib/python3.11/site-packages"
 
 _DISPLAY_SCRIPT = rf"""
 import sys, os
-
-# The conda env inherits PYTHONPATH from Isaac Lab which includes Isaac Sim's
-# pip_prebundle (headless cv2).  Strip those entries and prepend the conda
-# site-packages so the GUI-capable opencv-python is loaded first.
 sys.path = [
     "{_CONDA_SP}",
     *[p for p in sys.path if "pip_prebundle" not in p and "omni" not in p],
 ]
-
 import cv2, time, signal
-
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
 OUT_DIR = "/tmp/mushr_debug"
 FILES = [
-    (os.path.join(OUT_DIR, "raw.png"),  "Raw Camera"),
-    (os.path.join(OUT_DIR, "mask.png"), "Cone Mask"),
+    (os.path.join(OUT_DIR, "raw.png"),  "Raw Depth"),
+    (os.path.join(OUT_DIR, "policy.png"), "Policy Depth"),
 ]
 
-# Wait for the main process to write the first frame.
 while not os.path.exists(os.path.join(OUT_DIR, "raw.png")):
     time.sleep(0.05)
 
@@ -105,8 +96,6 @@ except ImportError:
 
 
 class _KeyState:
-    """Thread-safe WASD keyboard state for manual robot driving."""
-
     def __init__(self):
         self._down: set = set()
         self._lock = threading.Lock()
@@ -126,26 +115,14 @@ class _KeyState:
             pass
 
     def get_actions(self) -> tuple[float, float]:
-        """Return (throttle, steer) in [-1, 1].
-
-        When no key is pressed throttle is -1.0 (full deceleration) so the car
-        decelerates to a stop and stays still.  W overrides to full acceleration.
-        """
         with self._lock:
-            if "w" in self._down:
-                throttle = 1.0
-            elif "s" in self._down:
-                throttle = -1.0
-            else:
-                throttle = -1.0   # no key → brake to standstill
+            throttle = 1.0 if "w" in self._down else -1.0
             steer = (1.0 if "a" in self._down else 0.0) - (1.0 if "d" in self._down else 0.0)
         return throttle, steer
 
 
 display_proc = None
 if os.environ.get("DISPLAY"):
-    # Strip PYTHONPATH so Isaac Lab's prebundle paths don't leak into the
-    # display subprocess before the sys.path fix inside the script runs.
     _display_env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
     display_proc = subprocess.Popen(
         [sys.executable, "-c", _DISPLAY_SCRIPT], env=_display_env
@@ -163,35 +140,30 @@ simulation_app = app_launcher.app
 import numpy as np
 import torch
 import gymnasium as gym
-import cv2  # headless is fine here — only imwrite/cvtColor needed in main process
+import cv2  # headless fine here — only imwrite used
 
 import isaaclab_tasks  # noqa: F401
 import lituanicaXsim   # noqa: F401
 
-from lituanicaXsim.tasks.mushr_maze.mushr_maze_env import (
-    MushrMazeEnvCfg,
-    POLICY_IMAGE_WIDTH,
-    POLICY_IMAGE_HEIGHT,
-)
-from lituanicaXsim.tasks.mushr_maze.cone_vision import ConeVisionCfg, ConeVisionProcessor
+from lituanicaXsim.tasks.mushr_maze.mushr_maze_env import MushrMazeEnvCfg
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+def _depth_to_colormap(depth_float: np.ndarray) -> np.ndarray:
+    """Convert a float32 depth array (values in [0,1]) to a BGR uint8 image.
 
-def _to_uint8_rgb(frame: np.ndarray) -> np.ndarray:
-    """Convert any Isaac camera frame (uint8 or float32) to uint8 RGB [H,W,3]."""
-    if frame.shape[-1] > 3:
-        frame = frame[..., :3]
-    if frame.dtype == np.uint8:
-        return frame
-    frame = frame.astype(np.float32)
-    if frame.max() <= 1.0:
-        frame = frame * 255.0
-    return np.clip(frame, 0, 255).astype(np.uint8)
+    Uses COLORMAP_JET: blue = far/safe (0.0), red = close/danger (1.0).
+    The normalised input should be 1 - depth/depth_max so that close=1.0.
+    """
+    img8 = np.clip(depth_float * 255.0, 0, 255).astype(np.uint8)
+    return cv2.applyColorMap(img8, cv2.COLORMAP_JET)
 
 
+def _write_atomic(path: str, img: np.ndarray) -> None:
+    base, ext = os.path.splitext(path)
+    tmp = base + "_tmp" + ext
+    cv2.imwrite(tmp, img)
+    os.replace(tmp, path)
 
-# ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
     env_cfg = MushrMazeEnvCfg()
@@ -200,46 +172,34 @@ def main():
     if args_cli.device is not None:
         env_cfg.sim.device = args_cli.device
 
-    # Override camera resolution for visualisation.
-    # Training uses 640×360 to keep the TiledCamera tile small across many envs.
-    # With only 1 env here the full 1024×576 fits in VRAM easily and gives a
-    # much better raw-camera view for manual inspection.
-    # The pinhole optical parameters (focal_length, horizontal_aperture) are
-    # resolution-independent so the 120° FOV is preserved at any resolution.
-    env_cfg.camera_cfg.width  = 1024
-    env_cfg.camera_cfg.height = 576
+    # CLI overrides for crop fractions
+    if args_cli.crop_top is not None:
+        env_cfg.depth_crop_top_fraction = args_cli.crop_top
+    if args_cli.crop_bottom is not None:
+        env_cfg.depth_crop_bottom_fraction = args_cli.crop_bottom
+
+    cam_h = env_cfg.camera_cfg.height   # 180
+    cam_w = env_cfg.camera_cfg.width    # 240
+    depth_max = env_cfg.depth_max_m
+
+    crop_top_frac = env_cfg.depth_crop_top_fraction
+    crop_bot_frac = env_cfg.depth_crop_bottom_fraction
+    pol_h = max(1, int(cam_h * (1.0 - crop_top_frac - crop_bot_frac)))
+    pol_w = cam_w
 
     print("[visualize] Creating environment …")
     env = gym.make(args_cli.task, cfg=env_cfg)
     mushr_env = env.unwrapped
-
     device = mushr_env.device
-
-    cam_w = mushr_env.cfg.camera_cfg.width
-    cam_h = mushr_env.cfg.camera_cfg.height
-
-    # Cone mask at EXACT policy resolution (what the policy network receives).
-    # Camera stays at high-res for the raw view; detection still runs at 384×216
-    # (max(256, min_detect_width=384)) — identical to the training pipeline.
-    # crop_top / crop_bottom start from ConeVisionCfg defaults; CLI args override only
-    # when explicitly provided (--crop_top X  or  --crop_bottom X).
-    vision_cfg = ConeVisionCfg(
-        output_width=POLICY_IMAGE_WIDTH,              # 256
-        camera_height_width_ratio=cam_h / cam_w,     # e.g. 576/1024 = 0.5625 (16:9)
-    )
-    if args_cli.crop_top is not None:
-        vision_cfg.crop_top_fraction = args_cli.crop_top
-    if args_cli.crop_bottom is not None:
-        vision_cfg.crop_bottom_fraction = args_cli.crop_bottom
-    vision = ConeVisionProcessor(vision_cfg)
 
     out_dir = "/tmp/mushr_debug"
     os.makedirs(out_dir, exist_ok=True)
 
     print(
         f"[visualize] Camera: {cam_w}×{cam_h}  |  "
-        f"Policy mask: {vision.output_width}×{vision.output_height}  |  "
-        f"crop_top={vision_cfg.crop_top_fraction:.2f}  crop_bottom={vision_cfg.crop_bottom_fraction:.2f}"
+        f"Policy depth: {pol_w}×{pol_h}  |  "
+        f"depth_max={depth_max:.1f} m  |  "
+        f"crop_top={crop_top_frac:.2f}  crop_bottom={crop_bot_frac:.2f}"
     )
     print(f"[visualize] Frames → {out_dir}/   |   Press Ctrl+C to stop.")
 
@@ -250,7 +210,7 @@ def main():
             on_press=key_state.on_press, on_release=key_state.on_release
         )
         kb_listener.start()
-        print("[visualize] WASD controls active: W=accelerate  S=brake  A=left  D=right  (no key=stop)\n")
+        print("[visualize] WASD controls: W=accel  S=brake  A=left  D=right\n")
     else:
         print("[visualize] pynput not found — robot stays stationary.")
         print("[visualize] Install with:  pip install pynput\n")
@@ -263,36 +223,39 @@ def main():
             actions = torch.tensor([[throttle, steer]], device=device)
             env.step(actions)
 
-            # Grab raw camera frame
-            rgb_tensor = mushr_env.camera.data.output["rgb"]  # [1, H, W, C]
-            raw_np = _to_uint8_rgb(rgb_tensor[0].cpu().numpy())
+            # Grab raw depth frame [1, H, W, 1]
+            depth_tensor = mushr_env.camera.data.output["distance_to_image_plane"]
+            depth_np = depth_tensor[0, :, :, 0].cpu().numpy()  # [H, W] float32
 
-            # Run cone-vision pipeline
-            _, coverage, debug_imgs = vision.process_batch(
-                rgb_tensor, debug_env_id=0
-            )
+            # Replace inf/nan with depth_max for display
+            depth_np = np.where(np.isfinite(depth_np), depth_np, depth_max)
 
-            cov   = float(coverage[0].item())
-            label = f"cov={cov:.3f}"
-
-            # Write frames atomically (tmp → rename) so the display subprocess
-            # never reads a partially-written PNG (avoids libpng read errors).
-            def _write_atomic(path: str, img) -> None:
-                base, ext = os.path.splitext(path)
-                tmp = base + "_tmp" + ext   # e.g. raw_tmp.png — keeps codec hint
-                cv2.imwrite(tmp, img)
-                os.replace(tmp, path)
-
-            raw_bgr = cv2.cvtColor(raw_np, cv2.COLOR_RGB2BGR)
+            # ── Raw depth window (full resolution, false-coloured) ──────────────
+            # Normalise: close=1.0 (red), far=0.0 (blue)
+            raw_norm = 1.0 - np.clip(depth_np / depth_max, 0.0, 1.0)
+            raw_bgr  = _depth_to_colormap(raw_norm)
             _write_atomic(os.path.join(out_dir, "raw.png"), raw_bgr)
 
-            if debug_imgs is not None:
-                mask_bgr = debug_imgs["mask_bgr"]
-                # mask_bgr is POLICY_IMAGE_HEIGHT × POLICY_IMAGE_WIDTH (144×256).
-                # Use small font so text fits without obscuring the mask.
-                cv2.putText(mask_bgr, label, (2, POLICY_IMAGE_HEIGHT - 4),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.3, (200, 200, 200), 1, cv2.LINE_AA)
-                _write_atomic(os.path.join(out_dir, "mask.png"), mask_bgr)
+            # ── Policy depth window (cropped + noised, matches what policy sees) ─
+            top  = int(crop_top_frac * cam_h)
+            bot  = cam_h - int(crop_bot_frac * cam_h)
+            pol_np = depth_np[top:bot, :]                       # [H_crop, W]
+            # Apply same noise as the env (for accurate preview)
+            if env_cfg.depth_noise_sigma_m > 0.0:
+                pol_np = pol_np + np.random.normal(0.0, env_cfg.depth_noise_sigma_m, pol_np.shape).astype(np.float32)
+            pol_np = np.clip(pol_np, 0.01, depth_max)
+            pol_norm = 1.0 - pol_np / depth_max                 # close=1 red, far=0 blue
+            pol_bgr  = _depth_to_colormap(pol_norm)
+
+            # Overlay min/max depth stats
+            min_d = float(pol_np.min())
+            max_d_vis = float(pol_np.max())
+            label = f"min={min_d:.2f}m  max={max_d_vis:.2f}m"
+            cv2.putText(
+                pol_bgr, label, (2, pol_h - 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA,
+            )
+            _write_atomic(os.path.join(out_dir, "policy.png"), pol_bgr)
 
     except KeyboardInterrupt:
         pass

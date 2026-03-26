@@ -53,6 +53,17 @@ parser.add_argument(
     default=False,
     help="First-person view: force 1 env and open live Raw Camera + Cone Mask windows.",
 )
+parser.add_argument(
+    "--vel_cap",
+    type=float,
+    default=None,
+    help=(
+        "Override the velocity cap used during play (m/s).  "
+        "Use this to test a checkpoint at the speed it was trained at, e.g. --vel_cap 5.0.  "
+        "Sets both initial_vel_cap_m_s and vel_cap_max_m_s so the curriculum cannot "
+        "accidentally lower the cap during the play session."
+    ),
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -91,8 +102,8 @@ import cv2, time, signal
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 OUT_DIR = "/tmp/mushr_debug"
 FILES = [
-    (os.path.join(OUT_DIR, "raw.png"),  "Raw Camera"),
-    (os.path.join(OUT_DIR, "mask.png"), "Cone Mask"),
+    (os.path.join(OUT_DIR, "raw.png"),    "Raw Depth"),
+    (os.path.join(OUT_DIR, "policy.png"), "Policy Depth"),
 ]
 while not os.path.exists(os.path.join(OUT_DIR, "raw.png")):
     time.sleep(0.05)
@@ -143,6 +154,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # override configurations with non-hydra CLI arguments
     agent_cfg: RslRlBaseRunnerCfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+
+    # Override velocity cap independently of the training config.
+    # A checkpoint trained up to 5 m/s needs vel_cap=5 to run correctly;
+    # the default training config may have a lower initial_vel_cap_m_s.
+    if args_cli.vel_cap is not None:
+        env_cfg.initial_vel_cap_m_s = args_cli.vel_cap
+        env_cfg.vel_cap_max_m_s     = args_cli.vel_cap
+        env_cfg.spawn_speed_m_s     = min(args_cli.vel_cap, env_cfg.spawn_speed_m_s)
+        print(f"[play] vel_cap overridden to {args_cli.vel_cap} m/s")
 
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
@@ -244,7 +264,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if args_cli.fpv:
         os.makedirs(_fpv_out_dir, exist_ok=True)
         _mushr_env = env.unwrapped          # DirectRLEnv (MushrMazeEnv)
-        _vision    = _mushr_env._vision_processor
         if os.environ.get("DISPLAY"):
             _display_env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
             _fpv_proc = subprocess.Popen(
@@ -279,26 +298,38 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         os.replace(tmp, path)
 
     def _fpv_step() -> None:
-        """Grab camera frame, run cone-vision pipeline, write PNGs for display."""
-        rgb = _mushr_env.camera.data.output["rgb"]          # [1, H, W, C]
-        raw_np = rgb[0].cpu().numpy()
-        if raw_np.dtype != np.uint8:
-            raw_np = raw_np.astype(np.float32)
-            if raw_np.max() <= 1.0:
-                raw_np = raw_np * 255.0
-            raw_np = np.clip(raw_np, 0, 255).astype(np.uint8)
-        if raw_np.shape[-1] > 3:
-            raw_np = raw_np[..., :3]
+        """Grab depth frame, false-colour it, write PNGs for display."""
+        depth_tensor = _mushr_env.camera.data.output["distance_to_image_plane"]  # [1,H,W,1]
+        depth_np = depth_tensor[0, :, :, 0].cpu().numpy()   # [H, W] float32
 
-        raw_bgr = cv2.cvtColor(raw_np, cv2.COLOR_RGB2BGR)
+        depth_max = _mushr_env.cfg.depth_max_m
+        depth_np = np.where(np.isfinite(depth_np), depth_np, depth_max)
+
+        # Raw depth (full resolution)
+        raw_norm = 1.0 - np.clip(depth_np / depth_max, 0.0, 1.0)
+        raw_bgr  = cv2.applyColorMap(
+            np.clip(raw_norm * 255, 0, 255).astype(np.uint8), cv2.COLORMAP_JET
+        )
         _write_atomic(os.path.join(_fpv_out_dir, "raw.png"), raw_bgr)
 
         if _fpv_writer is not None:
             _fpv_writer.write(raw_bgr)
 
-        _, _, debug_imgs = _vision.process_batch(rgb, debug_env_id=0)
-        if debug_imgs is not None:
-            _write_atomic(os.path.join(_fpv_out_dir, "mask.png"), debug_imgs["mask_bgr"])
+        # Policy depth (cropped + noised, matches actual env observation)
+        h = depth_np.shape[0]
+        top = int(_mushr_env.cfg.depth_crop_top_fraction * h)
+        bot = h - int(_mushr_env.cfg.depth_crop_bottom_fraction * h)
+        pol_np = depth_np[top:bot, :]
+        if _mushr_env.cfg.depth_noise_sigma_m > 0.0:
+            pol_np = pol_np + np.random.normal(
+                0.0, _mushr_env.cfg.depth_noise_sigma_m, pol_np.shape
+            ).astype(np.float32)
+        pol_np   = np.clip(pol_np, 0.01, depth_max)
+        pol_norm = 1.0 - pol_np / depth_max
+        pol_bgr  = cv2.applyColorMap(
+            np.clip(pol_norm * 255, 0, 255).astype(np.uint8), cv2.COLORMAP_JET
+        )
+        _write_atomic(os.path.join(_fpv_out_dir, "policy.png"), pol_bgr)
     # ──────────────────────────────────────────────────────────────────────────
 
     # reset environment
