@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Isaac Lab reinforcement learning project training a **MuSHR nano v2** Ackermann/RC-car robot to navigate a cone track using PPO. The environment uses a front camera + OpenCV cone mask for observations and runs inside NVIDIA Isaac Sim via the Isaac Lab framework.
+Isaac Lab reinforcement learning project training a **MuSHR nano v2** Ackermann/RC-car robot to navigate a cone track using PPO. The environment uses an ArduCam TOF depth camera (240×180, 70° diagonal FOV) for observations — raw depth (after crop + Gaussian noise) fed directly to the policy, no OpenCV processing needed. Runs inside NVIDIA Isaac Sim via the Isaac Lab framework.
 
 **Registered gym task name: `Mushr`** (defined in `tasks/mushr_maze/__init__.py`)
 
@@ -33,16 +33,15 @@ python /home/matasciuzelis/Documents/lituanicaXsim/scripts/rsl_rl/play.py \
     --checkpoint /home/matasciuzelis/Documents/lituanicaXsim/logs/rsl_rl/mushr_maze/<run_timestamp>/model_600.pt
 ```
 
-### Camera Visualisation (no policy needed)
+### Depth Camera Visualisation (no policy needed)
 ```bash
 python /home/matasciuzelis/Documents/lituanicaXsim/scripts/rsl_rl/visualize.py --task Mushr
-# Optional: change upscale factor for cone-mask windows (default 5 → 480×270)
-python .../visualize.py --task Mushr --mask_scale 8
+# Override crop fractions:
+python .../visualize.py --task Mushr --crop_top 0.2 --crop_bottom 0.15
 ```
-Spawns 1 env, robot stationary at start. Opens three cv2 windows:
-- **Raw Camera** — full 1152×648 RGB from Isaac Sim
-- **Cone Overlay** — 96×54 upscaled; detected cones highlighted cyan, near-field line red
-- **Cone Mask** — 96×54 upscaled binary mask (what the policy network receives)
+Spawns 1 env, WASD to drive (requires pynput). Opens two cv2 windows:
+- **Raw Depth** — full 240×180 depth frame, false-coloured (blue=far/safe, red=close/danger)
+- **Policy Depth** — cropped + noised depth at exact policy resolution
 Press `Q` to quit.
 
 ### TensorBoard
