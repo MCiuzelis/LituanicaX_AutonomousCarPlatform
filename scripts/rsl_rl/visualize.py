@@ -1,18 +1,15 @@
-"""Visualize MuSHR ArduCam TOF depth stream from Isaac Sim without running any policy.
+"""Visualize MuSHR dual ArduCam TOF depth streams from Isaac Sim without running any policy.
 
 The robot is spawned at its start position.  WASD keys drive it manually
 (requires pynput — install with: pip install pynput).
 
-A separate display subprocess (spawned BEFORE Isaac Sim starts) owns the
-cv2.imshow windows.  Isaac Sim runs its own Qt application internally; creating
-a second QApplication in the same process silently blocks imshow.  Running the
-display in a child process avoids the conflict entirely.
+A separate display subprocess owns the cv2.imshow windows (avoids Qt conflict).
 
-Two windows are shown:
-  "Raw Depth"      — full-resolution depth frame, false-coloured with COLORMAP_JET
-                     (blue = far / safe, red = close / danger)
-  "Policy Depth"   — cropped + noised depth at exactly the resolution the policy
-                     network receives, also false-coloured
+Four windows are shown:
+  "Left Raw Depth"      — full-resolution left-camera depth, false-coloured COLORMAP_JET
+  "Left Policy Depth"   — cropped+noised left depth at exact policy resolution
+  "Right Raw Depth"     — full-resolution right-camera depth
+  "Right Policy Depth"  — cropped+noised right depth
 
 Frames are exchanged via PNG files written to /tmp/mushr_debug/.
 Press  Ctrl+C  in this terminal  OR  Q  in any display window to stop.
@@ -69,11 +66,13 @@ signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
 OUT_DIR = "/tmp/mushr_debug"
 FILES = [
-    (os.path.join(OUT_DIR, "raw.png"),  "Raw Depth"),
-    (os.path.join(OUT_DIR, "policy.png"), "Policy Depth"),
+    (os.path.join(OUT_DIR, "raw_left.png"),    "Left Raw Depth"),
+    (os.path.join(OUT_DIR, "policy_left.png"), "Left Policy Depth"),
+    (os.path.join(OUT_DIR, "raw_right.png"),   "Right Raw Depth"),
+    (os.path.join(OUT_DIR, "policy_right.png"),"Right Policy Depth"),
 ]
 
-while not os.path.exists(os.path.join(OUT_DIR, "raw.png")):
+while not os.path.exists(os.path.join(OUT_DIR, "raw_left.png")):
     time.sleep(0.05)
 
 while True:
@@ -178,8 +177,8 @@ def main():
     if args_cli.crop_bottom is not None:
         env_cfg.depth_crop_bottom_fraction = args_cli.crop_bottom
 
-    cam_h = env_cfg.camera_cfg.height   # 180
-    cam_w = env_cfg.camera_cfg.width    # 240
+    cam_h = env_cfg.camera_left_cfg.height   # 180
+    cam_w = env_cfg.camera_left_cfg.width    # 240
     depth_max = env_cfg.depth_max_m
 
     crop_top_frac = env_cfg.depth_crop_top_fraction
@@ -217,45 +216,37 @@ def main():
 
     env.reset()
 
+    def _write_camera(camera, suffix: str) -> None:
+        """Process one camera and write raw_{suffix}.png + policy_{suffix}.png."""
+        depth_tensor = camera.data.output["distance_to_image_plane"]  # [1, H, W, 1]
+        depth_np = depth_tensor[0, :, :, 0].cpu().numpy()
+        depth_np = np.where(np.isfinite(depth_np), depth_np, depth_max)
+        raw_norm = 1.0 - np.clip(depth_np / depth_max, 0.0, 1.0)
+        _write_atomic(os.path.join(out_dir, f"raw_{suffix}.png"), _depth_to_colormap(raw_norm))
+        top  = int(crop_top_frac * cam_h)
+        bot  = cam_h - int(crop_bot_frac * cam_h)
+        pol_np = depth_np[top:bot, :]
+        if env_cfg.depth_noise_sigma_m > 0.0:
+            pol_np = pol_np + np.random.normal(
+                0.0, env_cfg.depth_noise_sigma_m, pol_np.shape
+            ).astype(np.float32)
+        pol_np   = np.clip(pol_np, 0.01, depth_max)
+        pol_norm = 1.0 - pol_np / depth_max
+        pol_bgr  = _depth_to_colormap(pol_norm)
+        min_d, max_d_vis = float(pol_np.min()), float(pol_np.max())
+        cv2.putText(
+            pol_bgr, f"min={min_d:.2f}m  max={max_d_vis:.2f}m",
+            (2, pol_h - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA,
+        )
+        _write_atomic(os.path.join(out_dir, f"policy_{suffix}.png"), pol_bgr)
+
     try:
         while simulation_app.is_running():
             throttle, steer = key_state.get_actions()
             actions = torch.tensor([[throttle, steer]], device=device)
             env.step(actions)
-
-            # Grab raw depth frame [1, H, W, 1]
-            depth_tensor = mushr_env.camera.data.output["distance_to_image_plane"]
-            depth_np = depth_tensor[0, :, :, 0].cpu().numpy()  # [H, W] float32
-
-            # Replace inf/nan with depth_max for display
-            depth_np = np.where(np.isfinite(depth_np), depth_np, depth_max)
-
-            # ── Raw depth window (full resolution, false-coloured) ──────────────
-            # Normalise: close=1.0 (red), far=0.0 (blue)
-            raw_norm = 1.0 - np.clip(depth_np / depth_max, 0.0, 1.0)
-            raw_bgr  = _depth_to_colormap(raw_norm)
-            _write_atomic(os.path.join(out_dir, "raw.png"), raw_bgr)
-
-            # ── Policy depth window (cropped + noised, matches what policy sees) ─
-            top  = int(crop_top_frac * cam_h)
-            bot  = cam_h - int(crop_bot_frac * cam_h)
-            pol_np = depth_np[top:bot, :]                       # [H_crop, W]
-            # Apply same noise as the env (for accurate preview)
-            if env_cfg.depth_noise_sigma_m > 0.0:
-                pol_np = pol_np + np.random.normal(0.0, env_cfg.depth_noise_sigma_m, pol_np.shape).astype(np.float32)
-            pol_np = np.clip(pol_np, 0.01, depth_max)
-            pol_norm = 1.0 - pol_np / depth_max                 # close=1 red, far=0 blue
-            pol_bgr  = _depth_to_colormap(pol_norm)
-
-            # Overlay min/max depth stats
-            min_d = float(pol_np.min())
-            max_d_vis = float(pol_np.max())
-            label = f"min={min_d:.2f}m  max={max_d_vis:.2f}m"
-            cv2.putText(
-                pol_bgr, label, (2, pol_h - 4),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA,
-            )
-            _write_atomic(os.path.join(out_dir, "policy.png"), pol_bgr)
+            _write_camera(mushr_env.camera_left,  "left")
+            _write_camera(mushr_env.camera_right, "right")
 
     except KeyboardInterrupt:
         pass

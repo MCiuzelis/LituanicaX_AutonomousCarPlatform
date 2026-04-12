@@ -1,15 +1,11 @@
 """MuSHR nano v2 RC car — cone-track navigation environment (DirectRLEnv).
 
 Observation space:
-    [0:N]   flattened depth image from ArduCam TOF camera, after top/bottom crop,
-            with Gaussian noise added to simulate real-world 2 cm depth accuracy.
+    [0:N]   flattened depth image from LEFT ArduCam TOF camera (−35° yaw), after crop.
             Normalized: 1.0 = object at 0 m (danger), 0.0 = object at depth_max_m (clear).
-    [N:N+L] 360° LiDAR scan (L=450 rays, 0.8° resolution, 12 m max).
-            Normalized: 0.0 = wall at sensor, 1.0 = clear (≥12 m).  ±30 mm noise applied.
-    [N+L]   normalized forward linear velocity  (v / vel_cap) — vel_cap grows with curriculum
-    [N+L+1] normalized body-frame yaw rate  (ang_vel_z / imu_ang_vel_norm)
-    [N+L+2] previous throttle command ∈ [-1, 1]   (only if include_prev_action=True)
-    [N+L+3] previous steering command ∈ [-1, 1]   (only if include_prev_action=True)
+    [N:2N]  flattened depth image from RIGHT ArduCam TOF camera (+35° yaw), same pipeline.
+    [2N]    normalized forward linear velocity  (v / vel_cap) — vel_cap grows with curriculum
+    [2N+1 … 2N+10]  last 5 throttle+steer pairs, oldest→newest ∈ [-1, 1]  (only if include_prev_action=True)
 
 Camera profile (ArduCam TOF sensor for Raspberry Pi):
     - Sensor: Time-of-Flight depth, 240×180 pixels at 30 fps
@@ -26,8 +22,8 @@ Action space (2):
     [1]  steering command in [-1, 1]  → scaled to [-max_steer_rad, +max_steer_rad]
 
 Actuation (Ackermann / AWD):
-    - All 4 wheels receive a velocity target (rad/s) = commanded_vel / WHEEL_RADIUS
-    - Front wheels receive a position target (rad) = tan(steering_angle)
+    - All 4 wheels receive the same velocity target (rad/s) = commanded_vel / WHEEL_RADIUS
+    - Front wheel steer receives position target (rad) = tan(steering_angle)
       (tan-convention matches the joint representation in mushr_nano_v2.usd)
 
 Why depth camera vs RGB cone mask:
@@ -53,7 +49,6 @@ TUNING NOTES (first run):
 
 from __future__ import annotations
 
-from collections import deque
 from collections.abc import Sequence
 import csv
 import math
@@ -67,8 +62,6 @@ from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import ContactSensor, ContactSensorCfg
-from isaaclab.sensors import MultiMeshRayCaster, MultiMeshRayCasterCfg, RayCasterCfg
-from isaaclab.sensors.ray_caster import patterns as ray_patterns
 try:
     from isaaclab.sensors import TiledCamera, TiledCameraCfg
 except Exception:  # pragma: no cover
@@ -156,18 +149,18 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
 
     # ── Core env parameters ────────────────────────────────────────────────
     decimation:        int   = 4      # policy at ~30 Hz  (sim 120 Hz / 4)
-    episode_length_s:  float = 900.0  # 900 s × 30 Hz = 27 000 steps
+    episode_length_s:  float = 200.0  # 200 s × 30 Hz = 6 000 steps
     action_space:      int   = 2
     # observation_space is patched in MushrMazeEnv.__init__ after computing
     # the exact cropped depth image size.  The placeholder below keeps
-    # @configclass happy; the real value is written before super().__init__().
+    # @configclass happy; the real value is wri1tten before super().__init__().
     observation_space: int   = 1      # patched in __init__
     state_space:       int   = 0
 
     sim: SimulationCfg = SimulationCfg(dt=1.0 / 120.0, render_interval=4)
 
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=12,
+        num_envs=40,
         env_spacing=0.0,
         replicate_physics=True,
     )
@@ -178,7 +171,7 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     # Crop fractions (fraction of raw pixel rows discarded before the policy):
     #   top  → removes ceiling / sky (depth = max / inf)
     #   bottom → removes near-ground clutter and the robot's own body shadow
-    depth_crop_top_fraction:    float = 0.4
+    depth_crop_top_fraction:    float = 0.475
     depth_crop_bottom_fraction: float = 0.0
 
     # Gaussian depth noise: σ ≈ 0.007 m gives a ±2 cm (3σ) error band,
@@ -194,13 +187,12 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     # the observation vector.  Smaller = faster MLP convergence.
     # policy_depth_height < 0 → auto-compute from cropped aspect ratio.
     # Default 80×33 = 2640 dims (vs 240×99 = 23 760 without downsampling).
-    policy_depth_width:  int = 100
+    policy_depth_width:  int = 80
     policy_depth_height: int = -1   # -1 = auto
 
     # ════════════════════════════════════════════════════════════════════════
     # SPAWN — initial robot position, heading, and speed
     # ════════════════════════════════════════════════════════════════════════
-    spawn_speed_m_s:   float = 2.5   # initial forward speed at episode start (m/s)
     # Grace period after each reset: wall / flip / stuck terminations are suppressed
     # for this many policy steps so that PhysX contact forces can settle.
     # 10 steps ≈ 333 ms at 30 Hz — enough for any spawn-physics transient.
@@ -222,44 +214,43 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
         # (x_m, y_m, theta_deg)  — replace with real track coordinates.
         (7.6168,  -1.31077, 116.0),   # main start/finish
         (15.15,     5.0,      -90.0),   # example: tight right-hander
-        (10.295,     1.847,     18.0),   # example: ramp approach
-        (12.542,    9.8085,     -2.0),
-        (15.247,    -7.292,     -95),
+        # (10.295,     1.847,     18.0),   # example: ramp approach
+        # (12.542,    9.8085,     -2.0),
+        # (15.247,    -7.292,     -95),
         (12.191,    -7.7997,    111),
-        (8.840,     -8.089,     -93),
+        # (8.840,     -8.089,     -93),
         (5.540,     -9.1814,    88),
-        (12.326,    -3.5450,    53),
-        (10.799,    -0.5676,    -121),
+        # (12.326,    -3.5450,    53),
+        # (10.799,    -0.5676,    -121),
         (6.0156,    8.81074,    28),
         (11.60,     2.4047,     38),
     ]
-    spawn_yaw_jitter_rad: float = 0.1   # ± heading noise applied in both modes
+    spawn_yaw_jitter_rad: float = 0.15   # ± heading noise applied in both modes
 
     # ════════════════════════════════════════════════════════════════════════
     # VELOCITY CURRICULUM
     # vel_cap starts at initial_vel_cap_m_s and steps up each time any agent
     # completes a full lap, up to vel_cap_max_m_s.
     # ════════════════════════════════════════════════════════════════════════
-    initial_vel_cap_m_s: float = 2.5   # starting speed ceiling (m/s)
-    vel_cap_max_m_s:     float = 5.0   # absolute maximum speed (m/s)
-    vel_cap_step_m_s:    float = 0.25  # speed ceiling increment per lap (m/s)
+    initial_vel_cap_m_s: float = 3.0   # starting speed ceiling (m/s)
+    vel_cap_max_m_s:     float = 7.0   # absolute maximum speed (m/s)
+    vel_cap_step_m_s:    float = 0.05  # speed ceiling increment per lap (m/s)
+    spawn_vel_min_m_s:   float = 2.0  # minimum spawn speed (m/s); mirrors initial_vel_cap_m_s for training
+    spawn_vel_max_m_s:   float = 4.5  # maximum spawn speed (m/s)
 
     # ════════════════════════════════════════════════════════════════════════
     # DYNAMICS
     # ════════════════════════════════════════════════════════════════════════
-    # Acceleration limits (AWD, rubber-on-court friction):
-    #   μ_s × g = 0.8 × 9.81 ≈ 7.85 → 7.8 m/s²
-    #   μ_d × g = 0.7 × 9.81 ≈ 6.87 → 6.9 m/s²
+    # Acceleration / deceleration limits (AWD, rubber-on-court friction, all 4 wheels driven):
+    #   Accel: μ_s × g = 0.8 × 9.81 ≈ 7.8 m/s²  (all wheels contribute)
+    #   Decel: μ_d × g = 0.7 × 9.81 ≈ 6.9 m/s²  (all wheels brake)
     max_accel_m_s2:  float = 7.8    # max forward acceleration
     max_decel_m_s2:  float = 6.9    # max braking deceleration
     max_steer_rad:   float = 0.488  # ≈28° max front-wheel steer angle
 
-    # IMU angular-velocity normalization ceiling for the yaw-rate observation.
-    imu_ang_vel_norm: float = 10.0  # rad/s (generous ceiling for fast cornering)
-
     # Steering EMA low-pass filter coefficient (simulates servo bandwidth ≈100 ms).
     # alpha = 1 − exp(−dt/τ), dt ≈ 1/30 s → alpha=0.4 gives τ ≈ 76 ms.
-    action_lpf_alpha_steer: float = 0.4
+    action_lpf_alpha_steer: float = 0.5
 
     # ════════════════════════════════════════════════════════════════════════
     # TERMINATION THRESHOLDS
@@ -267,62 +258,18 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     # Horizontal contact force on any robot link that counts as a wall hit.
     wall_contact_force_thresh_n: float = 15.0  # Newtons
 
-    # Speed fraction thresholds (two separate knobs):
-    #   slow_penalty_speed_fraction — slow-penalty fires every step below this
-    #     (use 0.0 to disable; do NOT set high or you penalise deliberate braking)
-    #   slow_stop_speed_fraction    — episode terminates when speed falls below this
-    #     (catches truly stuck / reversed agents; keep low so normal braking is fine)
-    slow_penalty_speed_fraction: float = 0.0   # disabled — braking is desired behaviour
-    slow_stop_speed_fraction:    float = 0.03  # terminate if speed < 3 % of vel_cap
-
-    # ════════════════════════════════════════════════════════════════════════
-    # LIDAR (360° horizontal scan — real-world analogue: RPLIDAR A1/A2)
-    # ════════════════════════════════════════════════════════════════════════
-    # Simulates a single-plane 360° LiDAR with specs matching the user's sensor:
-    #   Range        : 0.02 mm – 12 m       → max_distance = 12.0 m
-    #   Scan freq    : 10 Hz                (≈ every 3 policy steps at 30 Hz)
-    #   Ranging freq : 4 500 Hz             → 450 samples/rev → 0.8°/sample
-    #   Accuracy     : ±30 mm (1-σ noise)   → lidar_noise_sigma_m = 0.03
-    #
-    # Rays cast against /World/Walls only (cones have no CollisionAPI).
-    # The 450-dim normalized distance vector is appended to the policy obs.
-    lidar_cfg: MultiMeshRayCasterCfg = MultiMeshRayCasterCfg(
-        prim_path="/World/envs/env_.*/Robot/mushr_nano/base_link",
-        # Cones (/World/Track) and ramps (/World/Ramps) — walls excluded.
-        # RayCaster reads UsdGeom.Mesh visual geometry directly; CollisionAPI is
-        # NOT required, so cones stay collision-free (no jiggling).
-        # Walls are invisible to the policy — ContactSensor termination only.
-        mesh_prim_paths=[
-            MultiMeshRayCasterCfg.RaycastTargetCfg(
-                prim_expr="/World/Track",
-                is_shared=True,
-                track_mesh_transforms=False,
-            ),
-            MultiMeshRayCasterCfg.RaycastTargetCfg(
-                prim_expr="/World/Ramps",
-                is_shared=True,
-                track_mesh_transforms=False,
-            ),
-        ],
-        pattern_cfg=ray_patterns.LidarPatternCfg(
-            channels=1,
-            vertical_fov_range=(0.0, 0.0),   # single horizontal plane
-            horizontal_fov_range=(0.0, 360.0),
-            horizontal_res=0.8,              # 360 / 0.8 = 450 rays
-        ),
-        max_distance=12.0,
-        ray_alignment="base",
-        offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.05)),  # 5 cm above base_link
-    )
-    lidar_noise_sigma_m: float = 0.03   # ±30 mm sensor accuracy
+    # slow_stop_speed_fraction — episode terminates when speed falls below this
+    # (catches truly stuck / reversed agents; keep low so normal braking is fine)
+    slow_stop_speed_fraction:    float = 0.04  # terminate if speed < 3 % of vel_cap
 
     # ════════════════════════════════════════════════════════════════════════
     # OBSERVATION EXTRAS
     # ════════════════════════════════════════════════════════════════════════
-    # Append the previous policy action (throttle + steer, each ∈ [-1,1]) to
-    # the observation.  Strongly recommended: gives the policy temporal context
-    # so it can learn to anticipate braking rather than react after a collision.
-    include_prev_action: bool = True
+    # Append the previous policy actions (throttle + steer, each ∈ [-1,1]) to
+    # the observation.  With forward velocity removed, this is the policy's only
+    # speed cue — longer history allows better speed inference from throttle commands.
+    include_prev_action:  bool = True
+    action_history_steps: int  = 15   # number of past (throttle, steer) pairs to include
 
     # ════════════════════════════════════════════════════════════════════════
     # REWARD WEIGHTS
@@ -331,49 +278,46 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     distance_weight:    float = 6.0
 
     # Speed bonus, normalised by initial_vel_cap_m_s (fixed scale across curriculum).
-    forward_weight:     float = 0.1
+    forward_weight:     float = 1.5
 
     # Extra penalty for wall contact (on top of the base collision cost).
-    wall_penalty:       float = 20.0
+    wall_penalty:       float = 30
 
     # Sector timing improvement reward.
     # Fires every time an agent crosses a sector gate faster than the global reference.
     # reward = sector_gain_weight × (ref_time - sector_time) / ref_time
     # This is the primary incentive for racing lines and faster cornering.
-    sector_gain_weight: float = 200.0
+    sector_gain_weight: float = 200
 
     # Rear-wheel slip penalty.
-    slip_weight:        float = 1.0
+    slip_weight:        float = 0
 
     # Steering deadzone penalty: only penalises steering beyond the deadzone.
-    steer_deadzone_weight: float = 0.05
+    steer_deadzone_weight: float = 0.15
     steer_deadzone:        float = 0.05   # fraction of max_steer_rad that is free
 
     # Dense per-step proximity reward toward the next sector gate.
-    sector_proximity_weight:   float = 0
+    sector_proximity_weight:   float = 1.0
     sector_proximity_max_dist: float = 10.0   # metres — reward fades to 0 beyond this
 
-    # Lap completion bonus (scaled by lap time relative to target_lap_time_s).
-    lap_completion_reward:       float = 1000.0
-    target_lap_time_s:           float = 28.0   # agents at ~36s; target ahead to keep gradient
-    lap_time_reward_min_scale:   float = 0.25
-    lap_time_reward_max_scale:   float = 8.0    # up from 4.0 — bigger spread for faster laps
+    # Lap completion bonus — linear interpolation between two (time, reward) anchors.
+    # reward = lap_reward_slow + (lap_reward_slow_time_s - lap_time) /
+    #          (lap_reward_slow_time_s - lap_reward_fast_time_s) * (lap_reward_fast - lap_reward_slow)
+    # Clamped at lap_reward_slow as floor; extrapolates above lap_reward_fast for sub-30s laps.
+    lap_reward_slow_time_s: float = 40.0    # reference slow lap time (s)
+    lap_reward_slow:        float = 200.0   # reward at slow reference time
+    lap_reward_fast_time_s: float = 30.0    # reference fast lap time (s)
+    lap_reward_fast:        float = 500.0   # reward at fast reference time
 
-    # Ramp speed cap — prevents flying off ramp peaks at full vel_cap speed.
-    # When the robot base is elevated (on_ramp), _current_vel is clamped to this value.
-    ramp_max_speed_m_s: float = 3.0
+    # Ramp per-step reward (while robot base is elevated on the ramp surface).
+    ramp_reward_weight: float = 0.1
 
-    # Ramp per-step reward (while any robot link touches the ramp).
-    ramp_reward_weight: float = 1
-
-    # Slow-driving penalty (per step below slow_speed_fraction × vel_cap).
-    slow_penalty_weight: float = 1.0
-
-    # ════════════════════════════════════════════════════════════════════════
-    # FIXED → RANDOM SPAWN TRANSITION
-    # ════════════════════════════════════════════════════════════════════════
-    fixed_spawn_reward_threshold: float = 9_999_999  # effectively disabled (fixed spawn always)
-    fixed_spawn_history_len:      int   = 50
+    # Ramp speed penalty: fires every step the robot is inside the ramp XY bounding
+    # box (or within ramp_approach_radius_m of it) and its forward speed exceeds
+    # ramp_speed_threshold_m_s.  Penalty scales linearly with the excess speed.
+    ramp_speed_threshold_m_s:  float = 3.0
+    ramp_speed_penalty_weight: float = 3
+    ramp_approach_radius_m:    float = 4.0  # extend penalty zone this far beyond ramp bbox
 
     # ════════════════════════════════════════════════════════════════════════
     # HARDWARE CONFIG  (robot articulation + camera sensor)
@@ -430,18 +374,27 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
             ),
             "front_throttle": ImplicitActuatorCfg(
                 joint_names_expr=["front_left_wheel_throttle", "front_right_wheel_throttle"],
-                stiffness=0.0, damping=1000.0,
+                stiffness=0.0, damping=1000.0,   # active — AWD, front wheels driven
                 velocity_limit_sim=450.0, effort_limit_sim=0.5,
             ),
         },
     )
 
-    # ArduCam TOF depth camera — 240×180, 30 fps, 70° diagonal FOV.
-    # data_types=["distance_to_image_plane"]: perpendicular depth in metres,
-    # matching what a real TOF sensor measures.
-    camera_cfg: TiledCameraCfg = TiledCameraCfg(
-        prim_path="/World/envs/env_.*/Robot/mushr_nano/base_link/front_camera",
-        update_period=0.0,    # render once per policy step (render_interval=4 → 30 Hz)
+    # Two ArduCam TOF depth cameras — identical specs, 2 cm behind base_link origin,
+    # 1 cm apart (1 cm left / 1 cm right of centre), each tilted 5° downward.
+    #
+    # Rotation derivation:
+    #   Start: q_forward = (-0.5, 0.5, -0.5, 0.5)  (camera level, pointing fwd)
+    #   Yaw  : q_yaw_z(±35°) * q_forward
+    #             left  (+35°): (-0.6272, 0.6272, -0.3265, 0.3265)
+    #             right (-35°): (-0.3265, 0.3265, -0.6272, 0.6272)
+    #   Pitch: right-multiply by q_cam_X(+5°) = (0.9990, 0.04362, 0, 0)
+    #          (rotates +5° around camera-local X → tilts Z-forward toward Y-down)
+    #             left  final: (-0.6540, 0.5992, -0.3119, 0.3404)
+    #             right final: (-0.3404, 0.3119, -0.5992, 0.6540)
+    camera_left_cfg: TiledCameraCfg = TiledCameraCfg(
+        prim_path="/World/envs/env_.*/Robot/mushr_nano/base_link/camera_left",
+        update_period=0.0,
         height=180,
         width=240,
         data_types=["distance_to_image_plane"],
@@ -449,11 +402,30 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
             focal_length=_TOF_FOCAL_MM,
             horizontal_aperture=_TOF_H_APERTURE_MM,
             vertical_aperture=_TOF_V_APERTURE_MM,
-            clipping_range=(0.05, 15.0),   # TOF range + generous clip for far walls
+            clipping_range=(0.05, 10.0),
         ),
         offset=TiledCameraCfg.OffsetCfg(
-            pos=(0.0, 0.0, 0.1),
-            rot=(-0.5, 0.5, -0.5, 0.5),
+            pos=(-0.02, 0.01, 0.1),   # 2 cm back, 1 cm left, 10 cm up
+            rot=(-0.6540, 0.5992, -0.3119, 0.3404),
+            convention="ros",
+        ),
+        debug_vis=False,
+    )
+    camera_right_cfg: TiledCameraCfg = TiledCameraCfg(
+        prim_path="/World/envs/env_.*/Robot/mushr_nano/base_link/camera_right",
+        update_period=0.0,
+        height=180,
+        width=240,
+        data_types=["distance_to_image_plane"],
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=_TOF_FOCAL_MM,
+            horizontal_aperture=_TOF_H_APERTURE_MM,
+            vertical_aperture=_TOF_V_APERTURE_MM,
+            clipping_range=(0.05, 10.0),
+        ),
+        offset=TiledCameraCfg.OffsetCfg(
+            pos=(-0.02, -0.01, 0.1),  # 2 cm back, 1 cm right, 10 cm up
+            rot=(-0.3404, 0.3119, -0.5992, 0.6540),
             convention="ros",
         ),
         debug_vis=False,
@@ -513,41 +485,33 @@ class MushrMazeEnv(DirectRLEnv):
         # ContactSensor dict must exist before super().__init__() calls _setup_scene().
         self._wall_contact_sensors: dict[str, ContactSensor] = {}
 
-        # Compute exact depth observation size.
+        # Compute exact depth observation size (same for both cameras).
         # 1. Crop: remove top/bottom rows from the raw 240×180 frame.
         # 2. Downsample: bilinear resize to policy_depth_width × policy_depth_height.
-        #    Smaller resolution = smaller MLP first layer = faster convergence.
-        cam_h = cfg.camera_cfg.height   # 180
-        cam_w = cfg.camera_cfg.width    # 240
+        cam_h = cfg.camera_left_cfg.height   # 180
+        cam_w = cfg.camera_left_cfg.width    # 240
         remaining = max(0.0, 1.0 - cfg.depth_crop_top_fraction - cfg.depth_crop_bottom_fraction)
         cropped_h = max(1, int(cam_h * remaining))
         cropped_w = cam_w
 
         self._policy_depth_w = cfg.policy_depth_width
         if cfg.policy_depth_height < 0:
-            # Auto-compute from cropped aspect ratio
             self._policy_depth_h = max(1, round(cfg.policy_depth_width * cropped_h / cropped_w))
         else:
             self._policy_depth_h = cfg.policy_depth_height
 
         depth_obs_size = self._policy_depth_h * self._policy_depth_w
 
-        # LiDAR dims: channels × horizontal_rays
-        # horizontal_res=0.8° over 360° (exclusive endpoint) → 450 rays × 1 channel
-        import math as _math
-        lidar_h_rays = _math.ceil(360.0 / cfg.lidar_cfg.pattern_cfg.horizontal_res)
-        self._lidar_n_rays = lidar_h_rays * cfg.lidar_cfg.pattern_cfg.channels
-
-        extra_obs = 2  # lin_vel + yaw_rate
+        extra_obs = 0  # lin_vel removed — not available on real hardware
         if cfg.include_prev_action:
-            extra_obs += 2  # prev_throttle + prev_steer
-        cfg.observation_space = depth_obs_size + self._lidar_n_rays + extra_obs
+            extra_obs += cfg.action_history_steps * 2  # N × (throttle + steer)
+        cfg.observation_space = depth_obs_size * 2 + extra_obs  # left + right cameras
 
         print(
-            f"[MushrMazeEnv] Depth obs: raw {cam_w}×{cam_h} "
+            f"[MushrMazeEnv] Depth obs per camera: raw {cam_w}×{cam_h} "
             f"→ crop {cropped_w}×{cropped_h} "
             f"→ policy {self._policy_depth_w}×{self._policy_depth_h} "
-            f"= {depth_obs_size} px  |  LiDAR: {self._lidar_n_rays} rays  |  "
+            f"= {depth_obs_size} px  |  2 cameras  |  "
             f"total obs = {cfg.observation_space}"
         )
 
@@ -578,8 +542,10 @@ class MushrMazeEnv(DirectRLEnv):
         self._prev_steer      = torch.zeros(self.num_envs, device=self.device)
         self._steer_hp        = torch.zeros(self.num_envs, device=self.device)
 
-        # Previous action for observation (throttle + steer in [-1,1])
-        self._prev_action = torch.zeros(self.num_envs, 2, device=self.device)
+        # Action history for observation: action_history_steps most-recent (throttle, steer) pairs.
+        # Shape [N, H, 2]; flattened to [N, H*2] when appended to obs.
+        H = cfg.action_history_steps
+        self._prev_action = torch.zeros(self.num_envs, H, 2, device=self.device)
 
         # Curriculum
         self._vel_cap:              float = cfg.initial_vel_cap_m_s
@@ -588,11 +554,6 @@ class MushrMazeEnv(DirectRLEnv):
         # Ramp / global state
         self._total_laps_completed: int  = 0
         self._ramp_enabled:         bool = True
-
-        # Fixed→random spawn tracking
-        self._random_spawn_unlocked: bool = True
-        self._ep_return_buf = torch.zeros(self.num_envs, device=self.device)
-        self._ep_return_history: deque = deque(maxlen=cfg.fixed_spawn_history_len)
 
         # Sector gate geometry
         self._n_sectors, self._sector_gates, self._sector_tangents = (
@@ -639,14 +600,11 @@ class MushrMazeEnv(DirectRLEnv):
         self._on_ramp            = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._wall_ever_touched  = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._ramp_ascended      = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        self._slow_timer         = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
 
-        # Depth observation cache (policy resolution after crop + downsample)
-        self._camera_obs = torch.zeros(
-            self.num_envs,
-            self._policy_depth_h * self._policy_depth_w,
-            device=self.device,
-        )
+        # Depth observation caches (policy resolution after crop + downsample)
+        _cam_flat = self._policy_depth_h * self._policy_depth_w
+        self._camera_left_obs  = torch.zeros(self.num_envs, _cam_flat, device=self.device)
+        self._camera_right_obs = torch.zeros(self.num_envs, _cam_flat, device=self.device)
         self._last_camera_update_step = -1
 
     # ------------------------------------------------------------------
@@ -751,8 +709,8 @@ class MushrMazeEnv(DirectRLEnv):
         )
         ground_cfg.func("/World/GroundPlane", ground_cfg)
 
-        self.camera = TiledCamera(self.cfg.camera_cfg)
-        self.lidar  = MultiMeshRayCaster(self.cfg.lidar_cfg)
+        self.camera_left  = TiledCamera(self.cfg.camera_left_cfg)
+        self.camera_right = TiledCamera(self.cfg.camera_right_cfg)
         for link_name in WALL_CONTACT_LINKS:
             sensor_cfg = ContactSensorCfg(
                 prim_path=f"/World/envs/env_.*/Robot/mushr_nano/{link_name}",
@@ -789,8 +747,8 @@ class MushrMazeEnv(DirectRLEnv):
                 )
 
         self.scene.articulations["robot"] = self.robot
-        self.scene.sensors["front_camera"] = self.camera
-        self.scene.sensors["lidar"] = self.lidar
+        self.scene.sensors["camera_left"]  = self.camera_left
+        self.scene.sensors["camera_right"] = self.camera_right
         for link_name, sensor in self._wall_contact_sensors.items():
             self.scene.sensors[f"wall_contact_{link_name}"] = sensor
 
@@ -895,16 +853,6 @@ class MushrMazeEnv(DirectRLEnv):
             self._current_vel + accel_m_s2 * dt
         ).clamp(0.0, self._vel_cap)
 
-        # Ramp speed cap: prevent flying off at full speed.
-        # _on_ramp is updated in _get_dones; use it from the previous step here.
-        # This is one step delayed but that's fine — ramps span many steps.
-        if self.cfg.ramp_max_speed_m_s < self.cfg.vel_cap_max_m_s:
-            self._current_vel = torch.where(
-                self._on_ramp,
-                self._current_vel.clamp(max=self.cfg.ramp_max_speed_m_s),
-                self._current_vel,
-            )
-
         alpha_s = self.cfg.action_lpf_alpha_steer
         self._filtered_steer = (
             alpha_s * actions[:, 1].clamp(-1.0, 1.0)
@@ -915,9 +863,10 @@ class MushrMazeEnv(DirectRLEnv):
         self._rear_wheel_ang_vel = self._current_vel / WHEEL_RADIUS
         self._steer_tan          = torch.tan(steer_ang)
 
-        # Store raw action for next-step observation
-        self._prev_action[:, 0] = actions[:, 0].clamp(-1.0, 1.0)
-        self._prev_action[:, 1] = actions[:, 1].clamp(-1.0, 1.0)
+        # Shift history left (drop oldest) and append newest action
+        self._prev_action = self._prev_action.roll(-1, dims=1)
+        self._prev_action[:, -1, 0] = actions[:, 0].clamp(-1.0, 1.0)
+        self._prev_action[:, -1, 1] = actions[:, 1].clamp(-1.0, 1.0)
 
     def _apply_action(self) -> None:
         wall_hit_now = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -947,58 +896,40 @@ class MushrMazeEnv(DirectRLEnv):
     # Depth camera cache  (called once per step, shared by obs + rewards)
     # ------------------------------------------------------------------
 
-    def _update_depth_cache(self) -> None:
-        """Process the depth frame and write self._camera_obs.
-
-        Pipeline:
-        1. Read distance_to_image_plane [N, H, W, 1] from TiledCamera.
-        2. Strip the channel dim → [N, H, W].
-        3. Replace inf/nan with depth_max_m (no-hit pixels).
-        4. Crop top and bottom rows (sky and near-ground noise).
-        5. Add Gaussian noise to simulate TOF ±2 cm accuracy.
-        6. Clamp to [0.01, depth_max_m] and normalise:
-               depth_norm = 1.0 - depth / depth_max_m
-           → 1.0 = obstacle at 0 m (danger), 0.0 = max range (clear).
-        7. Flatten to [N, H_crop × W] and store as float32.
-        """
-        current_step = int(self.episode_length_buf.max().item())
-        if self._last_camera_update_step == current_step:
-            return
-        self._last_camera_update_step = current_step
-
-        depth_raw = self.camera.data.output["distance_to_image_plane"]  # [N, H, W, 1]
-        depth = depth_raw[..., 0]                                        # [N, H, W]
-
-        # Replace non-finite values (no-hit rays → max range)
-        depth = torch.where(torch.isfinite(depth), depth, torch.tensor(self.cfg.depth_max_m, device=depth.device))
-
-        # Crop top and bottom
-        h = depth.shape[1]
-        top  = int(self.cfg.depth_crop_top_fraction    * h)
-        bot  = h - int(self.cfg.depth_crop_bottom_fraction * h)
-        depth = depth[:, top:bot, :]   # [N, H_crop, W]
-
-        # Add Gaussian depth noise (simulate 2 cm TOF accuracy)
-        if self.cfg.depth_noise_sigma_m > 0.0:
-            noise = torch.randn_like(depth) * self.cfg.depth_noise_sigma_m
-            depth = depth + noise
-
-        # Clamp and normalise (close = high, far = low)
-        depth = depth.clamp(0.01, self.cfg.depth_max_m)
-        depth_norm = 1.0 - depth / self.cfg.depth_max_m   # [N, H_crop, W]
-
-        # Downsample to policy resolution (much smaller MLP input)
+    def _process_single_depth(self, camera) -> torch.Tensor:
+        """Shared depth pipeline for one TiledCamera → [N, policy_h*policy_w]."""
         import torch.nn.functional as F
-        depth_4d = depth_norm.unsqueeze(1)   # [N, 1, H_crop, W]
+        depth_raw = camera.data.output["distance_to_image_plane"]  # [N, H, W, 1]
+        depth = depth_raw[..., 0]                                   # [N, H, W]
+        depth = torch.where(
+            torch.isfinite(depth),
+            depth,
+            torch.tensor(self.cfg.depth_max_m, device=depth.device),
+        )
+        h = depth.shape[1]
+        top = int(self.cfg.depth_crop_top_fraction    * h)
+        bot = h - int(self.cfg.depth_crop_bottom_fraction * h)
+        depth = depth[:, top:bot, :]
+        if self.cfg.depth_noise_sigma_m > 0.0:
+            depth = depth + torch.randn_like(depth) * self.cfg.depth_noise_sigma_m
+        depth = depth.clamp(0.01, self.cfg.depth_max_m)
+        depth_norm = 1.0 - depth / self.cfg.depth_max_m
         depth_4d = F.interpolate(
-            depth_4d,
+            depth_norm.unsqueeze(1),
             size=(self._policy_depth_h, self._policy_depth_w),
             mode="bilinear",
             align_corners=False,
         )
-        depth_policy = depth_4d.squeeze(1)   # [N, policy_h, policy_w]
+        return depth_4d.squeeze(1).reshape(self.num_envs, -1)
 
-        self._camera_obs = depth_policy.reshape(self.num_envs, -1)   # [N, policy_h*policy_w]
+    def _update_depth_cache(self) -> None:
+        """Process both depth cameras and write self._camera_left_obs / _camera_right_obs."""
+        current_step = int(self.episode_length_buf.max().item())
+        if self._last_camera_update_step == current_step:
+            return
+        self._last_camera_update_step = current_step
+        self._camera_left_obs  = self._process_single_depth(self.camera_left)
+        self._camera_right_obs = self._process_single_depth(self.camera_right)
 
     # ------------------------------------------------------------------
     # Observations
@@ -1007,27 +938,9 @@ class MushrMazeEnv(DirectRLEnv):
     def _get_observations(self) -> dict:
         self._update_depth_cache()
 
-        # Normalised forward velocity (fraction of current vel_cap)
-        lin_vel_b = self.robot.data.root_lin_vel_b[:, 0:1] / self._vel_cap   # [N, 1]
-
-        # Normalised yaw rate
-        yaw_rate = self.robot.data.root_ang_vel_b[:, 2:3] / self.cfg.imu_ang_vel_norm  # [N, 1]
-
-        # 360° LiDAR — [N, n_rays] hit distances, normalised to [0, 1]
-        # hit_distance=0 → wall at sensor origin, =1 → beyond max range (safe)
-        lidar_hits = self.lidar.data.ray_hits_w         # [N, n_rays, 3] world-frame hit points
-        lidar_origin = self.lidar.data.pos_w.unsqueeze(1)  # [N, 1, 3] broadcast over rays
-        lidar_dist = torch.linalg.vector_norm(lidar_hits - lidar_origin, dim=-1)  # [N, n_rays]
-        lidar_dist = lidar_dist.clamp(0.0, self.cfg.lidar_cfg.max_distance)
-        # Simulate ±30 mm accuracy
-        if self.cfg.lidar_noise_sigma_m > 0.0:
-            lidar_dist = lidar_dist + torch.randn_like(lidar_dist) * self.cfg.lidar_noise_sigma_m
-            lidar_dist = lidar_dist.clamp(0.0, self.cfg.lidar_cfg.max_distance)
-        lidar_norm = lidar_dist / self.cfg.lidar_cfg.max_distance   # [N, n_rays] ∈ [0, 1]
-
-        parts = [self._camera_obs, lidar_norm, lin_vel_b, yaw_rate]
+        parts = [self._camera_left_obs, self._camera_right_obs]
         if self.cfg.include_prev_action:
-            parts.append(self._prev_action)   # [N, 2]
+            parts.append(self._prev_action.view(self.num_envs, -1))   # [N, H*2]
 
         obs = torch.cat(parts, dim=-1)
         return {"policy": obs}
@@ -1045,7 +958,7 @@ class MushrMazeEnv(DirectRLEnv):
         # Distance covered this step
         r_distance = self.cfg.distance_weight * lin_vel_b * dt
 
-        # Speed bonus (fixed normalisation → stable across curriculum)
+        # Speed bonus — fixed normalisation by initial_vel_cap_m_s keeps scale stable as curriculum advances
         r_forward = self.cfg.forward_weight * (lin_vel_b / self.cfg.initial_vel_cap_m_s)
 
         # Wall penalty
@@ -1084,16 +997,15 @@ class MushrMazeEnv(DirectRLEnv):
                     ep_steps  = int(self.episode_length_buf[eid].item())
                     lap_steps = ep_steps - int(self._lap_start_step[eid].item())
                     lap_time_s = max(lap_steps, 1) * dt_p
-                    scale = float(
-                        torch.tensor(self.cfg.target_lap_time_s / lap_time_s).clamp(
-                            self.cfg.lap_time_reward_min_scale,
-                            self.cfg.lap_time_reward_max_scale,
-                        )
+                    t_range = self.cfg.lap_reward_slow_time_s - self.cfg.lap_reward_fast_time_s
+                    r_range = self.cfg.lap_reward_fast - self.cfg.lap_reward_slow
+                    lap_rew = self.cfg.lap_reward_slow + (
+                        (self.cfg.lap_reward_slow_time_s - lap_time_s) / t_range * r_range
                     )
+                    lap_rew = max(lap_rew, self.cfg.lap_reward_slow)
                     print(
                         f"[Lap] env={eid:>3d}  lap_time={lap_time_s:.1f}s  "
-                        f"reward={self.cfg.lap_completion_reward * scale:.0f}  "
-                        f"(×{scale:.2f})  total_laps={self._total_laps_completed}"
+                        f"reward={lap_rew:.0f}  total_laps={self._total_laps_completed}"
                     )
 
                 if not self._reference_established:
@@ -1104,12 +1016,28 @@ class MushrMazeEnv(DirectRLEnv):
                         f"{self._n_sectors} sectors, mean ref = "
                         f"{self._sector_reference_times.mean().item():.2f} s"
                     )
+                else:
+                    # Set reference to 105% of best known times — agents earn sector reward
+                    # whenever they drive within 5% of the all-time best, keeping r_sector
+                    # alive even when no new records are being set.  The reference still
+                    # tightens over time as best_times improve.
+                    updated = torch.minimum(
+                        self._sector_reference_times,
+                        self._sector_best_times * 1.05,
+                    )
+                    if not updated.equal(self._sector_reference_times):
+                        self._sector_reference_times = updated
+                        print(
+                            f"[Sector] Reference tightened → mean ref = "
+                            f"{self._sector_reference_times.mean().item():.2f} s"
+                        )
 
                 fresh_lap = lap_agents & (self._agent_spawn_vel_cap == self._vel_cap)
                 if fresh_lap.any() and not self._lap_at_current_vel:
                     self._lap_at_current_vel = True
 
-        # Lap completion bonus (scaled by lap time)
+        # Lap completion bonus — linear between (lap_reward_slow_time_s, lap_reward_slow)
+        # and (lap_reward_fast_time_s, lap_reward_fast), clamped at floor.
         r_lap = torch.zeros(self.num_envs, device=self.device)
         if lap_agents.any():
             lap_steps_f = (
@@ -1117,10 +1045,12 @@ class MushrMazeEnv(DirectRLEnv):
                 - self._lap_start_step[lap_agents].float()
             ).clamp(min=1.0)
             lap_time_s = lap_steps_f * dt
-            time_scale = (self.cfg.target_lap_time_s / lap_time_s).clamp(
-                self.cfg.lap_time_reward_min_scale, self.cfg.lap_time_reward_max_scale,
+            t_range = self.cfg.lap_reward_slow_time_s - self.cfg.lap_reward_fast_time_s
+            r_range = self.cfg.lap_reward_fast - self.cfg.lap_reward_slow
+            lap_rewards = self.cfg.lap_reward_slow + (
+                (self.cfg.lap_reward_slow_time_s - lap_time_s) / t_range * r_range
             )
-            r_lap[lap_agents] = self.cfg.lap_completion_reward * time_scale
+            r_lap[lap_agents] = lap_rewards.clamp(min=self.cfg.lap_reward_slow)
             self._lap_start_step[lap_agents] = self.episode_length_buf[lap_agents].int()
 
         if not self._reference_established:
@@ -1137,12 +1067,12 @@ class MushrMazeEnv(DirectRLEnv):
         self._sector_entry_step[crossed] = self.episode_length_buf[crossed].int()
         self._sector_d_prev = d_current
 
-        # ── Wheel slip (AWD) ──────────────────────────────────────────────────────
-        all_wheel_omega = torch.cat([
-            self.robot.data.joint_vel[:, self._rear_throttle_ids],
-            self.robot.data.joint_vel[:, self._front_throttle_ids],
-        ], dim=-1)
-        wheel_vel  = all_wheel_omega.mean(dim=-1) * WHEEL_RADIUS
+        # ── Wheel slip (AWD — all 4 wheels) ──────────────────────────────────────
+        all_throttle_ids = torch.cat([
+            self.robot.data.joint_vel.new_tensor(self._rear_throttle_ids, dtype=torch.long),
+            self.robot.data.joint_vel.new_tensor(self._front_throttle_ids, dtype=torch.long),
+        ])
+        wheel_vel  = self.robot.data.joint_vel[:, all_throttle_ids].mean(dim=-1) * WHEEL_RADIUS
         slip_speed = torch.abs(wheel_vel - lin_vel_b)
         r_slip     = -self.cfg.slip_weight * slip_speed / self.cfg.initial_vel_cap_m_s * (~self._on_ramp).float()
 
@@ -1164,30 +1094,33 @@ class MushrMazeEnv(DirectRLEnv):
             * (lin_vel_b / self.cfg.initial_vel_cap_m_s).clamp(0.0, 1.0)
         )
 
-        # ── Slow-driving penalty ─────────────────────────────────────────────────
-        # Uses slow_penalty_speed_fraction (default 0.0 = disabled).
-        # Deliberately NOT penalising braking — the depth camera already teaches
-        # the agent to slow before walls; penalising low speed here would fight that.
-        if self.cfg.slow_penalty_speed_fraction > 0.0:
-            is_slow = (
-                (lin_vel_b < (self.cfg.slow_penalty_speed_fraction * self._vel_cap))
-                & ~self._on_ramp
+        # ── Ramp speed penalty ───────────────────────────────────────────────────
+        # Penalise every step the robot is inside the ramp XY bbox OR within
+        # ramp_approach_radius_m of it, and going faster than ramp_speed_threshold_m_s.
+        if self._ramp_xy_min is not None:
+            in_ramp_xy = (
+                (pos_xy[:, 0] >= self._ramp_xy_min[0]) & (pos_xy[:, 0] <= self._ramp_xy_max[0]) &
+                (pos_xy[:, 1] >= self._ramp_xy_min[1]) & (pos_xy[:, 1] <= self._ramp_xy_max[1])
             )
+            # Distance from robot to nearest point on bbox (0 when inside)
+            nearest_x = pos_xy[:, 0].clamp(self._ramp_xy_min[0], self._ramp_xy_max[0])
+            nearest_y = pos_xy[:, 1].clamp(self._ramp_xy_min[1], self._ramp_xy_max[1])
+            dx = pos_xy[:, 0] - nearest_x
+            dy = pos_xy[:, 1] - nearest_y
+            dist_to_ramp_bbox = torch.sqrt(dx * dx + dy * dy)
+            near_ramp_xy = dist_to_ramp_bbox <= self.cfg.ramp_approach_radius_m
+            in_ramp_xy = in_ramp_xy | near_ramp_xy
         else:
-            is_slow = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        self._slow_timer = torch.where(
-            is_slow,
-            self._slow_timer + 1,
-            torch.zeros_like(self._slow_timer),
-        )
-        r_slow = -self.cfg.slow_penalty_weight * is_slow.float()
+            in_ramp_xy = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        ramp_speed_excess = (lin_vel_b - self.cfg.ramp_speed_threshold_m_s).clamp(min=0.0)
+        r_airborne = -self.cfg.ramp_speed_penalty_weight * ramp_speed_excess * in_ramp_xy.float()
 
         total = (
             r_distance + r_forward + r_slip + r_steer_shape
-            + r_slow + r_wall + r_sector + r_ramp + r_lap + r_proximity
+            + r_wall + r_sector + r_ramp + r_lap + r_proximity
+            + r_airborne
         )
 
-        self._ep_return_buf += total.detach()
         return total
 
     # ------------------------------------------------------------------
@@ -1241,23 +1174,6 @@ class MushrMazeEnv(DirectRLEnv):
         if env_ids is None:
             env_ids = self.robot._ALL_INDICES
 
-        # Episode return history
-        for eid in env_ids:
-            self._ep_return_history.append(float(self._ep_return_buf[eid].item()))
-        self._ep_return_buf[env_ids] = 0.0
-
-        if (
-            not self._random_spawn_unlocked
-            and len(self._ep_return_history) >= self.cfg.fixed_spawn_history_len
-        ):
-            mean_return = sum(self._ep_return_history) / len(self._ep_return_history)
-            if mean_return >= self.cfg.fixed_spawn_reward_threshold:
-                self._random_spawn_unlocked = True
-                print(
-                    f"[Spawn] Random spawning UNLOCKED! "
-                    f"Mean return = {mean_return:.1f} >= {self.cfg.fixed_spawn_reward_threshold:.1f}"
-                )
-
         # Curriculum advancement
         if self._lap_at_current_vel and self._vel_cap < self.cfg.vel_cap_max_m_s:
             self._lap_at_current_vel = False
@@ -1272,7 +1188,11 @@ class MushrMazeEnv(DirectRLEnv):
         default_root_state = self.robot.data.default_root_state[env_ids].clone()
         default_root_state[:, :3] += self.scene.env_origins[env_ids]
 
-        speed     = self.cfg.spawn_speed_m_s
+        speed_vec = (
+            torch.rand(n, device=self.device)
+            * (self.cfg.spawn_vel_max_m_s - self.cfg.spawn_vel_min_m_s)
+            + self.cfg.spawn_vel_min_m_s
+        )
         sz        = 0.002   # just above ground — constant for all spawn modes
         env_ids_t = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
 
@@ -1313,8 +1233,8 @@ class MushrMazeEnv(DirectRLEnv):
         default_root_state[:, 3:7] = dq
 
         default_root_state[:, 7:]  = 0.0
-        default_root_state[:, 7]   = speed * torch.cos(yaw)
-        default_root_state[:, 8]   = speed * torch.sin(yaw)
+        default_root_state[:, 7]   = speed_vec * torch.cos(yaw)
+        default_root_state[:, 8]   = speed_vec * torch.sin(yaw)
 
         self.robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
@@ -1333,14 +1253,13 @@ class MushrMazeEnv(DirectRLEnv):
         self._sector_d_prev[env_ids] = d_init.clamp(max=0.0)
 
         # Seed commanded velocity to match initial physics speed
-        self._current_vel[env_ids]    = speed
+        self._current_vel[env_ids]    = speed_vec
         self._accel_m_s2[env_ids]     = 0.0
         self._filtered_steer[env_ids] = 0.0
         self._steer_integral[env_ids] = 0.0
         self._prev_steer[env_ids]     = 0.0
-        self._prev_action[env_ids]    = 0.0
+        self._prev_action[env_ids]    = 0.0   # clears full [5, 2] history
 
-        self._slow_timer[env_ids]        = 0
         self._ramp_ascended[env_ids]     = False
         self._wall_ever_touched[env_ids] = False
 

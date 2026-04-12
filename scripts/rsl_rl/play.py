@@ -56,12 +56,11 @@ parser.add_argument(
 parser.add_argument(
     "--vel_cap",
     type=float,
-    default=None,
+    default=7.0,
     help=(
         "Override the velocity cap used during play (m/s).  "
-        "Use this to test a checkpoint at the speed it was trained at, e.g. --vel_cap 5.0.  "
         "Sets both initial_vel_cap_m_s and vel_cap_max_m_s so the curriculum cannot "
-        "accidentally lower the cap during the play session."
+        "accidentally lower the cap during the play session.  Default: 7.0 m/s."
     ),
 )
 # append RSL-RL cli arguments
@@ -102,10 +101,12 @@ import cv2, time, signal
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 OUT_DIR = "/tmp/mushr_debug"
 FILES = [
-    (os.path.join(OUT_DIR, "raw.png"),    "Raw Depth"),
-    (os.path.join(OUT_DIR, "policy.png"), "Policy Depth"),
+    (os.path.join(OUT_DIR, "raw_left.png"),    "Left Raw Depth"),
+    (os.path.join(OUT_DIR, "policy_left.png"), "Left Policy Depth"),
+    (os.path.join(OUT_DIR, "raw_right.png"),   "Right Raw Depth"),
+    (os.path.join(OUT_DIR, "policy_right.png"),"Right Policy Depth"),
 ]
-while not os.path.exists(os.path.join(OUT_DIR, "raw.png")):
+while not os.path.exists(os.path.join(OUT_DIR, "raw_left.png")):
     time.sleep(0.05)
 while True:
     for fpath, name in FILES:
@@ -155,14 +156,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent_cfg: RslRlBaseRunnerCfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
 
-    # Override velocity cap independently of the training config.
-    # A checkpoint trained up to 5 m/s needs vel_cap=5 to run correctly;
-    # the default training config may have a lower initial_vel_cap_m_s.
-    if args_cli.vel_cap is not None:
-        env_cfg.initial_vel_cap_m_s = args_cli.vel_cap
-        env_cfg.vel_cap_max_m_s     = args_cli.vel_cap
-        env_cfg.spawn_speed_m_s     = min(args_cli.vel_cap, env_cfg.spawn_speed_m_s)
-        print(f"[play] vel_cap overridden to {args_cli.vel_cap} m/s")
+    # Override velocity cap and spawn speed range for play.
+    # Spawn vel is random [2, 4] m/s regardless of training curriculum.
+    # vel_cap sets the top speed ceiling (default 7.0 m/s).
+    env_cfg.initial_vel_cap_m_s = args_cli.vel_cap
+    env_cfg.vel_cap_max_m_s     = args_cli.vel_cap
+    env_cfg.spawn_vel_min_m_s   = 2.0
+    env_cfg.spawn_vel_max_m_s   = 4.0
+    print(f"[play] vel_cap={args_cli.vel_cap} m/s, spawn vel ~ U[2.0, 4.0] m/s")
 
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
@@ -275,8 +276,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
         if args_cli.video:
             import time as _time
-            _cam_h = _mushr_env.cfg.camera_cfg.height
-            _cam_w = _mushr_env.cfg.camera_cfg.width
+            _cam_h = _mushr_env.cfg.camera_left_cfg.height
+            _cam_w = _mushr_env.cfg.camera_left_cfg.width
             _fps   = round(1.0 / (env.unwrapped.cfg.decimation * env.unwrapped.cfg.sim.dt))
             os.makedirs(os.path.join(log_dir, "videos", "play"), exist_ok=True)
             _video_path = os.path.join(
@@ -297,25 +298,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         cv2.imwrite(tmp, img)
         os.replace(tmp, path)
 
-    def _fpv_step() -> None:
-        """Grab depth frame, false-colour it, write PNGs for display."""
-        depth_tensor = _mushr_env.camera.data.output["distance_to_image_plane"]  # [1,H,W,1]
-        depth_np = depth_tensor[0, :, :, 0].cpu().numpy()   # [H, W] float32
-
+    def _depth_to_bgr_pair(camera, suffix: str) -> None:
+        """Process one camera → write raw_{suffix}.png and policy_{suffix}.png."""
+        depth_tensor = camera.data.output["distance_to_image_plane"]  # [1,H,W,1]
+        depth_np = depth_tensor[0, :, :, 0].cpu().numpy()
         depth_max = _mushr_env.cfg.depth_max_m
         depth_np = np.where(np.isfinite(depth_np), depth_np, depth_max)
-
-        # Raw depth (full resolution)
         raw_norm = 1.0 - np.clip(depth_np / depth_max, 0.0, 1.0)
         raw_bgr  = cv2.applyColorMap(
             np.clip(raw_norm * 255, 0, 255).astype(np.uint8), cv2.COLORMAP_JET
         )
-        _write_atomic(os.path.join(_fpv_out_dir, "raw.png"), raw_bgr)
-
-        if _fpv_writer is not None:
-            _fpv_writer.write(raw_bgr)
-
-        # Policy depth (cropped + noised, matches actual env observation)
+        _write_atomic(os.path.join(_fpv_out_dir, f"raw_{suffix}.png"), raw_bgr)
         h = depth_np.shape[0]
         top = int(_mushr_env.cfg.depth_crop_top_fraction * h)
         bot = h - int(_mushr_env.cfg.depth_crop_bottom_fraction * h)
@@ -329,7 +322,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         pol_bgr  = cv2.applyColorMap(
             np.clip(pol_norm * 255, 0, 255).astype(np.uint8), cv2.COLORMAP_JET
         )
-        _write_atomic(os.path.join(_fpv_out_dir, "policy.png"), pol_bgr)
+        _write_atomic(os.path.join(_fpv_out_dir, f"policy_{suffix}.png"), pol_bgr)
+
+    def _fpv_step() -> None:
+        """Grab depth frames from both cameras, false-colour them, write PNGs."""
+        _depth_to_bgr_pair(_mushr_env.camera_left,  "left")
+        _depth_to_bgr_pair(_mushr_env.camera_right, "right")
+        if _fpv_writer is not None:
+            # Write left raw frame to video for recording
+            depth_tensor = _mushr_env.camera_left.data.output["distance_to_image_plane"]
+            depth_np = depth_tensor[0, :, :, 0].cpu().numpy()
+            depth_max = _mushr_env.cfg.depth_max_m
+            depth_np = np.where(np.isfinite(depth_np), depth_np, depth_max)
+            raw_norm = 1.0 - np.clip(depth_np / depth_max, 0.0, 1.0)
+            raw_bgr  = cv2.applyColorMap(
+                np.clip(raw_norm * 255, 0, 255).astype(np.uint8), cv2.COLORMAP_JET
+            )
+            _fpv_writer.write(raw_bgr)
     # ──────────────────────────────────────────────────────────────────────────
 
     # reset environment
