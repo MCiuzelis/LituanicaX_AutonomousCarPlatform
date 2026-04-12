@@ -1,0 +1,21 @@
+15602,MarkQosNameValue,SurfaceBitDepth,8
+15602,MarkQosNameValue,AdapterWidth,1280
+15602,MarkQosNameValue,AllTransitSelectionValuesForwarded,
+15602,MarkQosNameValue,IsCoProc,0
+15602,MarkQosNameValue,DriverBranch,NVIDIA UNIX x86_64 Kernel Module  580.126.09  Wed Jan  7 22:59:56 UTC 2026
+15602,MarkQosNameValue,AdapterRefreshRate,60.0
+15602,MarkQosNameValue,Device,NVIDIA GeForce RTX 3070
+15602,MarkQosNameValue,AdapterHeight,720
+15602,MarkQosNameValue,TransitSelectionValueForwarded,0
+15602,MarkQosNameValue,LtrEnabled,0
+15602,MarkQosNameValue,EncoderInputSurfaceFormat,invalid_format
+15602,MarkQosNameValue,AllTransitSelectionValuesApplied,
+15602,MarkQosNameValue,TransitSelectionValueApplied,0
+15602,MarkQosNameValue,DriverVersion,580.12
+15602,MarkQosNameValue,DataChannelMode,DcSCTP
+15602,MarkQos,StreamServerBackendMode is 2
+15602,MarkQos,stream 0 nvtime::sessionStartTime[us] on server: 91862512828
+15602,MarkQos,RL QOS disabled for stream: 0
+15602,MarkGsBlobStats,
+16003,MarkQos,Number of delayed commands: 0
+16003,MarkGsBlobStats,
