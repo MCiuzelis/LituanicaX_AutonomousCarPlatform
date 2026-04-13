@@ -21,8 +21,10 @@ Action space (2):
          The env integrates a commanded velocity state clamped to [0, vel_cap].
     [1]  steering command in [-1, 1]  → scaled to [-max_steer_rad, +max_steer_rad]
 
-Actuation (Ackermann / AWD):
-    - All 4 wheels receive the same velocity target (rad/s) = commanded_vel / WHEEL_RADIUS
+Actuation (Ackermann / AWD, direct torque control):
+    - All 4 wheels receive a torque target (Nm) via set_joint_effort_target.
+      Torque follows a linear torque-speed curve: T = throttle × T_stall × (1 − ω/ω_noload).
+      Wheel spin occurs naturally when applied torque exceeds PhysX traction limit.
     - Front wheel steer receives position target (rad) = tan(steering_angle)
       (tan-convention matches the joint representation in mushr_nano_v2.usd)
 
@@ -171,7 +173,7 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     # Crop fractions (fraction of raw pixel rows discarded before the policy):
     #   top  → removes ceiling / sky (depth = max / inf)
     #   bottom → removes near-ground clutter and the robot's own body shadow
-    depth_crop_top_fraction:    float = 0.475
+    depth_crop_top_fraction:    float = 0.55#0.475
     depth_crop_bottom_fraction: float = 0.0
 
     # Gaussian depth noise: σ ≈ 0.007 m gives a ±2 cm (3σ) error band,
@@ -232,20 +234,25 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     # vel_cap starts at initial_vel_cap_m_s and steps up each time any agent
     # completes a full lap, up to vel_cap_max_m_s.
     # ════════════════════════════════════════════════════════════════════════
-    initial_vel_cap_m_s: float = 3.0   # starting speed ceiling (m/s)
-    vel_cap_max_m_s:     float = 7.0   # absolute maximum speed (m/s)
+    initial_vel_cap_m_s: float = 1.0   # starting speed ceiling (m/s)
+    vel_cap_max_m_s:     float = 1.0   # absolute maximum speed (m/s)
     vel_cap_step_m_s:    float = 0.05  # speed ceiling increment per lap (m/s)
-    spawn_vel_min_m_s:   float = 2.0  # minimum spawn speed (m/s); mirrors initial_vel_cap_m_s for training
-    spawn_vel_max_m_s:   float = 4.5  # maximum spawn speed (m/s)
+    spawn_vel_min_m_s:   float = 0.1  # minimum spawn speed (m/s); mirrors initial_vel_cap_m_s for training
+    spawn_vel_max_m_s:   float = 1.0  # maximum spawn speed (m/s)
 
     # ════════════════════════════════════════════════════════════════════════
     # DYNAMICS
-    # ════════════════════════════════════════════════════════════════════════
-    # Acceleration / deceleration limits (AWD, rubber-on-court friction, all 4 wheels driven):
-    #   Accel: μ_s × g = 0.8 × 9.81 ≈ 7.8 m/s²  (all wheels contribute)
-    #   Decel: μ_d × g = 0.7 × 9.81 ≈ 6.9 m/s²  (all wheels brake)
-    max_accel_m_s2:  float = 7.8    # max forward acceleration
-    max_decel_m_s2:  float = 6.9    # max braking deceleration
+    # ════════════════════╛
+    # Direct torque-control model (AWD).  The policy outputs throttle ∈ [-1,1]
+    # which maps to a per-wheel torque following a linear torque-speed curve
+    # (models back-EMF / no-load speed):
+    #
+    #   T(ω) = throttle_norm × max_stall_torque_nm × max(0, 1 − ω/max_wheel_no_load_omega)
+    #
+    # Wheel spin happens when T > μ_s × (m×g / N_wheels) × WHEEL_RADIUS.
+    # Tune max_stall_torque_nm so spin occurs at the desired throttle fraction (~0.65).
+    max_stall_torque_nm:      float = 0.5    # peak wheel torque at zero wheel speed (Nm)
+    max_wheel_no_load_omega:  float = 60#300.0  # wheel ω at which torque → 0 (rad/s ≈ 15 m/s)
     max_steer_rad:   float = 0.488  # ≈28° max front-wheel steer angle
 
     # Steering EMA low-pass filter coefficient (simulates servo bandwidth ≈100 ms).
@@ -278,10 +285,10 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     distance_weight:    float = 6.0
 
     # Speed bonus, normalised by initial_vel_cap_m_s (fixed scale across curriculum).
-    forward_weight:     float = 1.5
+    forward_weight:     float = 0
 
     # Extra penalty for wall contact (on top of the base collision cost).
-    wall_penalty:       float = 30
+    wall_penalty:       float = 0
 
     # Sector timing improvement reward.
     # Fires every time an agent crosses a sector gate faster than the global reference.
@@ -290,14 +297,14 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     sector_gain_weight: float = 200
 
     # Rear-wheel slip penalty.
-    slip_weight:        float = 0
+    slip_weight:        float = 5
 
     # Steering deadzone penalty: only penalises steering beyond the deadzone.
     steer_deadzone_weight: float = 0.15
     steer_deadzone:        float = 0.05   # fraction of max_steer_rad that is free
 
     # Dense per-step proximity reward toward the next sector gate.
-    sector_proximity_weight:   float = 1.0
+    sector_proximity_weight:   float = 0
     sector_proximity_max_dist: float = 10.0   # metres — reward fades to 0 beyond this
 
     # Lap completion bonus — linear interpolation between two (time, reward) anchors.
@@ -369,12 +376,12 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
             ),
             "rear_throttle": ImplicitActuatorCfg(
                 joint_names_expr=["back_left_wheel_throttle", "back_right_wheel_throttle"],
-                stiffness=0.0, damping=1000.0,
+                stiffness=0.0, damping=0.0,       # direct torque control via effort target
                 velocity_limit_sim=450.0, effort_limit_sim=0.5,
             ),
             "front_throttle": ImplicitActuatorCfg(
                 joint_names_expr=["front_left_wheel_throttle", "front_right_wheel_throttle"],
-                stiffness=0.0, damping=1000.0,   # active — AWD, front wheels driven
+                stiffness=0.0, damping=0.0,       # direct torque control via effort target
                 velocity_limit_sim=450.0, effort_limit_sim=0.5,
             ),
         },
@@ -529,12 +536,17 @@ class MushrMazeEnv(DirectRLEnv):
         ])
 
         # Ackermann command buffers
-        self._rear_wheel_ang_vel = torch.zeros(self.num_envs, device=self.device)
-        self._steer_tan          = torch.zeros(self.num_envs, device=self.device)
+        self._steer_tan = torch.zeros(self.num_envs, device=self.device)
 
-        # Velocity integration state
-        self._current_vel = torch.zeros(self.num_envs, device=self.device)
-        self._accel_m_s2  = torch.zeros(self.num_envs, device=self.device)
+        # Precomputed tensor of all 4 driven wheel joint indices [rear_L, rear_R, front_L, front_R]
+        self._all_throttle_ids = torch.tensor(
+            self._rear_throttle_ids + self._front_throttle_ids,
+            dtype=torch.long, device=self.device,
+        )
+
+        # Per-wheel torque commands (split rear/front for set_joint_effort_target)
+        self._wheel_torque_rear  = torch.zeros(self.num_envs, 2, device=self.device)
+        self._wheel_torque_front = torch.zeros(self.num_envs, 2, device=self.device)
 
         # Steering LPF state
         self._filtered_steer = torch.zeros(self.num_envs, device=self.device)
@@ -636,8 +648,9 @@ class MushrMazeEnv(DirectRLEnv):
         except Exception as e:
             print(f"[Wall] convexDecomposition setup failed: {e}")
 
-        ramp_cfg = sim_utils.UsdFileCfg(usd_path=RAMP_USD, scale=(0.003, 0.003, 0.003))
-        ramp_cfg.func("/World/Ramps", ramp_cfg, translation=(16, 0.0, 0.0), orientation=(0.0, 0.0, 0.0, 0.0))
+        # DISABLED: ramp temporarily removed
+        # ramp_cfg = sim_utils.UsdFileCfg(usd_path=RAMP_USD, scale=(0.003, 0.003, 0.003))
+        # ramp_cfg.func("/World/Ramps", ramp_cfg, translation=(16, 0.0, 0.0), orientation=(0.0, 0.0, 0.0, 0.0))
 
         import omni.usd
         from pxr import Usd, UsdGeom, UsdPhysics, UsdShade
@@ -831,27 +844,26 @@ class MushrMazeEnv(DirectRLEnv):
     # ------------------------------------------------------------------
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
-        """Convert actions → Ackermann commands using velocity integration.
+        """Convert actions → Ackermann commands (direct torque control, AWD).
 
         Throttle (actions[:,0]) ∈ [-1,1]:
-            +1 → max acceleration (max_accel_m_s2)
-             0 → neutral (no change)
-            -1 → max deceleration (max_decel_m_s2)
-        Velocity is integrated and clamped to [0, vel_cap].  No throttle LPF
-        is needed — the integration itself is a rate limiter.
+            Remapped to [0,1], then applied as wheel torque following a
+            linear torque-speed curve (models motor back-EMF):
+                T(ω) = throttle_norm × max_stall_torque × max(0, 1 − ω/ω_noload)
+            Wheel spin occurs naturally when T > traction limit.
         """
-        dt = self.cfg.decimation / 120.0  # policy step ≈ 0.033 s
-
         throttle_norm = (actions[:, 0].clamp(-1.0, 1.0) + 1.0) * 0.5   # → [0, 1]
-        accel_m_s2 = (
-            throttle_norm * (self.cfg.max_accel_m_s2 + self.cfg.max_decel_m_s2)
-            - self.cfg.max_decel_m_s2
-        )   # → [-max_decel, +max_accel]
-        self._accel_m_s2 = accel_m_s2
 
-        self._current_vel = (
-            self._current_vel + accel_m_s2 * dt
-        ).clamp(0.0, self._vel_cap)
+        # Per-wheel speed (abs) — shape [N, 4]: rear_L, rear_R, front_L, front_R
+        wheel_omega = self.robot.data.joint_vel[:, self._all_throttle_ids].abs()
+
+        # Linear torque-speed rolloff: full torque at standstill, zero at no-load speed
+        torque_rolloff = (1.0 - wheel_omega / self.cfg.max_wheel_no_load_omega).clamp(0.0, 1.0)
+
+        # Per-wheel torque = throttle × stall_torque × rolloff  — shape [N, 4]
+        per_wheel_torque = throttle_norm.unsqueeze(-1) * self.cfg.max_stall_torque_nm * torque_rolloff
+        self._wheel_torque_rear  = per_wheel_torque[:, :2]
+        self._wheel_torque_front = per_wheel_torque[:, 2:]
 
         alpha_s = self.cfg.action_lpf_alpha_steer
         self._filtered_steer = (
@@ -859,9 +871,7 @@ class MushrMazeEnv(DirectRLEnv):
             + (1.0 - alpha_s) * self._filtered_steer
         )
         steer_ang = self._filtered_steer * self.cfg.max_steer_rad
-
-        self._rear_wheel_ang_vel = self._current_vel / WHEEL_RADIUS
-        self._steer_tan          = torch.tan(steer_ang)
+        self._steer_tan = torch.tan(steer_ang)
 
         # Shift history left (drop oldest) and append newest action
         self._prev_action = self._prev_action.roll(-1, dims=1)
@@ -883,10 +893,12 @@ class MushrMazeEnv(DirectRLEnv):
         self._wall_ever_touched |= (wall_hit_now & ~in_grace)
 
         wall_mask = self._wall_ever_touched
-        wheel_vels = self._rear_wheel_ang_vel.unsqueeze(-1).expand(-1, 2).clone()
-        wheel_vels[wall_mask] = 0.0
-        self.robot.set_joint_velocity_target(wheel_vels, joint_ids=self._rear_throttle_ids)
-        self.robot.set_joint_velocity_target(wheel_vels, joint_ids=self._front_throttle_ids)
+        torque_rear  = self._wheel_torque_rear.clone()
+        torque_front = self._wheel_torque_front.clone()
+        torque_rear[wall_mask]  = 0.0
+        torque_front[wall_mask] = 0.0
+        self.robot.set_joint_effort_target(torque_rear,  joint_ids=self._rear_throttle_ids)
+        self.robot.set_joint_effort_target(torque_front, joint_ids=self._front_throttle_ids)
 
         steer_positions = self._steer_tan.unsqueeze(-1).expand(-1, 2).clone()
         steer_positions[wall_mask] = 0.0
@@ -1068,11 +1080,7 @@ class MushrMazeEnv(DirectRLEnv):
         self._sector_d_prev = d_current
 
         # ── Wheel slip (AWD — all 4 wheels) ──────────────────────────────────────
-        all_throttle_ids = torch.cat([
-            self.robot.data.joint_vel.new_tensor(self._rear_throttle_ids, dtype=torch.long),
-            self.robot.data.joint_vel.new_tensor(self._front_throttle_ids, dtype=torch.long),
-        ])
-        wheel_vel  = self.robot.data.joint_vel[:, all_throttle_ids].mean(dim=-1) * WHEEL_RADIUS
+        wheel_vel  = self.robot.data.joint_vel[:, self._all_throttle_ids].mean(dim=-1) * WHEEL_RADIUS
         slip_speed = torch.abs(wheel_vel - lin_vel_b)
         r_slip     = -self.cfg.slip_weight * slip_speed / self.cfg.initial_vel_cap_m_s * (~self._on_ramp).float()
 
@@ -1252,9 +1260,7 @@ class MushrMazeEnv(DirectRLEnv):
         d_init      = ((spawn_xy - gate_pts_r) * gate_tan_r).sum(dim=-1)
         self._sector_d_prev[env_ids] = d_init.clamp(max=0.0)
 
-        # Seed commanded velocity to match initial physics speed
-        self._current_vel[env_ids]    = speed_vec
-        self._accel_m_s2[env_ids]     = 0.0
+        # Body velocity already seeded above via write_root_velocity_to_sim
         self._filtered_steer[env_ids] = 0.0
         self._steer_integral[env_ids] = 0.0
         self._prev_steer[env_ids]     = 0.0
