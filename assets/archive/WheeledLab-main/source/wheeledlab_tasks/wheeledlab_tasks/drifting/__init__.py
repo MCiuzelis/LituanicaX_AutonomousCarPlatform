@@ -1,2 +1,0 @@
-from .mushr_drift_env_cfg import MushrDriftRLEnvCfg, MushrDriftPlayEnvCfg
-from .f1tenth_drift_env_cfg import F1TenthDriftRLEnvCfg
