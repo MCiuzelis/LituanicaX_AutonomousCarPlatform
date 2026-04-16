@@ -179,7 +179,6 @@ def camera_manager_thread(queues):
 
 
 # ── Policy loop ───────────────────────────────────────────────────────────────
-
 def policy_thread() -> None:
     print("Loading policy...")
     opts = ort.SessionOptions()
@@ -198,8 +197,10 @@ def policy_thread() -> None:
         t_start = time.perf_counter()
 
         if not space_active.is_set():
+            # Fix: Use the robot's methods instead of accessing internal PWM objects
             robot.set_throttle(0)
-            robot.servo_pwm.ChangeDutyCycle(0)
+            robot.set_steering(0) # Center the wheels when inactive
+            
             action_history[:] = 0.0
             with action_lock:
                 latest_action[0], latest_action[1] = 0.0, 0.0
@@ -207,8 +208,8 @@ def policy_thread() -> None:
             continue
 
         with frames_lock:
-            raw_left  = latest_raw.get(LEFT_IDX)  # Corrected index 0
-            raw_right = latest_raw.get(RIGHT_IDX) # Corrected index 8
+            raw_left  = latest_raw.get(LEFT_IDX)
+            raw_right = latest_raw.get(RIGHT_IDX)
 
         if raw_left is None or raw_right is None:
             time.sleep(step_interval)
@@ -220,22 +221,17 @@ def policy_thread() -> None:
 
         # Get policy output [-1, 1]
         action = sess.run([output_name], {input_name: obs})[0].clip(-1.0, 1.0)[0]
+        # action[0] is throttle, action[1] is steering
         throttle_raw, steer = float(action[0]), float(action[1])
 
-        # ── THE FIX: Linear Remap [-1, 1] -> [0, 1] ──
-        # Policy -1 becomes 0.0 (Stopped/Neutral)
-        # Policy  0 becomes 0.5 (Half Forward)
-        # Policy  1 becomes 1.0 (Full Forward)
-        print(f"Raw policy output: throttle={throttle_raw:.3f} steer={steer:.3f}")
-
+        # Remap policy throttle [-1, 1] -> [0, 1] for the motor
         throttle_motor = (throttle_raw + 1.0) / 2.0
 
-        # print(f"Motor action: throttle={throttle_motor:.3f} steer={steer:.3f}")
-
+        # Apply to hardware via our Robot class
         robot.set_throttle(throttle_motor)
-        robot.set_steering(-steer)
+        robot.set_steering(steer) # Removed negative sign; handle inversion in Robot config if needed
 
-        # Update history with RAW values (usually best for the model's "memory")
+        # Update history
         action_history = np.roll(action_history, -2)
         action_history[-2] = throttle_raw
         action_history[-1] = steer
