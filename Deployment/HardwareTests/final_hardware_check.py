@@ -28,7 +28,7 @@ def main():
             motor = math.sin(2 * math.pi * FREQUENCY * t)
             steering = math.sin(2 * math.pi * FREQUENCY * t + math.pi / 2)
 
-            robot.set_throttle(motor)
+            # robot.set_throttle(motor)
             robot.set_steering(steering)
 
             print(f"\rThrottle: {motor:+.2f} | Steering: {steering:+.2f}", end="")

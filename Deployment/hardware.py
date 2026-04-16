@@ -1,12 +1,15 @@
 import RPi.GPIO as GPIO
-
+from rpi_hardware_pwm import HardwarePWM
 
 class Robot:
     def __init__(
         self,
-        pwm_motor_pin=18,
+        # Hardware PWM uses channels, not just GPIO numbers
+        # Pin 18 is typically PWM Channel 2 or 3 depending on overlay
+        # Pin 12 is typically PWM Channel 0
+        pwm_motor_channel=2, 
         dir_motor_pin=15,
-        servo_pin=12,
+        servo_channel=0,
         pwm_freq=1000,
         servo_freq=50,
         servo_min_us=500,
@@ -19,10 +22,7 @@ class Robot:
         max_throttle=0.06
     ):
         # Store config
-        self.pwm_motor_pin = pwm_motor_pin
         self.dir_motor_pin = dir_motor_pin
-        self.servo_pin = servo_pin
-
         self.pwm_freq = pwm_freq
         self.servo_freq = servo_freq
 
@@ -34,20 +34,16 @@ class Robot:
         self.servo_amplitude = servo_amplitude
         self.servo_direction = servo_direction
         self.motor_direction = motor_direction
-
-        # ✅ Clamp and store max throttle
         self.max_throttle = max(0.0, min(1.0, max_throttle))
 
-        # GPIO setup
+        # GPIO setup for Direction pin (Standard GPIO)
         GPIO.setmode(GPIO.BCM)
-
         GPIO.setup(self.dir_motor_pin, GPIO.OUT)
-        GPIO.setup(self.pwm_motor_pin, GPIO.OUT)
-        GPIO.setup(self.servo_pin, GPIO.OUT)
 
-        # Create PWM instances
-        self.motor_pwm = GPIO.PWM(self.pwm_motor_pin, self.pwm_freq)
-        self.servo_pwm = GPIO.PWM(self.servo_pin, self.servo_freq)
+        # Create Hardware PWM instances
+        # HardwarePWM(channel, hz)
+        self.motor_pwm = HardwarePWM(pwm_channel=pwm_motor_channel, hz=self.pwm_freq)
+        self.servo_pwm = HardwarePWM(pwm_channel=servo_channel, hz=self.servo_freq)
 
         # Start PWM (0 duty initially)
         self.motor_pwm.start(0)
@@ -55,15 +51,8 @@ class Robot:
 
     # ---------------- MOTOR ----------------
     def set_throttle(self, value):
-        """
-        value: -1.0 to 1.0
-        """
         value = max(-1.0, min(1.0, value))
-
-        # ✅ Apply max throttle limit
         value *= self.max_throttle
-
-        # Apply direction inversion
         value *= self.motor_direction
 
         direction = GPIO.HIGH if value >= 0 else GPIO.LOW
@@ -71,21 +60,14 @@ class Robot:
 
         GPIO.output(self.dir_motor_pin, direction)
 
-        # Duty cycle is 0–100
-        self.motor_pwm.ChangeDutyCycle(speed * 100.0)
+        # rpi-hardware-pwm uses 0-100 for duty cycle
+        self.motor_pwm.change_duty_cycle(speed * 100.0)
 
     # ---------------- SERVO ----------------
     def set_steering(self, value):
-        """
-        value: -1.0 to 1.0
-        0 = center
-        """
         value = max(-1.0, min(1.0, value))
-
-        # Apply direction + amplitude
         value = value * self.servo_direction * self.servo_amplitude
 
-        # Convert to pulse width
         span = (self.servo_max_us - self.servo_min_us) / 2
         pulse = (
             self.servo_center_us
@@ -93,20 +75,16 @@ class Robot:
             + (value * span)
         )
 
-        # Clamp
         pulse = max(self.servo_min_us, min(self.servo_max_us, pulse))
 
-        # Convert µs → duty cycle (20ms period)
+        # Convert µs → duty cycle (based on 50Hz / 20ms period)
         duty = (pulse / 20000.0) * 100.0
 
-        self.servo_pwm.ChangeDutyCycle(duty)
+        self.servo_pwm.change_duty_cycle(duty)
 
     # ---------------- CLEANUP ----------------
     def stop(self):
         try:
-            self.motor_pwm.ChangeDutyCycle(0)
-            self.servo_pwm.ChangeDutyCycle(0)
-
             self.motor_pwm.stop()
             self.servo_pwm.stop()
         finally:
