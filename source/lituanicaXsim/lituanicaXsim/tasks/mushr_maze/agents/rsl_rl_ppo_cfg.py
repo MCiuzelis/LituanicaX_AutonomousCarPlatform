@@ -10,9 +10,9 @@ from isaaclab_rl.rsl_rl import (
 
 @configclass
 class MushrMazePPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    num_steps_per_env: int = 1500#2000
+    num_steps_per_env: int = 2000
     max_iterations:    int = 3000
-    save_interval:     int = 40
+    save_interval:     int = 20
     experiment_name:   str = "mushr_maze"
 
     # Observation group mapping required by RslRlVecEnvWrapper

@@ -1,11 +1,13 @@
 """MuSHR nano v2 RC car — cone-track navigation environment (DirectRLEnv).
 
 Observation space:
-    [0:N]   flattened depth image from LEFT ArduCam TOF camera (−35° yaw), after crop.
-            Normalized: 1.0 = object at 0 m (danger), 0.0 = object at depth_max_m (clear).
-    [N:2N]  flattened depth image from RIGHT ArduCam TOF camera (+35° yaw), same pipeline.
-    [2N]    normalized forward linear velocity  (v / vel_cap) — vel_cap grows with curriculum
-    [2N+1 … 2N+10]  last 5 throttle+steer pairs, oldest→newest ∈ [-1, 1]  (only if include_prev_action=True)
+    [0:N]        flattened depth image from LEFT ArduCam TOF camera (+35° yaw), after crop.
+                 Normalized: 1.0 = object at 0 m (danger), 0.0 = object at depth_max_m (clear).
+    [N:2N]       flattened depth image from RIGHT ArduCam TOF camera (−35° yaw), same pipeline.
+    [2N:2N+2H]   last H throttle+steer pairs, oldest→newest ∈ [−1, 1]
+                 H = action_history_steps (default 15) → 30 values.
+                 Only appended when include_prev_action=True.
+    No velocity in observation — vehicle speed is not available from real-robot sensors.
 
 Camera profile (ArduCam TOF sensor for Raspberry Pi):
     - Sensor: Time-of-Flight depth, 240×180 pixels at 30 fps
@@ -14,11 +16,10 @@ Camera profile (ArduCam TOF sensor for Raspberry Pi):
     - Policy runs at 30 Hz, synced with camera (sim 120 Hz, decimation=4)
 
 Action space (2):
-    [0]  throttle command in [-1, 1]  → remapped to [0, 1] inside the env:
-         +1 → full acceleration at max_accel_m_s2
-          0 → neutral (no velocity change)
-         -1 → full deceleration at max_decel_m_s2
-         The env integrates a commanded velocity state clamped to [0, vel_cap].
+    [0]  throttle command in [-1, 1]  → remapped to [0, 1] inside the env.
+         Applied as per-wheel torque via a linear torque-speed curve:
+           T(ω) = throttle_norm × T_stall × max(0, 1 − ω/ω_noload)
+         where T_stall and ω_noload are derived from slip_threshold + max_velocity_m_s.
     [1]  steering command in [-1, 1]  → scaled to [-max_steer_rad, +max_steer_rad]
 
 Actuation (Ackermann / AWD, direct torque control):
@@ -46,7 +47,7 @@ TUNING NOTES (first run):
     - All adjustable parameters are in MushrMazeEnvCfg in one place below.
     - Spawn position: set use_preset_spawns + preset_spawn_points in cfg.
     - Camera crop: depth_crop_top_fraction, depth_crop_bottom_fraction.
-    - Speed curriculum: initial_vel_cap_m_s, vel_cap_max_m_s, vel_cap_step_m_s.
+    - Motor model: slip_threshold (wheel-spin sensitivity) and max_velocity_m_s (top speed).
 """
 
 from __future__ import annotations
@@ -82,9 +83,9 @@ _ASSETS_DIR = os.path.normpath(
 )
 
 MUSHR_USD        = os.path.join(_ASSETS_DIR, "mushr_nano_v2.usd")
-TRACK_USD        = os.path.join(_ASSETS_DIR, "CONES.usd")
-WALL_USD         = os.path.join(_ASSETS_DIR, "WALLS.usd")
-WALL_INITIAL_USD = os.path.join(_ASSETS_DIR, "WALLS_INITIAL.usd")
+# TRACK_USD        = os.path.join(_ASSETS_DIR, "CONES.usd")
+TRACK_USD        = os.path.join(_ASSETS_DIR, "CYLINDERS.usd")
+WALL_USD         = os.path.join(_ASSETS_DIR, "WALLS_no_ramps.usd")
 RAMP_USD         = os.path.join(_ASSETS_DIR, "RAMPS.usd")
 
 # ---------------------------------------------------------------------------
@@ -92,9 +93,7 @@ RAMP_USD         = os.path.join(_ASSETS_DIR, "RAMPS.usd")
 # These match mushr_nano_v2.usd geometry and are NOT user-adjustable without
 # also modifying the robot USD.
 # ---------------------------------------------------------------------------
-WHEEL_RADIUS = 0.05    # m
-BASE_LENGTH  = 0.325   # m  (front–rear axle distance)
-BASE_WIDTH   = 0.2     # m  (left–right wheel distance)
+WHEEL_RADIUS = 0.041   # m  (82 mm diameter wheels)
 
 # ---------------------------------------------------------------------------
 # ArduCam TOF camera optics  (derived from 70° diagonal FOV, 240×180 sensor)
@@ -142,8 +141,8 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     --------
     CAMERA          — sensor resolution, FOV, depth range, crop, noise
     SPAWN           — starting position, heading, and speed
-    VELOCITY        — speed curriculum settings
-    DYNAMICS        — acceleration limits, steering limit, IMU normalization
+    SPAWN SPEED     — initial episode velocity range
+    DYNAMICS        — physics-based motor model, steering limit
     TERMINATION     — contact-force threshold, slow-speed detection
     OBSERVATION     — whether to include previous action in obs
     REWARD WEIGHTS  — all reward scale factors
@@ -151,7 +150,7 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
 
     # ── Core env parameters ────────────────────────────────────────────────
     decimation:        int   = 4      # policy at ~30 Hz  (sim 120 Hz / 4)
-    episode_length_s:  float = 200.0  # 200 s × 30 Hz = 6 000 steps
+    episode_length_s:  float = 150.0  # 150 s × 30 Hz = 4 500 steps
     action_space:      int   = 2
     # observation_space is patched in MushrMazeEnv.__init__ after computing
     # the exact cropped depth image size.  The placeholder below keeps
@@ -173,15 +172,41 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     # Crop fractions (fraction of raw pixel rows discarded before the policy):
     #   top  → removes ceiling / sky (depth = max / inf)
     #   bottom → removes near-ground clutter and the robot's own body shadow
-    depth_crop_top_fraction:    float = 0.55#0.475
-    depth_crop_bottom_fraction: float = 0.0
+    depth_crop_top_fraction:    float = 0.35
+    depth_crop_bottom_fraction: float = 0.3
 
     # Gaussian depth noise: σ ≈ 0.007 m gives a ±2 cm (3σ) error band,
     # matching the ArduCam TOF spec.  Set to 0.0 to disable.
-    depth_noise_sigma_m: float = 0.007
+    depth_noise_sigma_m: float = 0.008
+
+    # Random invalid-pixel dropout: each pixel is independently zeroed with this
+    # probability, replicating the black-spec speckle noise visible in real ArduCam
+    # TOF output.  Affected pixels are set to depth_max_m (treated as far/safe by the
+    # policy, matching the real camera's low-confidence masking behaviour).
+    # Visible as black dots in both windows of visualize.py.  Set to 0.0 to disable.
+    depth_invalid_pixel_prob: float = 0.2
+
+    # Random-depth (coloured) speckle: each pixel is set to a uniform random depth in
+    # [0, depth_max_m] with this probability.  Models stray reflections and multi-path
+    # interference that appear as bright or mid-range dots (unlike depth_invalid_pixel_prob
+    # which always sets the pixel to the far/black depth_max_m value).
+    # Set to 0.0 to disable.
+    depth_color_noise_prob: float = 0.05
+
+    # Edge blur noise — simulates the mixed-pixel / depth-bleeding artefact common in
+    # real ToF sensors: pixels whose sensing area straddles a depth discontinuity report
+    # a value somewhere between the two depths rather than either clean value.
+    # Implementation: L1 gradient |∇depth| is computed on the CLEAN cropped depth frame
+    # (before any other noise), then Gaussian noise with
+    #   std = depth_edge_noise_sigma_m × clamp(|∇depth| / depth_edge_gradient_threshold_m, 0, 1)
+    # is added.  Only pixels at depth edges receive meaningful extra noise.
+    # Set depth_edge_noise_sigma_m = 0.0 to disable entirely.
+    depth_edge_gradient_threshold_m: float = 0.35   # gradient (m/px) that gives edge_weight = 1
+    depth_edge_noise_sigma_m:        float = 0.1   # noise std at maximum-weight edges (metres)
 
     # Depth range for normalization.  Readings > depth_max_m are clamped.
-    depth_max_m: float = 5.0
+    # Must match autopilot.py MAX_DISTANCE / 1000.  ArduCam supports 2000 mm or 4000 mm only.
+    depth_max_m: float = 2.0
 
     # ── Policy image downsampling ──────────────────────────────────────────
     # After cropping the raw depth frame (240×≈99 at defaults) the image is
@@ -189,7 +214,7 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     # the observation vector.  Smaller = faster MLP convergence.
     # policy_depth_height < 0 → auto-compute from cropped aspect ratio.
     # Default 80×33 = 2640 dims (vs 240×99 = 23 760 without downsampling).
-    policy_depth_width:  int = 80
+    policy_depth_width:  int = 120
     policy_depth_height: int = -1   # -1 = auto
 
     # ════════════════════════════════════════════════════════════════════════
@@ -213,57 +238,72 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     #
     use_preset_spawns: bool = True
     preset_spawn_points: list = [
-        # (x_m, y_m, theta_deg)  — replace with real track coordinates.
-        (7.6168,  -1.31077, 116.0),   # main start/finish
-        (15.15,     5.0,      -90.0),   # example: tight right-hander
-        # (10.295,     1.847,     18.0),   # example: ramp approach
-        # (12.542,    9.8085,     -2.0),
-        # (15.247,    -7.292,     -95),
+        # (x_m, y_m, theta_deg)
+
+        (7.6168,  -1.31077, 116.0),
+        (7.6168,  -1.31077, -64.0),   # 116 + 180 → 296 → -64
+
+        (15.15,     5.0,      -90.0),
+        (15.15,     5.0,       90.0),  # -90 + 180 → 90
+
         (12.191,    -7.7997,    111),
-        # (8.840,     -8.089,     -93),
+        (12.191,    -7.7997,   -69),   # 111 + 180 → 291 → -69
+
         (5.540,     -9.1814,    88),
-        # (12.326,    -3.5450,    53),
-        # (10.799,    -0.5676,    -121),
+        (5.540,     -9.1814,   -92),   # 88 + 180 → 268 → -92
+
         (6.0156,    8.81074,    28),
+        (6.0156,    8.81074,  -152),   # 28 + 180 → 208 → -152
+
         (11.60,     2.4047,     38),
+        (11.60,     2.4047,   -142),   # 38 + 180 → 218 → -142
     ]
     spawn_yaw_jitter_rad: float = 0.15   # ± heading noise applied in both modes
 
     # ════════════════════════════════════════════════════════════════════════
-    # VELOCITY CURRICULUM
-    # vel_cap starts at initial_vel_cap_m_s and steps up each time any agent
-    # completes a full lap, up to vel_cap_max_m_s.
+    # SPAWN SPEED — initial robot velocity at each episode reset
     # ════════════════════════════════════════════════════════════════════════
-    initial_vel_cap_m_s: float = 1.0   # starting speed ceiling (m/s)
-    vel_cap_max_m_s:     float = 1.0   # absolute maximum speed (m/s)
-    vel_cap_step_m_s:    float = 0.05  # speed ceiling increment per lap (m/s)
-    spawn_vel_min_m_s:   float = 0.1  # minimum spawn speed (m/s); mirrors initial_vel_cap_m_s for training
-    spawn_vel_max_m_s:   float = 1.0  # maximum spawn speed (m/s)
+    spawn_vel_min_m_s: float = 0.0   # minimum spawn speed (m/s)
+    spawn_vel_max_m_s: float = 0.0   # maximum spawn speed (m/s)
 
     # ════════════════════════════════════════════════════════════════════════
-    # DYNAMICS
-    # ════════════════════╛
-    # Direct torque-control model (AWD).  The policy outputs throttle ∈ [-1,1]
-    # which maps to a per-wheel torque following a linear torque-speed curve
-    # (models back-EMF / no-load speed):
+    # DYNAMICS — physics-based motor model (AWD, direct torque control)
     #
-    #   T(ω) = throttle_norm × max_stall_torque_nm × max(0, 1 − ω/max_wheel_no_load_omega)
+    # Motor torque-speed curve (linear, same for all 4 wheels):
+    #   T(throttle, ω) = throttle_norm × T_stall × max(0, 1 − ω/ω_noload)
     #
-    # Wheel spin happens when T > μ_s × (m×g / N_wheels) × WHEEL_RADIUS.
-    # Tune max_stall_torque_nm so spin occurs at the desired throttle fraction (~0.65).
-    max_stall_torque_nm:      float = 0.5    # peak wheel torque at zero wheel speed (Nm)
-    max_wheel_no_load_omega:  float = 60#300.0  # wheel ω at which torque → 0 (rad/s ≈ 15 m/s)
-    max_steer_rad:   float = 0.488  # ≈28° max front-wheel steer angle
+    # T_stall and ω_noload are DERIVED from two intuitive parameters:
+    #
+    #   slip_threshold   — throttle fraction [0,1] that just saturates wheel
+    #                      traction at rest (ω=0).  At this point motor torque
+    #                      equals the grip limit μ_s×(m×g/N_wheels)×r_wheel:
+    #                        T_stall = μ_s × (m×g/4) × r / slip_threshold
+    #
+    #   max_velocity_m_s — vehicle speed where full-throttle torque drops to 0
+    #                      (the motor's no-load speed times wheel radius).  This
+    #                      is a SOFT physics limit — the car simply cannot
+    #                      accelerate past it on a flat straight.
+    #                        ω_noload = max_velocity_m_s / WHEEL_RADIUS
+    #
+    # Both derived values are printed at startup and stored as self._T_stall /
+    # self._omega_noload.  No hard velocity clamp is applied anywhere.
+    # ════════════════════════════════════════════════════════════════════════
+    car_mass_kg:      float = 1.3    # total robot mass (kg); must match robot_cfg mass_props
+    wheel_grip_mu_s:  float = 0.8    # effective static friction coeff (wheel × ground)
+    slip_threshold:   float = 0.7   # throttle fraction [0,1] that saturates traction at rest
+    max_velocity_m_s: float = 2.0   # top speed (m/s): full-throttle torque drops to 0 here
+    max_steer_rad:    float = 0.488  # ≈28° max front-wheel steer angle
 
-    # Steering EMA low-pass filter coefficient (simulates servo bandwidth ≈100 ms).
-    # alpha = 1 − exp(−dt/τ), dt ≈ 1/30 s → alpha=0.4 gives τ ≈ 76 ms.
-    action_lpf_alpha_steer: float = 0.5
+    # Action latency simulation — all actuator commands are delayed by this many
+    # milliseconds before reaching the wheels/steering.  At 30 Hz each step ≈ 33 ms,
+    # so 100 ms ≈ 3 policy steps.  Set to 0.0 to disable.
+    action_delay_ms: float = 33
 
     # ════════════════════════════════════════════════════════════════════════
     # TERMINATION THRESHOLDS
     # ════════════════════════════════════════════════════════════════════════
     # Horizontal contact force on any robot link that counts as a wall hit.
-    wall_contact_force_thresh_n: float = 15.0  # Newtons
+    wall_contact_force_thresh_n: float = 15.0  # Newtonsgz
 
     # slow_stop_speed_fraction — episode terminates when speed falls below this
     # (catches truly stuck / reversed agents; keep low so normal braking is fine)
@@ -282,10 +322,10 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     # REWARD WEIGHTS
     # ════════════════════════════════════════════════════════════════════════
     # Distance: rewards physical metres covered each step (v × dt).
-    distance_weight:    float = 6.0
+    distance_weight:    float = 12.0
 
-    # Speed bonus, normalised by initial_vel_cap_m_s (fixed scale across curriculum).
-    forward_weight:     float = 0
+    # Speed bonus, normalised by max_velocity_m_s.
+    forward_weight:     float = 2
 
     # Extra penalty for wall contact (on top of the base collision cost).
     wall_penalty:       float = 0
@@ -294,13 +334,13 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     # Fires every time an agent crosses a sector gate faster than the global reference.
     # reward = sector_gain_weight × (ref_time - sector_time) / ref_time
     # This is the primary incentive for racing lines and faster cornering.
-    sector_gain_weight: float = 200
+    sector_gain_weight: float = 100#200
 
     # Rear-wheel slip penalty.
-    slip_weight:        float = 5
+    slip_weight:        float = 1
 
     # Steering deadzone penalty: only penalises steering beyond the deadzone.
-    steer_deadzone_weight: float = 0.15
+    steer_deadzone_weight: float = 0.1
     steer_deadzone:        float = 0.05   # fraction of max_steer_rad that is free
 
     # Dense per-step proximity reward toward the next sector gate.
@@ -312,18 +352,18 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     #          (lap_reward_slow_time_s - lap_reward_fast_time_s) * (lap_reward_fast - lap_reward_slow)
     # Clamped at lap_reward_slow as floor; extrapolates above lap_reward_fast for sub-30s laps.
     lap_reward_slow_time_s: float = 40.0    # reference slow lap time (s)
-    lap_reward_slow:        float = 200.0   # reward at slow reference time
+    lap_reward_slow:        float = 10.0   # reward at slow reference time
     lap_reward_fast_time_s: float = 30.0    # reference fast lap time (s)
-    lap_reward_fast:        float = 500.0   # reward at fast reference time
+    lap_reward_fast:        float = 10.0   # reward at fast reference time
 
     # Ramp per-step reward (while robot base is elevated on the ramp surface).
-    ramp_reward_weight: float = 0.1
+    ramp_reward_weight: float = 0
 
     # Ramp speed penalty: fires every step the robot is inside the ramp XY bounding
     # box (or within ramp_approach_radius_m of it) and its forward speed exceeds
     # ramp_speed_threshold_m_s.  Penalty scales linearly with the excess speed.
     ramp_speed_threshold_m_s:  float = 3.0
-    ramp_speed_penalty_weight: float = 3
+    ramp_speed_penalty_weight: float = 0
     ramp_approach_radius_m:    float = 4.0  # extend penalty zone this far beyond ramp bbox
 
     # ════════════════════════════════════════════════════════════════════════
@@ -336,7 +376,7 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
             usd_path=MUSHR_USD,
             scale=(1.0, 1.0, 1.0),
             activate_contact_sensors=True,
-            mass_props=sim_utils.MassPropertiesCfg(mass=2.0),
+            mass_props=sim_utils.MassPropertiesCfg(mass=1.3),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 rigid_body_enabled=True,
                 max_linear_velocity=10000.0,
@@ -372,33 +412,35 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
             "steering": ImplicitActuatorCfg(
                 joint_names_expr=["front_left_wheel_steer", "front_right_wheel_steer"],
                 stiffness=100.0, damping=10.0,
-                velocity_limit_sim=10.0, effort_limit_sim=3.2,
+                # Velocity limit matches real servo: full sweep (2×0.488 rad) in 150 ms
+                # → 0.976 / 0.150 = 6.51 rad/s.  PhysX enforces this as a hard cap.
+                velocity_limit_sim=6.51, effort_limit_sim=3.2,
             ),
             "rear_throttle": ImplicitActuatorCfg(
                 joint_names_expr=["back_left_wheel_throttle", "back_right_wheel_throttle"],
                 stiffness=0.0, damping=0.0,       # direct torque control via effort target
-                velocity_limit_sim=450.0, effort_limit_sim=0.5,
+                velocity_limit_sim=450.0, effort_limit_sim=5.0,
             ),
             "front_throttle": ImplicitActuatorCfg(
                 joint_names_expr=["front_left_wheel_throttle", "front_right_wheel_throttle"],
                 stiffness=0.0, damping=0.0,       # direct torque control via effort target
-                velocity_limit_sim=450.0, effort_limit_sim=0.5,
+                velocity_limit_sim=450.0, effort_limit_sim=5.0,
             ),
         },
     )
 
-    # Two ArduCam TOF depth cameras — identical specs, 2 cm behind base_link origin,
-    # 1 cm apart (1 cm left / 1 cm right of centre), each tilted 5° downward.
+    # Two ArduCam TOF depth cameras:
+    #   Position: 122 mm forward of base_link, ±50 mm left/right, 70 mm above base_link.
+    #   Orientation: ±30° yaw outward only — no pitch.
     #
-    # Rotation derivation:
-    #   Start: q_forward = (-0.5, 0.5, -0.5, 0.5)  (camera level, pointing fwd)
-    #   Yaw  : q_yaw_z(±35°) * q_forward
-    #             left  (+35°): (-0.6272, 0.6272, -0.3265, 0.3265)
-    #             right (-35°): (-0.3265, 0.3265, -0.6272, 0.6272)
-    #   Pitch: right-multiply by q_cam_X(+5°) = (0.9990, 0.04362, 0, 0)
-    #          (rotates +5° around camera-local X → tilts Z-forward toward Y-down)
-    #             left  final: (-0.6540, 0.5992, -0.3119, 0.3404)
-    #             right final: (-0.3404, 0.3119, -0.5992, 0.6540)
+    # Rotation derivation (all quaternions in (w, x, y, z) ROS convention):
+    #   Start: q_forward = (-0.5, 0.5, -0.5, 0.5)  (camera level, pointing fwd in ROS)
+    #   Yaw  : q_yaw_z(±30°) * q_forward
+    #             left  (+30°): (-0.6124, 0.6124, -0.3536, 0.3536)
+    #             right (-30°): (-0.3536, 0.3536, -0.6124, 0.6124)
+    #   Result forward vectors in base_link frame:
+    #             left : (cos30°, sin30°, 0) = (0.866, 0.500, 0.000)
+    #             right: (cos30°, -sin30°, 0) = (0.866, -0.500, 0.000)
     camera_left_cfg: TiledCameraCfg = TiledCameraCfg(
         prim_path="/World/envs/env_.*/Robot/mushr_nano/base_link/camera_left",
         update_period=0.0,
@@ -409,11 +451,11 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
             focal_length=_TOF_FOCAL_MM,
             horizontal_aperture=_TOF_H_APERTURE_MM,
             vertical_aperture=_TOF_V_APERTURE_MM,
-            clipping_range=(0.05, 10.0),
+            clipping_range=(0.01, 5.0),
         ),
         offset=TiledCameraCfg.OffsetCfg(
-            pos=(-0.02, 0.01, 0.1),   # 2 cm back, 1 cm left, 10 cm up
-            rot=(-0.6540, 0.5992, -0.3119, 0.3404),
+            pos=(0.122, 0.05, 0.07),   # 122 mm fwd, 50 mm left, 70 mm up from base_link
+            rot=(-0.6124, 0.6124, -0.3536, 0.3536),   # 30° yaw left, no pitch
             convention="ros",
         ),
         debug_vis=False,
@@ -428,11 +470,11 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
             focal_length=_TOF_FOCAL_MM,
             horizontal_aperture=_TOF_H_APERTURE_MM,
             vertical_aperture=_TOF_V_APERTURE_MM,
-            clipping_range=(0.05, 10.0),
+            clipping_range=(0.01, 5.0),
         ),
         offset=TiledCameraCfg.OffsetCfg(
-            pos=(-0.02, -0.01, 0.1),  # 2 cm back, 1 cm right, 10 cm up
-            rot=(-0.3404, 0.3119, -0.5992, 0.6540),
+            pos=(0.122, -0.05, 0.07),  # 122 mm fwd, 50 mm right, 70 mm up from base_link
+            rot=(-0.3536, 0.3536, -0.6124, 0.6124),   # 30° yaw right, no pitch
             convention="ros",
         ),
         debug_vis=False,
@@ -442,6 +484,12 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     show_camera_debug:    bool = False
     camera_debug_env_id:  int  = 0
     camera_debug_interval:int  = 2
+
+    # Spawn a pair of visible cones in the sim to verify camera placement.
+    # Tip at each camera sensor origin; base (wide end) pointing along the camera's
+    # look direction.  Left camera = cyan, right camera = magenta.
+    # Set to True for one training run, inspect in the viewport, then set back to False.
+    show_camera_cones: bool = False
 
 
 # ===========================================================================
@@ -559,9 +607,29 @@ class MushrMazeEnv(DirectRLEnv):
         H = cfg.action_history_steps
         self._prev_action = torch.zeros(self.num_envs, H, 2, device=self.device)
 
-        # Curriculum
-        self._vel_cap:              float = cfg.initial_vel_cap_m_s
-        self._lap_at_current_vel:   bool  = False
+        # Action delay buffer — holds the last (delay_steps+1) raw actions so that
+        # actuators receive the command issued delay_steps policy ticks ago.
+        # The observation history still stores the undelayed policy output so the
+        # network can reason about what it recently commanded vs what the car has done.
+        policy_dt = cfg.decimation * cfg.sim.dt          # ≈ 1/30 s
+        self._delay_steps = max(0, round(cfg.action_delay_ms * 1e-3 / policy_dt))
+        buf_len = max(1, self._delay_steps + 1)
+        self._action_delay_buf = torch.zeros(self.num_envs, buf_len, 2, device=self.device)
+        print(f"[MushrMazeEnv] Action delay: {cfg.action_delay_ms:.0f} ms → {self._delay_steps} policy step(s)")
+
+        # Derived motor parameters — computed once from physics-based config fields.
+        # T_stall: stall torque per wheel = traction limit / slip_threshold
+        # ω_noload: no-load angular velocity = max_velocity / wheel_radius
+        _g = 9.81
+        _traction_limit = cfg.wheel_grip_mu_s * (cfg.car_mass_kg * _g / 4.0) * WHEEL_RADIUS
+        self._T_stall      = _traction_limit / cfg.slip_threshold
+        self._omega_noload = cfg.max_velocity_m_s / WHEEL_RADIUS
+        print(
+            f"[MushrMazeEnv] Motor model: T_stall={self._T_stall:.4f} Nm/wheel, "
+            f"ω_noload={self._omega_noload:.2f} rad/s  "
+            f"(slip_threshold={cfg.slip_threshold:.2f}, μ_s={cfg.wheel_grip_mu_s}, "
+            f"m={cfg.car_mass_kg} kg, v_max={cfg.max_velocity_m_s} m/s)"
+        )
 
         # Ramp / global state
         self._total_laps_completed: int  = 0
@@ -589,10 +657,6 @@ class MushrMazeEnv(DirectRLEnv):
         )
         self._lap_start_step = torch.zeros(
             self.num_envs, dtype=torch.int32, device=self.device,
-        )
-        self._agent_spawn_vel_cap = torch.full(
-            (self.num_envs,), cfg.initial_vel_cap_m_s,
-            dtype=torch.float32, device=self.device,
         )
         self._current_sector = torch.zeros(
             self.num_envs, dtype=torch.int64, device=self.device,
@@ -743,6 +807,58 @@ class MushrMazeEnv(DirectRLEnv):
         phys_rubber.CreateDynamicFrictionAttr().Set(1.0)
         phys_rubber.CreateRestitutionAttr().Set(0.05)
 
+        # ── Debug camera-direction cones (disabled by default) ───────────────────
+        # Cone tip at camera sensor origin; base (wide end) along camera look direction.
+        # Cloned to all envs automatically.  Toggle: cfg.show_camera_cones = True.
+        if self.cfg.show_camera_cones:
+            import math as _math
+            from pxr import Gf
+            base_link_p = "/World/envs/env_0/Robot/mushr_nano/base_link"
+            cone_h, cone_r = 0.15, 0.025   # height (m), base radius (m)
+            for cam_name, cam_cfg, colour in (
+                ("camera_left",  self.cfg.camera_left_cfg,  (0.0, 1.0, 1.0)),  # cyan
+                ("camera_right", self.cfg.camera_right_cfg, (1.0, 0.0, 1.0)),  # magenta
+            ):
+                # Camera forward direction in base_link frame = R(q) · (0,0,1).
+                # Camera quaternion is (w, x, y, z) in ROS convention.
+                qw, qx, qy, qz = cam_cfg.offset.rot
+                fwd_x = 2.0*(qx*qz + qw*qy)
+                fwd_y = 2.0*(qy*qz - qw*qx)
+                fwd_z = 1.0 - 2.0*(qx*qx + qy*qy)
+
+                # Cone centre = camera_pos + (h/2) * fwd  → tip lands at camera origin.
+                px, py, pz = cam_cfg.offset.pos
+                ccx = px + 0.5*cone_h*fwd_x
+                ccy = py + 0.5*cone_h*fwd_y
+                ccz = pz + 0.5*cone_h*fwd_z
+
+                # Quaternion rotating cone's +Y onto fwd.
+                # cross((0,1,0), fwd) = (fwd_z, 0, -fwd_x); dot = fwd_y.
+                dot      = fwd_y
+                cross_len = _math.sqrt(fwd_z**2 + fwd_x**2)
+                if cross_len < 1e-6:
+                    orient = Gf.Quatf(1.0, 0.0, 0.0, 0.0) if dot > 0 else Gf.Quatf(0.0, 1.0, 0.0, 0.0)
+                else:
+                    w_q    = _math.sqrt(max(0.0, 0.5*(1.0 + dot)))
+                    k      = _math.sqrt(max(0.0, 0.5*(1.0 - dot))) / cross_len
+                    orient = Gf.Quatf(w_q, k*fwd_z, 0.0, k*(-fwd_x))
+
+                cone_prim = UsdGeom.Cone.Define(
+                    stage, f"{base_link_p}/{cam_name}_debug_cone"
+                )
+                cone_prim.CreateHeightAttr(cone_h)
+                cone_prim.CreateRadiusAttr(cone_r)
+                cone_prim.CreateAxisAttr("Y")
+                cone_prim.CreateDisplayColorAttr([Gf.Vec3f(*colour)])
+                xf = UsdGeom.Xformable(cone_prim.GetPrim())
+                xf.ClearXformOpOrder()
+                xf.AddTranslateOp().Set(Gf.Vec3d(ccx, ccy, ccz))
+                xf.AddOrientOp().Set(orient)
+                print(
+                    f"[CamCone] {cam_name}: tip=({px:.4f}, {py:.4f}, {pz:.4f})  "
+                    f"fwd=({fwd_x:.3f}, {fwd_y:.3f}, {fwd_z:.3f})"
+                )
+
         self.scene.clone_environments(copy_from_source=False)
 
         rubber_mat = UsdShade.Material(rubber_mat_prim)
@@ -849,34 +965,42 @@ class MushrMazeEnv(DirectRLEnv):
         Throttle (actions[:,0]) ∈ [-1,1]:
             Remapped to [0,1], then applied as wheel torque following a
             linear torque-speed curve (models motor back-EMF):
-                T(ω) = throttle_norm × max_stall_torque × max(0, 1 − ω/ω_noload)
+                T(ω) = throttle_norm × T_stall × max(0, 1 − ω/ω_noload)
             Wheel spin occurs naturally when T > traction limit.
+
+        Latency model: raw actions are pushed into _action_delay_buf; actuators
+        receive the command from delay_steps ticks ago.  The observation history
+        (_prev_action) still records the undelayed policy output so the network
+        can reason about what it recently commanded.
         """
-        throttle_norm = (actions[:, 0].clamp(-1.0, 1.0) + 1.0) * 0.5   # → [0, 1]
+        raw = actions[:, :2].clamp(-1.0, 1.0)   # [N, 2]  — undelayed policy output
+
+        # Push into delay FIFO and read the oldest (delayed) entry
+        self._action_delay_buf = self._action_delay_buf.roll(-1, dims=1)
+        self._action_delay_buf[:, -1] = raw
+        delayed = self._action_delay_buf[:, 0]   # [N, 2]  — what the actuators act on
+
+        throttle_norm = (delayed[:, 0] + 1.0) * 0.5   # → [0, 1]
 
         # Per-wheel speed (abs) — shape [N, 4]: rear_L, rear_R, front_L, front_R
         wheel_omega = self.robot.data.joint_vel[:, self._all_throttle_ids].abs()
 
         # Linear torque-speed rolloff: full torque at standstill, zero at no-load speed
-        torque_rolloff = (1.0 - wheel_omega / self.cfg.max_wheel_no_load_omega).clamp(0.0, 1.0)
+        torque_rolloff = (1.0 - wheel_omega / self._omega_noload).clamp(0.0, 1.0)
 
         # Per-wheel torque = throttle × stall_torque × rolloff  — shape [N, 4]
-        per_wheel_torque = throttle_norm.unsqueeze(-1) * self.cfg.max_stall_torque_nm * torque_rolloff
+        per_wheel_torque = throttle_norm.unsqueeze(-1) * self._T_stall * torque_rolloff
         self._wheel_torque_rear  = per_wheel_torque[:, :2]
         self._wheel_torque_front = per_wheel_torque[:, 2:]
 
-        alpha_s = self.cfg.action_lpf_alpha_steer
-        self._filtered_steer = (
-            alpha_s * actions[:, 1].clamp(-1.0, 1.0)
-            + (1.0 - alpha_s) * self._filtered_steer
-        )
+        # Steering: direct passthrough, no LPF (matches real hardware — no filter on servo)
+        self._filtered_steer = delayed[:, 1]
         steer_ang = self._filtered_steer * self.cfg.max_steer_rad
         self._steer_tan = torch.tan(steer_ang)
 
-        # Shift history left (drop oldest) and append newest action
+        # Shift observation history left and append newest RAW (undelayed) action
         self._prev_action = self._prev_action.roll(-1, dims=1)
-        self._prev_action[:, -1, 0] = actions[:, 0].clamp(-1.0, 1.0)
-        self._prev_action[:, -1, 1] = actions[:, 1].clamp(-1.0, 1.0)
+        self._prev_action[:, -1] = raw
 
     def _apply_action(self) -> None:
         wall_hit_now = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -921,9 +1045,46 @@ class MushrMazeEnv(DirectRLEnv):
         h = depth.shape[1]
         top = int(self.cfg.depth_crop_top_fraction    * h)
         bot = h - int(self.cfg.depth_crop_bottom_fraction * h)
-        depth = depth[:, top:bot, :]
+        depth = depth[:, top:bot, :]                                # [N, H', W]
+
+        # Edge weights computed on the CLEAN signal so that only real depth
+        # discontinuities (not noise spikes) drive the edge-blur effect.
+        if self.cfg.depth_edge_noise_sigma_m > 0.0:
+            _d4  = depth.unsqueeze(1)                                        # [N,1,H',W]
+            _px  = F.pad(_d4, (1, 1, 0, 0), mode="replicate")               # [N,1,H',W+2]
+            _py  = F.pad(_d4, (0, 0, 1, 1), mode="replicate")               # [N,1,H'+2,W]
+            _dx  = (_px[:, :, :, 2:] - _px[:, :, :, :-2]) * 0.5            # centred ∂/∂x
+            _dy  = (_py[:, :, 2:, :] - _py[:, :, :-2, :]) * 0.5            # centred ∂/∂y
+            _edge_w = (
+                (_dx.abs() + _dy.abs()).squeeze(1)                           # L1 grad [N,H',W]
+                / self.cfg.depth_edge_gradient_threshold_m
+            ).clamp(0.0, 1.0)
+
+        # ── Noise passes ──────────────────────────────────────────────────────
         if self.cfg.depth_noise_sigma_m > 0.0:
+            # Broadband Gaussian noise (models ±2 cm ToF depth accuracy).
             depth = depth + torch.randn_like(depth) * self.cfg.depth_noise_sigma_m
+
+        if self.cfg.depth_invalid_pixel_prob > 0.0:
+            # Black-spec speckle: pixel → depth_max_m (far/safe, matches ArduCam masking).
+            invalid = torch.rand_like(depth) < self.cfg.depth_invalid_pixel_prob
+            depth = depth.masked_fill(invalid, self.cfg.depth_max_m)
+
+        if self.cfg.depth_color_noise_prob > 0.0:
+            # Coloured speckle: pixel → uniform random depth in [0, depth_max_m].
+            # Models stray reflections / multi-path interference.
+            color_mask = torch.rand_like(depth) < self.cfg.depth_color_noise_prob
+            depth = torch.where(
+                color_mask,
+                torch.rand_like(depth) * self.cfg.depth_max_m,
+                depth,
+            )
+
+        if self.cfg.depth_edge_noise_sigma_m > 0.0:
+            # Edge blur: extra Gaussian noise proportional to local depth gradient.
+            # Simulates mixed-pixel / depth-bleeding at depth discontinuities.
+            depth = depth + torch.randn_like(depth) * (self.cfg.depth_edge_noise_sigma_m * _edge_w)
+
         depth = depth.clamp(0.01, self.cfg.depth_max_m)
         depth_norm = 1.0 - depth / self.cfg.depth_max_m
         depth_4d = F.interpolate(
@@ -970,8 +1131,8 @@ class MushrMazeEnv(DirectRLEnv):
         # Distance covered this step
         r_distance = self.cfg.distance_weight * lin_vel_b * dt
 
-        # Speed bonus — fixed normalisation by initial_vel_cap_m_s keeps scale stable as curriculum advances
-        r_forward = self.cfg.forward_weight * (lin_vel_b / self.cfg.initial_vel_cap_m_s)
+        # Speed bonus — normalised by max_velocity_m_s
+        r_forward = self.cfg.forward_weight * (lin_vel_b / self.cfg.max_velocity_m_s)
 
         # Wall penalty
         r_wall = -self.cfg.wall_penalty * self._wall_terminated.float()
@@ -1044,10 +1205,6 @@ class MushrMazeEnv(DirectRLEnv):
                             f"{self._sector_reference_times.mean().item():.2f} s"
                         )
 
-                fresh_lap = lap_agents & (self._agent_spawn_vel_cap == self._vel_cap)
-                if fresh_lap.any() and not self._lap_at_current_vel:
-                    self._lap_at_current_vel = True
-
         # Lap completion bonus — linear between (lap_reward_slow_time_s, lap_reward_slow)
         # and (lap_reward_fast_time_s, lap_reward_fast), clamped at floor.
         r_lap = torch.zeros(self.num_envs, device=self.device)
@@ -1082,7 +1239,7 @@ class MushrMazeEnv(DirectRLEnv):
         # ── Wheel slip (AWD — all 4 wheels) ──────────────────────────────────────
         wheel_vel  = self.robot.data.joint_vel[:, self._all_throttle_ids].mean(dim=-1) * WHEEL_RADIUS
         slip_speed = torch.abs(wheel_vel - lin_vel_b)
-        r_slip     = -self.cfg.slip_weight * slip_speed / self.cfg.initial_vel_cap_m_s * (~self._on_ramp).float()
+        r_slip     = -self.cfg.slip_weight * slip_speed / self.cfg.max_velocity_m_s * (~self._on_ramp).float()
 
         # ── Steering deadzone penalty ────────────────────────────────────────────
         steer_norm    = torch.abs(self._filtered_steer).clamp(0.0, 1.0)
@@ -1099,7 +1256,7 @@ class MushrMazeEnv(DirectRLEnv):
         r_ramp = (
             self.cfg.ramp_reward_weight
             * self._on_ramp.float()
-            * (lin_vel_b / self.cfg.initial_vel_cap_m_s).clamp(0.0, 1.0)
+            * (lin_vel_b / self.cfg.max_velocity_m_s).clamp(0.0, 1.0)
         )
 
         # ── Ramp speed penalty ───────────────────────────────────────────────────
@@ -1166,7 +1323,7 @@ class MushrMazeEnv(DirectRLEnv):
         # Grace period of 45 steps (~1.5 s) lets the car accelerate from spawn.
         lin_vel_b = self.robot.data.root_lin_vel_b[:, 0]
         stopped = (
-            (lin_vel_b < (self.cfg.slow_stop_speed_fraction * self._vel_cap))
+            (lin_vel_b < (self.cfg.slow_stop_speed_fraction * self.cfg.max_velocity_m_s))
             & (self.episode_length_buf > 45)
         )
 
@@ -1181,14 +1338,6 @@ class MushrMazeEnv(DirectRLEnv):
     def _reset_idx(self, env_ids: Sequence[int] | None):
         if env_ids is None:
             env_ids = self.robot._ALL_INDICES
-
-        # Curriculum advancement
-        if self._lap_at_current_vel and self._vel_cap < self.cfg.vel_cap_max_m_s:
-            self._lap_at_current_vel = False
-            self._vel_cap = min(
-                self._vel_cap + self.cfg.vel_cap_step_m_s, self.cfg.vel_cap_max_m_s
-            )
-            print(f"[Curriculum] vel_cap → {self._vel_cap:.2f} m/s  (full lap completed)")
 
         super()._reset_idx(env_ids)
 
@@ -1248,10 +1397,9 @@ class MushrMazeEnv(DirectRLEnv):
         self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
 
         # Sector / spawn / filter state reset
-        self._spawn_pos[env_ids]           = spawn_xy
-        self._sectors_this_ep[env_ids]     = 0
-        self._agent_spawn_vel_cap[env_ids] = self._vel_cap
-        self._sector_entry_step[env_ids]   = 0
+        self._spawn_pos[env_ids]        = spawn_xy
+        self._sectors_this_ep[env_ids]  = 0
+        self._sector_entry_step[env_ids] = 0
         self._lap_start_step[env_ids]      = 0
 
         next_gate_r = (self._current_sector[env_ids] + 1) % self._n_sectors
@@ -1264,7 +1412,8 @@ class MushrMazeEnv(DirectRLEnv):
         self._filtered_steer[env_ids] = 0.0
         self._steer_integral[env_ids] = 0.0
         self._prev_steer[env_ids]     = 0.0
-        self._prev_action[env_ids]    = 0.0   # clears full [5, 2] history
+        self._prev_action[env_ids]    = 0.0         # clears full [H, 2] history
+        self._action_delay_buf[env_ids] = 0.0       # clears latency FIFO
 
         self._ramp_ascended[env_ids]     = False
         self._wall_ever_touched[env_ids] = False
