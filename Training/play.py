@@ -90,7 +90,11 @@ import time
 # Identical approach to visualize.py: a separate Python process with the
 # GUI-capable opencv-python loaded from the conda site-packages polls two PNG
 # files written atomically by the main process and shows them via cv2.imshow.
-_CONDA_SP = "/home/matasciuzelis/miniconda3/envs/isaac/lib/python3.11/site-packages"
+_conda_prefix = os.environ.get("CONDA_PREFIX", "")
+_CONDA_SP = (
+    os.path.join(_conda_prefix, "lib", f"python{sys.version_info.major}.{sys.version_info.minor}", "site-packages")
+    if _conda_prefix else ""
+)
 _FPV_DISPLAY_SCRIPT = rf"""
 import sys, os
 sys.path = [
@@ -138,7 +142,7 @@ from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper, export_po
 from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
 
 import isaaclab_tasks  # noqa: F401
-import lituanicaXsim  # noqa: F401
+import tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
@@ -171,7 +175,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
 
     # specify directory for logging experiments (absolute path, matches train.py)
-    log_root_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../logs", "rsl_rl", agent_cfg.experiment_name)
+    log_root_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "rsl_rl", agent_cfg.experiment_name)
     print(f"[INFO] Loading experiment from directory: {log_root_path}")
     if args_cli.use_pretrained_checkpoint:
         resume_path = get_published_pretrained_checkpoint("rsl_rl", train_task_name)
@@ -264,7 +268,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     _fpv_out_dir = "/tmp/mushr_debug"
     if args_cli.fpv:
         os.makedirs(_fpv_out_dir, exist_ok=True)
-        _mushr_env = env.unwrapped          # DirectRLEnv (MushrMazeEnv)
+        _mushr_env = env.unwrapped          # DirectRLEnv (ConeTrackEnv)
         if os.environ.get("DISPLAY"):
             _display_env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
             _fpv_proc = subprocess.Popen(
@@ -309,18 +313,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             np.clip(raw_norm * 255, 0, 255).astype(np.uint8), cv2.COLORMAP_JET
         )
         _write_atomic(os.path.join(_fpv_out_dir, f"raw_{suffix}.png"), raw_bgr)
-        h = depth_np.shape[0]
-        top = int(_mushr_env.cfg.depth_crop_top_fraction * h)
-        bot = h - int(_mushr_env.cfg.depth_crop_bottom_fraction * h)
-        pol_np = depth_np[top:bot, :]
-        if _mushr_env.cfg.depth_noise_sigma_m > 0.0:
-            pol_np = pol_np + np.random.normal(
-                0.0, _mushr_env.cfg.depth_noise_sigma_m, pol_np.shape
-            ).astype(np.float32)
-        pol_np   = np.clip(pol_np, 0.01, depth_max)
-        pol_norm = 1.0 - pol_np / depth_max
+
+        # Policy window: exact same pipeline as training (_process_single_depth).
+        pol_flat = _mushr_env._process_single_depth(camera)   # [1, ph*pw], values [0,1]
+        pol_2d   = pol_flat[0].reshape(
+            _mushr_env._policy_depth_h, _mushr_env._policy_depth_w,
+        ).cpu().numpy()
         pol_bgr  = cv2.applyColorMap(
-            np.clip(pol_norm * 255, 0, 255).astype(np.uint8), cv2.COLORMAP_JET
+            np.clip(pol_2d * 255, 0, 255).astype(np.uint8), cv2.COLORMAP_JET
         )
         _write_atomic(os.path.join(_fpv_out_dir, f"policy_{suffix}.png"), pol_bgr)
 

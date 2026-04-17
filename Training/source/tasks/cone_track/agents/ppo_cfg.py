@@ -1,4 +1,4 @@
-"""RSL-RL PPO configuration for MuSHR RC car maze navigation."""
+"""RSL-RL PPO configuration for the cone-track task."""
 
 from isaaclab.utils import configclass
 from isaaclab_rl.rsl_rl import (
@@ -9,11 +9,11 @@ from isaaclab_rl.rsl_rl import (
 
 
 @configclass
-class MushrMazePPORunnerCfg(RslRlOnPolicyRunnerCfg):
+class ConeTrackPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env: int = 2000
     max_iterations:    int = 3000
     save_interval:     int = 20
-    experiment_name:   str = "mushr_maze"
+    experiment_name:   str = "cone_track"
 
     # Observation group mapping required by RslRlVecEnvWrapper
     obs_groups = {"policy": ["policy"], "critic": ["policy"]}
