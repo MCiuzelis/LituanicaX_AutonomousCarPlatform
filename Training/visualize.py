@@ -43,7 +43,7 @@ if "ISAACLAB_LIBSTDCPP_FIXED" not in os.environ:
 from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description="Visualize MuSHR TOF depth streams (no policy).")
-parser.add_argument("--task", type=str, default="Mushr", help="Gym task name.")
+parser.add_argument("--task", type=str, default="ConeTrack", help="Gym task name.")
 parser.add_argument("--crop_top",    type=float, default=None,
     help="Override depth_crop_top_fraction (e.g. 0.15).")
 parser.add_argument("--crop_bottom", type=float, default=None,
@@ -65,7 +65,11 @@ args_cli = parser.parse_args()
 args_cli.enable_cameras = True
 
 # ── display subprocess ─────────────────────────────────────────────────────────
-_CONDA_SP = "/home/matasciuzelis/miniconda3/envs/isaac/lib/python3.11/site-packages"
+_conda_prefix = os.environ.get("CONDA_PREFIX", "")
+_CONDA_SP = (
+    os.path.join(_conda_prefix, "lib", f"python{sys.version_info.major}.{sys.version_info.minor}", "site-packages")
+    if _conda_prefix else ""
+)
 
 _DISPLAY_SCRIPT = rf"""
 import sys, os
@@ -154,9 +158,9 @@ import gymnasium as gym
 import cv2  # headless fine here — only imwrite used
 
 import isaaclab_tasks  # noqa: F401
-import lituanicaXsim   # noqa: F401
+import tasks  # noqa: F401
 
-from lituanicaXsim.tasks.mushr_maze.mushr_maze_env import MushrMazeEnvCfg
+from tasks.cone_track.env import ConeTrackEnvCfg
 
 
 def _depth_to_colormap(depth_float: np.ndarray) -> np.ndarray:
@@ -177,7 +181,7 @@ def _write_atomic(path: str, img: np.ndarray) -> None:
 
 
 def main():
-    env_cfg = MushrMazeEnvCfg()
+    env_cfg = ConeTrackEnvCfg()
     env_cfg.scene.num_envs = 1
     env_cfg.show_camera_debug = False
     if args_cli.device is not None:

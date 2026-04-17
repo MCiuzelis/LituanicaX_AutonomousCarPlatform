@@ -1,8 +1,0 @@
-To activate the virtual env:
-source ~/arducam_venv/bin/activate
-
-hardware pwm:
-sudo nano /boot/firmware/config.txt
-dtoverlay=pwm-2chan,pin=12,func=4,pin2=18,func2=4
-
-something similar for cam

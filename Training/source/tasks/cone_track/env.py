@@ -44,8 +44,8 @@ Termination conditions:
     - Slow driving: speed < 2% of vel_cap for > ~1.5 s after episode start
 
 TUNING NOTES (first run):
-    - All adjustable parameters are in MushrMazeEnvCfg in one place below.
-    - Spawn position: set use_preset_spawns + preset_spawn_points in cfg.
+    - All adjustable parameters are in ConeTrackEnvCfg in one place below.
+    - Spawn position: set preset_spawn_points in cfg.
     - Camera crop: depth_crop_top_fraction, depth_crop_bottom_fraction.
     - Motor model: slip_threshold (wheel-spin sensitivity) and max_velocity_m_s (top speed).
 """
@@ -53,7 +53,6 @@ TUNING NOTES (first run):
 from __future__ import annotations
 
 from collections.abc import Sequence
-import csv
 import math
 import os
 
@@ -79,13 +78,12 @@ from isaaclab.utils.math import quat_from_euler_xyz
 # Asset USD paths  (relative to this file → project root → assets/)
 # ---------------------------------------------------------------------------
 _ASSETS_DIR = os.path.normpath(
-    os.path.join(os.path.dirname(__file__), "../../../../../assets")
+    os.path.join(os.path.dirname(__file__), "../../../assets")
 )
 
 MUSHR_USD        = os.path.join(_ASSETS_DIR, "mushr_nano_v2.usd")
-# TRACK_USD        = os.path.join(_ASSETS_DIR, "CONES.usd")
-TRACK_USD        = os.path.join(_ASSETS_DIR, "CYLINDERS.usd")
-WALL_USD         = os.path.join(_ASSETS_DIR, "WALLS_no_ramps.usd")
+TRACK_USD        = os.path.join(_ASSETS_DIR, "TRACK.usd")
+WALL_USD         = os.path.join(_ASSETS_DIR, "WALLS.usd")
 RAMP_USD         = os.path.join(_ASSETS_DIR, "RAMPS.usd")
 
 # ---------------------------------------------------------------------------
@@ -113,12 +111,6 @@ _TOF_FOCAL_MM      = 4.0   # reference focal length (mm); aperture ratio is what
 _TOF_H_APERTURE_MM = 2.0 * _TOF_FOCAL_MM * math.tan(math.radians(_TOF_HFOV_DEG / 2.0))
 _TOF_V_APERTURE_MM = 2.0 * _TOF_FOCAL_MM * math.tan(math.radians(_TOF_VFOV_DEG / 2.0))
 
-# ---------------------------------------------------------------------------
-# Sector gate system — centerline exported from Blender/curve_points.csv
-# ---------------------------------------------------------------------------
-SECTOR_CSV_TO_ISAAC_SCALE    = 0.3
-SECTOR_CSV_TO_ISAAC_X_OFFSET = 16.0
-
 # Robot links monitored for wall contact.
 WALL_CONTACT_LINKS = (
     "base_link",
@@ -134,7 +126,7 @@ WALL_CONTACT_LINKS = (
 # ===========================================================================
 
 @configclass
-class MushrMazeEnvCfg(DirectRLEnvCfg):
+class ConeTrackEnvCfg(DirectRLEnvCfg):
     """Single source of truth for every number you might want to change.
 
     Sections
@@ -152,9 +144,9 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     decimation:        int   = 4      # policy at ~30 Hz  (sim 120 Hz / 4)
     episode_length_s:  float = 150.0  # 150 s × 30 Hz = 4 500 steps
     action_space:      int   = 2
-    # observation_space is patched in MushrMazeEnv.__init__ after computing
+    # observation_space is patched in ConeTrackEnv.__init__ after computing
     # the exact cropped depth image size.  The placeholder below keeps
-    # @configclass happy; the real value is wri1tten before super().__init__().
+    # @configclass happy; the real value is written before super().__init__().
     observation_space: int   = 1      # patched in __init__
     state_space:       int   = 0
 
@@ -226,38 +218,19 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     spawn_grace_steps: int   = 10
 
     # ── Spawn mode ────────────────────────────────────────────────────────────
-    #   use_preset_spawns=False (default)
-    #       Each reset picks a uniformly random sector gate from curve_points.csv,
-    #       giving every part of the circuit equal training coverage.
-    #
-    #   use_preset_spawns=True
-    #       Each reset picks randomly from preset_spawn_points.  Use this for
-    #       targeted curriculum: list the hard corners / ramp approaches you
-    #       want agents to practise most.  Each entry is (x_m, y_m, theta_deg).
-    #       spawn_yaw_jitter_rad is still applied in both modes.
-    #
-    use_preset_spawns: bool = True
+    #   Each reset picks randomly from preset_spawn_points.
+    #   Each entry is (x_m, y_m, theta_deg).
+    #   spawn_yaw_jitter_rad is applied.
     preset_spawn_points: list = [
         # (x_m, y_m, theta_deg)
-
-        (7.6168,  -1.31077, 116.0),
-        (7.6168,  -1.31077, -64.0),   # 116 + 180 → 296 → -64
-
-        (15.15,     5.0,      -90.0),
-        (15.15,     5.0,       90.0),  # -90 + 180 → 90
-
-        (12.191,    -7.7997,    111),
-        (12.191,    -7.7997,   -69),   # 111 + 180 → 291 → -69
-
-        (5.540,     -9.1814,    88),
-        (5.540,     -9.1814,   -92),   # 88 + 180 → 268 → -92
-
-        (6.0156,    8.81074,    28),
-        (6.0156,    8.81074,  -152),   # 28 + 180 → 208 → -152
-
-        (11.60,     2.4047,     38),
-        (11.60,     2.4047,   -142),   # 38 + 180 → 218 → -142
+        (0.756,  5.0, 20.8),
+        (3.91,  3.31, -156.0),
+        (3.62,  1.97, -154.48),
+        (0.0,  0.0, 0.0),
+        (-5.46,  3.7, 0.0),
+        (-3.6,  4.7, -217.86),
     ]
+    duplicate_with_flipped_yaw: bool = True  # if True, each (x, y, θ) spawns two episodes: one with +180deg rotation around z
     spawn_yaw_jitter_rad: float = 0.15   # ± heading noise applied in both modes
 
     # ════════════════════════════════════════════════════════════════════════
@@ -303,7 +276,7 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     # TERMINATION THRESHOLDS
     # ════════════════════════════════════════════════════════════════════════
     # Horizontal contact force on any robot link that counts as a wall hit.
-    wall_contact_force_thresh_n: float = 15.0  # Newtonsgz
+    wall_contact_force_thresh_n: float = 1.0  # Newtonsgz
 
     # slow_stop_speed_fraction — episode terminates when speed falls below this
     # (catches truly stuck / reversed agents; keep low so normal braking is fine)
@@ -327,34 +300,12 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     # Speed bonus, normalised by max_velocity_m_s.
     forward_weight:     float = 2
 
-    # Extra penalty for wall contact (on top of the base collision cost).
-    wall_penalty:       float = 0
-
-    # Sector timing improvement reward.
-    # Fires every time an agent crosses a sector gate faster than the global reference.
-    # reward = sector_gain_weight × (ref_time - sector_time) / ref_time
-    # This is the primary incentive for racing lines and faster cornering.
-    sector_gain_weight: float = 100#200
-
     # Rear-wheel slip penalty.
     slip_weight:        float = 1
 
     # Steering deadzone penalty: only penalises steering beyond the deadzone.
     steer_deadzone_weight: float = 0.1
     steer_deadzone:        float = 0.05   # fraction of max_steer_rad that is free
-
-    # Dense per-step proximity reward toward the next sector gate.
-    sector_proximity_weight:   float = 0
-    sector_proximity_max_dist: float = 10.0   # metres — reward fades to 0 beyond this
-
-    # Lap completion bonus — linear interpolation between two (time, reward) anchors.
-    # reward = lap_reward_slow + (lap_reward_slow_time_s - lap_time) /
-    #          (lap_reward_slow_time_s - lap_reward_fast_time_s) * (lap_reward_fast - lap_reward_slow)
-    # Clamped at lap_reward_slow as floor; extrapolates above lap_reward_fast for sub-30s laps.
-    lap_reward_slow_time_s: float = 40.0    # reference slow lap time (s)
-    lap_reward_slow:        float = 10.0   # reward at slow reference time
-    lap_reward_fast_time_s: float = 30.0    # reference fast lap time (s)
-    lap_reward_fast:        float = 10.0   # reward at fast reference time
 
     # Ramp per-step reward (while robot base is elevated on the ramp surface).
     ramp_reward_weight: float = 0
@@ -394,7 +345,7 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
             ),
         ),
         init_state=ArticulationCfg.InitialStateCfg(
-            pos=(7.6168, -1.31077, 0.002),   # placeholder — overridden every episode in _reset_idx
+            pos=(0, 0, 0),   # placeholder — overridden every episode in _reset_idx
             joint_pos={
                 "back_left_wheel_throttle":    0.0,
                 "back_right_wheel_throttle":   0.0,
@@ -493,50 +444,13 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
 
 
 # ===========================================================================
-# Sector gate geometry helper
-# ===========================================================================
-
-def _load_sector_gates(device: str):
-    """Load Blender/curve_points.csv and return gate tensors for sector timing."""
-    csv_path = os.path.join(
-        os.path.dirname(__file__),
-        "../../../../../Blender/curve_points.csv",
-    )
-    pts: list[tuple[float, float]] = []
-    with open(csv_path, newline="") as f:
-        for row in csv.reader(f):
-            row = [r.strip() for r in row if r.strip()]
-            if len(row) >= 2:
-                bx, by = float(row[0]), float(row[1])
-                x = by * -SECTOR_CSV_TO_ISAAC_SCALE + SECTOR_CSV_TO_ISAAC_X_OFFSET
-                y = bx *  SECTOR_CSV_TO_ISAAC_SCALE
-                pts.append((x, y))
-
-    n = len(pts)
-    assert n >= 3, f"curve_points.csv must have at least 3 points, got {n}"
-    print(f"[Sector] Loaded {n} sector gates from curve_points.csv")
-
-    tangents: list[tuple[float, float]] = []
-    for i in range(n):
-        px, py = pts[(i - 1) % n]
-        nx, ny = pts[(i + 1) % n]
-        dx, dy = nx - px, ny - py
-        mag = math.hypot(dx, dy)
-        tangents.append((dx / mag, dy / mag))
-
-    gates_t    = torch.tensor(pts,      dtype=torch.float32, device=device)
-    tangents_t = torch.tensor(tangents, dtype=torch.float32, device=device)
-    return n, gates_t, tangents_t
-
-
-# ===========================================================================
 # Environment Class
 # ===========================================================================
 
-class MushrMazeEnv(DirectRLEnv):
-    cfg: MushrMazeEnvCfg
+class ConeTrackEnv(DirectRLEnv):
+    cfg: ConeTrackEnvCfg
 
-    def __init__(self, cfg: MushrMazeEnvCfg, render_mode: str | None = None, **kwargs):
+    def __init__(self, cfg: ConeTrackEnvCfg, render_mode: str | None = None, **kwargs):
         # ContactSensor dict must exist before super().__init__() calls _setup_scene().
         self._wall_contact_sensors: dict[str, ContactSensor] = {}
 
@@ -563,7 +477,7 @@ class MushrMazeEnv(DirectRLEnv):
         cfg.observation_space = depth_obs_size * 2 + extra_obs  # left + right cameras
 
         print(
-            f"[MushrMazeEnv] Depth obs per camera: raw {cam_w}×{cam_h} "
+            f"[ConeTrackEnv] Depth obs per camera: raw {cam_w}×{cam_h} "
             f"→ crop {cropped_w}×{cropped_h} "
             f"→ policy {self._policy_depth_w}×{self._policy_depth_h} "
             f"= {depth_obs_size} px  |  2 cameras  |  "
@@ -615,7 +529,7 @@ class MushrMazeEnv(DirectRLEnv):
         self._delay_steps = max(0, round(cfg.action_delay_ms * 1e-3 / policy_dt))
         buf_len = max(1, self._delay_steps + 1)
         self._action_delay_buf = torch.zeros(self.num_envs, buf_len, 2, device=self.device)
-        print(f"[MushrMazeEnv] Action delay: {cfg.action_delay_ms:.0f} ms → {self._delay_steps} policy step(s)")
+        print(f"[ConeTrackEnv] Action delay: {cfg.action_delay_ms:.0f} ms → {self._delay_steps} policy step(s)")
 
         # Derived motor parameters — computed once from physics-based config fields.
         # T_stall: stall torque per wheel = traction limit / slip_threshold
@@ -625,51 +539,12 @@ class MushrMazeEnv(DirectRLEnv):
         self._T_stall      = _traction_limit / cfg.slip_threshold
         self._omega_noload = cfg.max_velocity_m_s / WHEEL_RADIUS
         print(
-            f"[MushrMazeEnv] Motor model: T_stall={self._T_stall:.4f} Nm/wheel, "
+            f"[ConeTrackEnv] Motor model: T_stall={self._T_stall:.4f} Nm/wheel, "
             f"ω_noload={self._omega_noload:.2f} rad/s  "
             f"(slip_threshold={cfg.slip_threshold:.2f}, μ_s={cfg.wheel_grip_mu_s}, "
             f"m={cfg.car_mass_kg} kg, v_max={cfg.max_velocity_m_s} m/s)"
         )
 
-        # Ramp / global state
-        self._total_laps_completed: int  = 0
-        self._ramp_enabled:         bool = True
-
-        # Sector gate geometry
-        self._n_sectors, self._sector_gates, self._sector_tangents = (
-            _load_sector_gates(self.device)
-        )
-        print("[Sector] First 3 world gate positions (world XY):")
-        for i in range(min(3, self._n_sectors)):
-            x, y = self._sector_gates[i].tolist()
-            print(f"  gate[{i}]: ({x:.4f}, {y:.4f})")
-
-        # Sector timing
-        self._sector_best_times = torch.full(
-            (self._n_sectors,), float("inf"), dtype=torch.float32, device=self.device,
-        )
-        self._sector_reference_times = torch.full(
-            (self._n_sectors,), float("inf"), dtype=torch.float32, device=self.device,
-        )
-        self._reference_established: bool = False
-        self._sectors_this_ep = torch.zeros(
-            self.num_envs, dtype=torch.int32, device=self.device,
-        )
-        self._lap_start_step = torch.zeros(
-            self.num_envs, dtype=torch.int32, device=self.device,
-        )
-        self._current_sector = torch.zeros(
-            self.num_envs, dtype=torch.int64, device=self.device,
-        )
-        self._sector_entry_step = torch.zeros(
-            self.num_envs, dtype=torch.int32, device=self.device,
-        )
-        self._sector_d_prev = torch.zeros(
-            self.num_envs, dtype=torch.float32, device=self.device,
-        )
-
-        # Quick-start tracking
-        self._spawn_pos = torch.zeros(self.num_envs, 2, device=self.device)
 
         # Contact / termination flags
         self._wall_terminated    = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -690,11 +565,11 @@ class MushrMazeEnv(DirectRLEnv):
     def _setup_scene(self):
         self.robot = Articulation(self.cfg.robot_cfg)
 
-        track_cfg = sim_utils.UsdFileCfg(usd_path=TRACK_USD, scale=(0.003, 0.003, 0.003))
-        track_cfg.func("/World/Track", track_cfg, translation=(16, 0.0, 0.0), orientation=(0.0, 0.0, 0.0, 0.0))
+        track_cfg = sim_utils.UsdFileCfg(usd_path=TRACK_USD, scale=(1, 1, 1))
+        track_cfg.func("/World/Track", track_cfg, translation=(0, 0.0, 0.0), orientation=(0.0, 0.0, 0.0, 1.0))
 
-        wall_cfg = sim_utils.UsdFileCfg(usd_path=WALL_USD, scale=(0.003, 0.003, 0.01))
-        wall_cfg.func("/World/Walls", wall_cfg, translation=(16, 0.0, 0.0), orientation=(0.0, 0.0, 0.0, 0.0))
+        wall_cfg = sim_utils.UsdFileCfg(usd_path=WALL_USD, scale=(1, 1, 1))
+        wall_cfg.func("/World/Walls", wall_cfg, translation=(0, 0.0, 0.0), orientation=(0.0, 0.0, 0.0, 1.0))
 
         try:
             import omni.usd
@@ -926,7 +801,7 @@ class MushrMazeEnv(DirectRLEnv):
                     col_api = UsdPhysics.CollisionAPI(prim)
                     if col_api:
                         col_api.GetCollisionEnabledAttr().Set(True)
-                print(f"[Ramp] ENABLED after {self._total_laps_completed} total laps!")
+                print(f"[Ramp] ENABLED after {self._ramp_enabled} total laps!")
         except Exception as e:
             print(f"[Ramp] Enable failed: {e}")
 
@@ -951,7 +826,7 @@ class MushrMazeEnv(DirectRLEnv):
                     col_api = UsdPhysics.CollisionAPI(prim)
                     if col_api:
                         col_api.GetCollisionEnabledAttr().Set(True)
-            print(f"[Walls] Swapped to WALLS.usd after {self._total_laps_completed} total laps!")
+            print(f"[Walls] Swapped to WALLS.usd after {self._ramp_enabled} total laps!")
         except Exception as e:
             print(f"[Walls] Swap failed: {e}")
 
@@ -1134,107 +1009,7 @@ class MushrMazeEnv(DirectRLEnv):
         # Speed bonus — normalised by max_velocity_m_s
         r_forward = self.cfg.forward_weight * (lin_vel_b / self.cfg.max_velocity_m_s)
 
-        # Wall penalty
-        r_wall = -self.cfg.wall_penalty * self._wall_terminated.float()
-
         pos_xy = self.robot.data.root_pos_w[:, :2]
-
-        # ── Sector timing ─────────────────────────────────────────────────────────
-        next_gate = (self._current_sector + 1) % self._n_sectors
-        gate_pts  = self._sector_gates[next_gate]
-        gate_tan  = self._sector_tangents[next_gate]
-        d_current = ((pos_xy - gate_pts) * gate_tan).sum(dim=-1)
-        near_gate = torch.linalg.vector_norm(pos_xy - gate_pts, dim=-1) < 1.8
-        crossed   = (self._sector_d_prev <= 0.0) & (d_current > 0.0) & near_gate
-        sector_time = (
-            (self.episode_length_buf - self._sector_entry_step).float() * dt
-        )
-        lap_agents = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-
-        if crossed.any():
-            crossed_sectors = next_gate[crossed]
-            crossed_times   = sector_time[crossed]
-            candidate = torch.full(
-                (self._n_sectors,), float("inf"), dtype=torch.float32, device=self.device,
-            )
-            candidate.scatter_reduce_(0, crossed_sectors, crossed_times, reduce="amin", include_self=False)
-            torch.minimum(self._sector_best_times, candidate, out=self._sector_best_times)
-            self._sectors_this_ep[crossed] += 1
-            lap_agents = self._sectors_this_ep >= self._n_sectors
-            if lap_agents.any():
-                self._sectors_this_ep[lap_agents] = 0
-                self._total_laps_completed += int(lap_agents.sum().item())
-
-                dt_p = self.cfg.decimation * self.cfg.sim.dt
-                for eid in lap_agents.nonzero(as_tuple=False).squeeze(-1).tolist():
-                    ep_steps  = int(self.episode_length_buf[eid].item())
-                    lap_steps = ep_steps - int(self._lap_start_step[eid].item())
-                    lap_time_s = max(lap_steps, 1) * dt_p
-                    t_range = self.cfg.lap_reward_slow_time_s - self.cfg.lap_reward_fast_time_s
-                    r_range = self.cfg.lap_reward_fast - self.cfg.lap_reward_slow
-                    lap_rew = self.cfg.lap_reward_slow + (
-                        (self.cfg.lap_reward_slow_time_s - lap_time_s) / t_range * r_range
-                    )
-                    lap_rew = max(lap_rew, self.cfg.lap_reward_slow)
-                    print(
-                        f"[Lap] env={eid:>3d}  lap_time={lap_time_s:.1f}s  "
-                        f"reward={lap_rew:.0f}  total_laps={self._total_laps_completed}"
-                    )
-
-                if not self._reference_established:
-                    self._sector_reference_times = self._sector_best_times.clone()
-                    self._reference_established = True
-                    print(
-                        f"[Sector] Reference lap established! "
-                        f"{self._n_sectors} sectors, mean ref = "
-                        f"{self._sector_reference_times.mean().item():.2f} s"
-                    )
-                else:
-                    # Set reference to 105% of best known times — agents earn sector reward
-                    # whenever they drive within 5% of the all-time best, keeping r_sector
-                    # alive even when no new records are being set.  The reference still
-                    # tightens over time as best_times improve.
-                    updated = torch.minimum(
-                        self._sector_reference_times,
-                        self._sector_best_times * 1.05,
-                    )
-                    if not updated.equal(self._sector_reference_times):
-                        self._sector_reference_times = updated
-                        print(
-                            f"[Sector] Reference tightened → mean ref = "
-                            f"{self._sector_reference_times.mean().item():.2f} s"
-                        )
-
-        # Lap completion bonus — linear between (lap_reward_slow_time_s, lap_reward_slow)
-        # and (lap_reward_fast_time_s, lap_reward_fast), clamped at floor.
-        r_lap = torch.zeros(self.num_envs, device=self.device)
-        if lap_agents.any():
-            lap_steps_f = (
-                self.episode_length_buf[lap_agents].float()
-                - self._lap_start_step[lap_agents].float()
-            ).clamp(min=1.0)
-            lap_time_s = lap_steps_f * dt
-            t_range = self.cfg.lap_reward_slow_time_s - self.cfg.lap_reward_fast_time_s
-            r_range = self.cfg.lap_reward_fast - self.cfg.lap_reward_slow
-            lap_rewards = self.cfg.lap_reward_slow + (
-                (self.cfg.lap_reward_slow_time_s - lap_time_s) / t_range * r_range
-            )
-            r_lap[lap_agents] = lap_rewards.clamp(min=self.cfg.lap_reward_slow)
-            self._lap_start_step[lap_agents] = self.episode_length_buf[lap_agents].int()
-
-        if not self._reference_established:
-            r_sector = torch.zeros(self.num_envs, device=self.device)
-        else:
-            ref_time  = self._sector_reference_times[next_gate]
-            beats_ref = crossed & (sector_time < ref_time)
-            improvement = (
-                (ref_time - sector_time) / ref_time.clamp(min=1e-6)
-            ).clamp(0.0, 1.0)
-            r_sector = self.cfg.sector_gain_weight * beats_ref.float() * improvement
-
-        self._current_sector[crossed]    = next_gate[crossed]
-        self._sector_entry_step[crossed] = self.episode_length_buf[crossed].int()
-        self._sector_d_prev = d_current
 
         # ── Wheel slip (AWD — all 4 wheels) ──────────────────────────────────────
         wheel_vel  = self.robot.data.joint_vel[:, self._all_throttle_ids].mean(dim=-1) * WHEEL_RADIUS
@@ -1246,11 +1021,6 @@ class MushrMazeEnv(DirectRLEnv):
         steer_excess  = (steer_norm - self.cfg.steer_deadzone).clamp(min=0.0)
         steer_excess_norm = steer_excess / max(1.0 - self.cfg.steer_deadzone, 1e-6)
         r_steer_shape = -self.cfg.steer_deadzone_weight * steer_excess_norm
-
-        # ── Sector proximity ─────────────────────────────────────────────────────
-        dist_to_gate = torch.linalg.vector_norm(pos_xy - gate_pts, dim=-1)
-        proximity    = (1.0 - dist_to_gate / self.cfg.sector_proximity_max_dist).clamp(0.0, 1.0)
-        r_proximity  = self.cfg.sector_proximity_weight * proximity
 
         # ── Ramp reward ──────────────────────────────────────────────────────────
         r_ramp = (
@@ -1280,11 +1050,7 @@ class MushrMazeEnv(DirectRLEnv):
         ramp_speed_excess = (lin_vel_b - self.cfg.ramp_speed_threshold_m_s).clamp(min=0.0)
         r_airborne = -self.cfg.ramp_speed_penalty_weight * ramp_speed_excess * in_ramp_xy.float()
 
-        total = (
-            r_distance + r_forward + r_slip + r_steer_shape
-            + r_wall + r_sector + r_ramp + r_lap + r_proximity
-            + r_airborne
-        )
+        total = r_distance + r_forward + r_slip + r_steer_shape + r_ramp + r_airborne
 
         return total
 
@@ -1353,33 +1119,18 @@ class MushrMazeEnv(DirectRLEnv):
         sz        = 0.002   # just above ground — constant for all spawn modes
         env_ids_t = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
 
-        if self.cfg.use_preset_spawns:
-            # ── Preset-point spawn: randomly pick from hand-crafted list ──────
-            pts   = self.cfg.preset_spawn_points
-            idx   = torch.randint(0, len(pts), (n,), device="cpu").tolist()
-            xs    = torch.tensor([pts[i][0] for i in idx], dtype=torch.float32, device=self.device)
-            ys    = torch.tensor([pts[i][1] for i in idx], dtype=torch.float32, device=self.device)
-            yaw   = torch.tensor(
-                [math.radians(pts[i][2]) for i in idx], dtype=torch.float32, device=self.device
-            )
-            if self.cfg.spawn_yaw_jitter_rad > 0.0:
-                yaw = yaw + (torch.rand(n, device=self.device) - 0.5) * 2.0 * self.cfg.spawn_yaw_jitter_rad
-            spawn_xy = torch.stack([xs, ys], dim=-1)               # [n, 2]
-            # Nearest sector gate per spawn point (for sector progress tracking)
-            nearest_gates = torch.zeros(n, dtype=torch.long, device=self.device)
-            for j in range(n):
-                diff = self._sector_gates - spawn_xy[j].unsqueeze(0)
-                nearest_gates[j] = torch.linalg.vector_norm(diff, dim=-1).argmin()
-            self._current_sector[env_ids_t] = nearest_gates
-        else:
-            # ── CSV-gate spawn: uniform random over all sector gates ──────────
-            gate_idx = torch.randint(0, self._n_sectors, (n,), device=self.device)
-            spawn_xy = self._sector_gates[gate_idx]                # [n, 2]
-            gate_tan = self._sector_tangents[gate_idx]             # [n, 2]
-            yaw      = torch.atan2(gate_tan[:, 1], gate_tan[:, 0])
-            if self.cfg.spawn_yaw_jitter_rad > 0.0:
-                yaw = yaw + (torch.rand(n, device=self.device) - 0.5) * 2.0 * self.cfg.spawn_yaw_jitter_rad
-            self._current_sector[env_ids_t] = gate_idx
+        pts = list(self.cfg.preset_spawn_points)
+        if self.cfg.duplicate_with_flipped_yaw:
+            pts = pts + [(x, y, theta + 180.0) for x, y, theta in pts]
+        idx  = torch.randint(0, len(pts), (n,), device="cpu").tolist()
+        xs   = torch.tensor([pts[i][0] for i in idx], dtype=torch.float32, device=self.device)
+        ys   = torch.tensor([pts[i][1] for i in idx], dtype=torch.float32, device=self.device)
+        yaw  = torch.tensor(
+            [math.radians(pts[i][2]) for i in idx], dtype=torch.float32, device=self.device
+        )
+        if self.cfg.spawn_yaw_jitter_rad > 0.0:
+            yaw = yaw + (torch.rand(n, device=self.device) - 0.5) * 2.0 * self.cfg.spawn_yaw_jitter_rad
+        spawn_xy = torch.stack([xs, ys], dim=-1)
 
         default_root_state[:, 0] = spawn_xy[:, 0]
         default_root_state[:, 1] = spawn_xy[:, 1]
@@ -1395,18 +1146,6 @@ class MushrMazeEnv(DirectRLEnv):
 
         self.robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
-
-        # Sector / spawn / filter state reset
-        self._spawn_pos[env_ids]        = spawn_xy
-        self._sectors_this_ep[env_ids]  = 0
-        self._sector_entry_step[env_ids] = 0
-        self._lap_start_step[env_ids]      = 0
-
-        next_gate_r = (self._current_sector[env_ids] + 1) % self._n_sectors
-        gate_pts_r  = self._sector_gates[next_gate_r]
-        gate_tan_r  = self._sector_tangents[next_gate_r]
-        d_init      = ((spawn_xy - gate_pts_r) * gate_tan_r).sum(dim=-1)
-        self._sector_d_prev[env_ids] = d_init.clamp(max=0.0)
 
         # Body velocity already seeded above via write_root_velocity_to_sim
         self._filtered_steer[env_ids] = 0.0
