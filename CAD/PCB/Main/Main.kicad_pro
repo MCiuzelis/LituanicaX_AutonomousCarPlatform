@@ -199,7 +199,14 @@
         }
       ],
       "track_widths": [
-        0.0
+        0.0,
+        0.1,
+        0.2,
+        0.25,
+        0.4,
+        0.6,
+        4.0,
+        6.0
       ],
       "tuning_pattern_settings": {
         "diff_pair_defaults": {
@@ -521,7 +528,6 @@
         "bus_width": 12,
         "clearance": 0.2,
         "diff_pair_gap": 0.25,
-        "diff_pair_via_gap": 0.25,
         "diff_pair_width": 0.2,
         "line_style": 0,
         "microvia_diameter": 0.5,
@@ -685,7 +691,7 @@
         "uuid": "e63e39d7-6ac0-4ffd-8aa3-1841a4541b55"
       }
     ],
-    "used_designators": "U2-5",
+    "used_designators": "C14,C23-24,C26-27,C30-32,R17-19,#PWR32-34,#PWR44,#PWR81-82,U1",
     "variants": []
   },
   "sheets": [
