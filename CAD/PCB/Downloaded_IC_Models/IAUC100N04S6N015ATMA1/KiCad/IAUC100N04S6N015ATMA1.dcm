@@ -1,0 +1,9 @@
+EESchema-DOCLIB  Version 2.0
+#
+$CMP IAUC100N04S6N015ATMA1
+D MOSFETs MOSFET_(20V 40V)
+K
+F https://www.infineon.com/dgdl/Infineon-IAUC100N04S6N015-DataSheet-v01_00-EN.pdf?fileId=5546d4626afcd350016b1ca3da54121e
+$ENDCMP
+#
+#End Doc Library
