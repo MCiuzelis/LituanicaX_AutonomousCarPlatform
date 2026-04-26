@@ -1,0 +1,5 @@
+[submodule "Training/IsaacLab"]
+	path = Training/IsaacLab
+	url = https://github.com/isaac-sim/IsaacLab.git
+	branch = release/2.3.0
+	ignore = dirty
