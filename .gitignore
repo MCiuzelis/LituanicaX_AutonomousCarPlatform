@@ -18,7 +18,7 @@ build/
 Training/assets/archives/
 
 # Editor / OS noise
-.vscode/
+*.vscode/
 *.swp
 *~
-.DS_Store
+*.DS_Store
