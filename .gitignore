@@ -1,6 +1,7 @@
 # Training logs and checkpoints — excluded from git (can be multi-GB)
 logs/
 outputs/
+Training/.venv/
 
 # Python cache
 __pycache__/
