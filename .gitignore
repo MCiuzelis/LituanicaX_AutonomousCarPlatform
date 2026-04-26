@@ -22,3 +22,6 @@ Training/assets/archives/
 *.swp
 *~
 *.DS_Store
+
+CAD/Timer/*
+CAD/Track/Assets/*
