@@ -25,3 +25,6 @@ Training/assets/archives/
 
 CAD/Timer/*
 CAD/Track/Assets/*
+
+#ignore blender autosaves
+*.blend1
