@@ -80,11 +80,24 @@ from isaaclab.utils.math import quat_from_euler_xyz
 _ASSETS_DIR = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "../../../assets")
 )
+_REPO_ROOT  = os.path.normpath(os.path.join(os.path.dirname(__file__), "../../../../"))
+_EXPORT_DIR = os.path.join(_REPO_ROOT, "CAD", "Track", "Export")
 
 MUSHR_USD        = os.path.join(_ASSETS_DIR, "mushr_nano_v2.usd")
-TRACK_USD        = os.path.join(_ASSETS_DIR, "TRACK.usd")
-WALL_USD         = os.path.join(_ASSETS_DIR, "WALLS.usd")
+TRACK_USD        = os.path.join(_EXPORT_DIR, "Track.usdc")
+WALL_USD         = os.path.join(_EXPORT_DIR, "Walls.usdc")
 RAMP_USD         = os.path.join(_ASSETS_DIR, "RAMPS.usd")
+
+# Decorative asset sets — purely visual objects the depth cameras see.
+# Index NUM_ASSET_SETS means "no decorations" (all sets hidden).
+ASSET_SET_USDS = [
+    os.path.join(_EXPORT_DIR, "Assets1.usdc"),
+    os.path.join(_EXPORT_DIR, "Assets2.usdc"),
+    os.path.join(_EXPORT_DIR, "Assets3.usdc"),
+    os.path.join(_EXPORT_DIR, "Assets4.usdc"),
+    os.path.join(_EXPORT_DIR, "Assets5.usdc"),
+]
+NUM_ASSET_SETS = len(ASSET_SET_USDS)   # randomisation draws from [0, NUM_ASSET_SETS] inclusive
 
 # ---------------------------------------------------------------------------
 # Physical constants — MuSHR nano v2 (fixed by the USD / hardware)
@@ -153,7 +166,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     sim: SimulationCfg = SimulationCfg(dt=1.0 / 120.0, render_interval=4)
 
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=40,
+        num_envs=5,
         env_spacing=0.0,
         replicate_physics=True,
     )
@@ -222,7 +235,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     #   Each entry is (x_m, y_m, theta_deg).
     #   spawn_yaw_jitter_rad is applied.
     preset_spawn_points: list = [
-        # (x_m, y_m, theta_deg)
+        # (x_m, y_m, theta_deg) — raw Blender coordinates
         (0.756,  5.0, 20.8),
         (3.91,  3.31, -156.0),
         (3.62,  1.97, -154.48),
@@ -230,6 +243,11 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
         (-5.46,  3.7, 0.0),
         (-3.6,  4.7, -217.86),
     ]
+    # Coordinate transform applied to every spawn point at runtime.
+    # Blender exports X/Y inverted relative to Isaac Sim's frame, so both are -1.
+    spawn_x_scale: float = -1.15
+    spawn_y_scale: float = -1.15
+
     duplicate_with_flipped_yaw: bool = True  # if True, each (x, y, θ) spawns two episodes: one with +180deg rotation around z
     spawn_yaw_jitter_rad: float = 0.15   # ± heading noise applied in both modes
 
@@ -263,9 +281,16 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # ════════════════════════════════════════════════════════════════════════
     car_mass_kg:      float = 1.3    # total robot mass (kg); must match robot_cfg mass_props
     wheel_grip_mu_s:  float = 0.8    # effective static friction coeff (wheel × ground)
-    slip_threshold:   float = 0.7   # throttle fraction [0,1] that saturates traction at rest
-    max_velocity_m_s: float = 2.0   # top speed (m/s): full-throttle torque drops to 0 here
+    slip_threshold:   float = 0.8   # throttle fraction [0,1] that saturates traction at rest
+    max_velocity_m_s: float = 6.0   # top speed (m/s): full-throttle torque drops to 0 here
     max_steer_rad:    float = 0.488  # ≈28° max front-wheel steer angle
+    # DC-motor zero-power "brake" mode (not float).
+    # When policy outputs -1 (throttle_norm == 0) the ESC shorts both motor terminals,
+    # creating a back-EMF braking torque proportional to wheel speed:
+    #   T_brake = -brake_strength × T_stall × (ω / ω_noload)   [viscous, sign opposes rotation]
+    # At any throttle above 0 there is no braking — pure drive torque.
+    # At brake_strength=0.3, braking at 6 m/s ≈ 0.6 g deceleration.
+    brake_strength:   float = 0.3
 
     # Action latency simulation — all actuator commands are delayed by this many
     # milliseconds before reaching the wheels/steering.  At 30 Hz each step ≈ 33 ms,
@@ -294,14 +319,17 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # ════════════════════════════════════════════════════════════════════════
     # REWARD WEIGHTS
     # ════════════════════════════════════════════════════════════════════════
+    # Constant reward per step the agent stays alive (not crashed / stuck).
+    alive_weight:       float = 0.3
+
     # Distance: rewards physical metres covered each step (v × dt).
-    distance_weight:    float = 12.0
+    distance_weight:    float = 30.0
 
     # Speed bonus, normalised by max_velocity_m_s.
-    forward_weight:     float = 2
+    forward_weight:     float = 0.3
 
     # Rear-wheel slip penalty.
-    slip_weight:        float = 1
+    slip_weight:        float = 0.0
 
     # Steering deadzone penalty: only penalises steering beyond the deadzone.
     steer_deadzone_weight: float = 0.1
@@ -314,8 +342,13 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # box (or within ramp_approach_radius_m of it) and its forward speed exceeds
     # ramp_speed_threshold_m_s.  Penalty scales linearly with the excess speed.
     ramp_speed_threshold_m_s:  float = 3.0
-    ramp_speed_penalty_weight: float = 0
+    ramp_speed_penalty_weight: float = 0.0
     ramp_approach_radius_m:    float = 4.0  # extend penalty zone this far beyond ramp bbox
+
+    # How often to switch the active decorative asset set (in policy steps).
+    # Decoupled from episode resets so the background changes at a steady rate
+    # regardless of how fast agents are crashing.
+    asset_randomize_every_n_steps: int = 500
 
     # ════════════════════════════════════════════════════════════════════════
     # HARDWARE CONFIG  (robot articulation + camera sensor)
@@ -552,6 +585,12 @@ class ConeTrackEnv(DirectRLEnv):
         self._wall_ever_touched  = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._ramp_ascended      = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
+        # Average-speed reward accumulator: sum of clamped forward velocity per env.
+        self._cumulative_forward_vel = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        # Index of the currently active decorative asset set (-1 = none selected yet).
+        self._current_asset_set: int = -1
+        self._asset_step_counter: int = 0
+
         # Depth observation caches (policy resolution after crop + downsample)
         _cam_flat = self._policy_depth_h * self._policy_depth_w
         self._camera_left_obs  = torch.zeros(self.num_envs, _cam_flat, device=self.device)
@@ -570,6 +609,12 @@ class ConeTrackEnv(DirectRLEnv):
 
         wall_cfg = sim_utils.UsdFileCfg(usd_path=WALL_USD, scale=(1, 1, 1))
         wall_cfg.func("/World/Walls", wall_cfg, translation=(0, 0.0, 0.0), orientation=(0.0, 0.0, 0.0, 1.0))
+
+        for set_idx, asset_usd in enumerate(ASSET_SET_USDS):
+            asset_cfg = sim_utils.UsdFileCfg(usd_path=asset_usd, scale=(1, 1, 1))
+            asset_cfg.func(f"/World/Assets/Set{set_idx}", asset_cfg,
+                           translation=(0.0, 0.0, 0.0), orientation=(0.0, 0.0, 0.0, 1.0))
+
 
         try:
             import omni.usd
@@ -624,6 +669,11 @@ class ConeTrackEnv(DirectRLEnv):
             wall_rb.GetRigidBodyEnabledAttr().Set(True)
             wall_rb.GetKinematicEnabledAttr().Set(True)
             UsdGeom.Imageable(wall_root).MakeInvisible()
+
+        for set_idx in range(NUM_ASSET_SETS):
+            prim = stage.GetPrimAtPath(f"/World/Assets/Set{set_idx}")
+            if prim.IsValid():
+                UsdGeom.Imageable(prim).MakeInvisible()
 
         ramp_root = stage.GetPrimAtPath("/World/Ramps")
         if ramp_root.IsValid():
@@ -830,6 +880,27 @@ class ConeTrackEnv(DirectRLEnv):
         except Exception as e:
             print(f"[Walls] Swap failed: {e}")
 
+    def _set_active_assets(self, set_idx: int) -> None:
+        """Show asset set set_idx; hide all others.
+
+        set_idx == NUM_ASSET_SETS means no decorations (all sets hidden).
+        """
+        try:
+            import omni.usd
+            from pxr import UsdGeom
+            stage = omni.usd.get_context().get_stage()
+            for i in range(NUM_ASSET_SETS):
+                root = stage.GetPrimAtPath(f"/World/Assets/Set{i}")
+                if not root.IsValid():
+                    continue
+                if i == set_idx:
+                    UsdGeom.Imageable(root).MakeVisible()
+                else:
+                    UsdGeom.Imageable(root).MakeInvisible()
+            self._current_asset_set = set_idx
+        except Exception as e:
+            print(f"[Assets] Visibility toggle failed for set {set_idx}: {e}")
+
     # ------------------------------------------------------------------
     # Step hooks
     # ------------------------------------------------------------------
@@ -848,6 +919,14 @@ class ConeTrackEnv(DirectRLEnv):
         (_prev_action) still records the undelayed policy output so the network
         can reason about what it recently commanded.
         """
+        # Step-based asset randomisation — decoupled from episode resets.
+        self._asset_step_counter += 1
+        if self._asset_step_counter >= self.cfg.asset_randomize_every_n_steps:
+            self._asset_step_counter = 0
+            new_set = int(torch.randint(0, NUM_ASSET_SETS + 1, (1,)).item())
+            if new_set != self._current_asset_set:
+                self._set_active_assets(new_set)
+
         raw = actions[:, :2].clamp(-1.0, 1.0)   # [N, 2]  — undelayed policy output
 
         # Push into delay FIFO and read the oldest (delayed) entry
@@ -855,16 +934,32 @@ class ConeTrackEnv(DirectRLEnv):
         self._action_delay_buf[:, -1] = raw
         delayed = self._action_delay_buf[:, 0]   # [N, 2]  — what the actuators act on
 
-        throttle_norm = (delayed[:, 0] + 1.0) * 0.5   # → [0, 1]
+        # Policy output [-1, 1] split at 0:
+        #   [0, 1]  → drive  (throttle_norm = output directly)
+        #   [-1, 0) → brake  (ESC shorts motor terminals; magnitude is irrelevant)
+        throttle_norm = delayed[:, 0].clamp(min=0.0)          # drive: [0, 1]
+        is_braking    = delayed[:, 0] < 0.0                   # brake: any negative value
 
-        # Per-wheel speed (abs) — shape [N, 4]: rear_L, rear_R, front_L, front_R
-        wheel_omega = self.robot.data.joint_vel[:, self._all_throttle_ids].abs()
+        # Per-wheel speed — abs for rolloff, signed for braking direction
+        wheel_vel_signed = self.robot.data.joint_vel[:, self._all_throttle_ids]
+        wheel_omega      = wheel_vel_signed.abs()
 
         # Linear torque-speed rolloff: full torque at standstill, zero at no-load speed
         torque_rolloff = (1.0 - wheel_omega / self._omega_noload).clamp(0.0, 1.0)
 
-        # Per-wheel torque = throttle × stall_torque × rolloff  — shape [N, 4]
-        per_wheel_torque = throttle_norm.unsqueeze(-1) * self._T_stall * torque_rolloff
+        # Drive torque: positive effort, forward only
+        drive_torque = throttle_norm.unsqueeze(-1) * self._T_stall * torque_rolloff
+
+        # DC-motor zero-power "brake" mode (not float).
+        # The ESC shorts both motor terminals only when the throttle command is exactly 0
+        # (policy output -1). The resulting back-EMF current creates a braking torque
+        # proportional to wheel speed: T = -k * ω. Using signed velocity means the
+        # torque always opposes rotation and reaches 0 as ω → 0, so the car cannot
+        # reverse even without an extra clamp.
+        # At brake_strength=0.3, full-speed braking ≈ 0.6 g deceleration.
+        brake_torque = -self.cfg.brake_strength * self._T_stall * (wheel_vel_signed / self._omega_noload)
+
+        per_wheel_torque = torch.where(is_braking.unsqueeze(-1), brake_torque, drive_torque)
         self._wheel_torque_rear  = per_wheel_torque[:, :2]
         self._wheel_torque_front = per_wheel_torque[:, 2:]
 
@@ -1006,8 +1101,11 @@ class ConeTrackEnv(DirectRLEnv):
         # Distance covered this step
         r_distance = self.cfg.distance_weight * lin_vel_b * dt
 
-        # Speed bonus — normalised by max_velocity_m_s
-        r_forward = self.cfg.forward_weight * (lin_vel_b / self.cfg.max_velocity_m_s)
+        # Average-speed bonus: accumulate positive forward velocity each step and
+        # reward the running mean, so the policy must sustain speed, not just burst.
+        self._cumulative_forward_vel += lin_vel_b.clamp(min=0.0)
+        avg_vel = self._cumulative_forward_vel / self.episode_length_buf.float().clamp(min=1)
+        r_forward = self.cfg.forward_weight * (avg_vel / self.cfg.max_velocity_m_s)
 
         pos_xy = self.robot.data.root_pos_w[:, :2]
 
@@ -1050,7 +1148,9 @@ class ConeTrackEnv(DirectRLEnv):
         ramp_speed_excess = (lin_vel_b - self.cfg.ramp_speed_threshold_m_s).clamp(min=0.0)
         r_airborne = -self.cfg.ramp_speed_penalty_weight * ramp_speed_excess * in_ramp_xy.float()
 
-        total = r_distance + r_forward + r_slip + r_steer_shape + r_ramp + r_airborne
+        r_alive = torch.full((self.num_envs,), self.cfg.alive_weight, device=self.device)
+
+        total = r_alive + r_distance + r_forward + r_slip + r_steer_shape + r_ramp + r_airborne
 
         return total
 
@@ -1123,8 +1223,8 @@ class ConeTrackEnv(DirectRLEnv):
         if self.cfg.duplicate_with_flipped_yaw:
             pts = pts + [(x, y, theta + 180.0) for x, y, theta in pts]
         idx  = torch.randint(0, len(pts), (n,), device="cpu").tolist()
-        xs   = torch.tensor([pts[i][0] for i in idx], dtype=torch.float32, device=self.device)
-        ys   = torch.tensor([pts[i][1] for i in idx], dtype=torch.float32, device=self.device)
+        xs   = torch.tensor([pts[i][0] * self.cfg.spawn_x_scale for i in idx], dtype=torch.float32, device=self.device)
+        ys   = torch.tensor([pts[i][1] * self.cfg.spawn_y_scale for i in idx], dtype=torch.float32, device=self.device)
         yaw  = torch.tensor(
             [math.radians(pts[i][2]) for i in idx], dtype=torch.float32, device=self.device
         )
@@ -1156,7 +1256,9 @@ class ConeTrackEnv(DirectRLEnv):
 
         self._ramp_ascended[env_ids]     = False
         self._wall_ever_touched[env_ids] = False
+        self._cumulative_forward_vel[env_ids] = 0.0
 
         joint_pos = self.robot.data.default_joint_pos[env_ids]
         joint_vel = torch.zeros_like(joint_pos)
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
+
