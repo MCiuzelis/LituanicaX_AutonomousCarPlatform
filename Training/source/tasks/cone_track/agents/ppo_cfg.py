@@ -22,8 +22,8 @@ class ConeTrackPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         init_noise_std=0.75,
         actor_obs_normalization=True,
         critic_obs_normalization=True,
-        actor_hidden_dims=[512, 256, 128],
-        critic_hidden_dims=[1024, 512, 256],
+        actor_hidden_dims=[1024, 512, 128],   # was [512, 256, 128]                                                                                           
+        critic_hidden_dims=[2048, 512, 256],  # was [1024, 512, 256] 
         activation="elu",
     )
 
