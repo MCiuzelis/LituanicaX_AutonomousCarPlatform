@@ -189,14 +189,14 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # TOF output.  Affected pixels are set to depth_max_m (treated as far/safe by the
     # policy, matching the real camera's low-confidence masking behaviour).
     # Visible as black dots in both windows of visualize.py.  Set to 0.0 to disable.
-    depth_invalid_pixel_prob: float = 0.2
+    depth_invalid_pixel_prob: float = 0.05
 
     # Random-depth (coloured) speckle: each pixel is set to a uniform random depth in
     # [0, depth_max_m] with this probability.  Models stray reflections and multi-path
     # interference that appear as bright or mid-range dots (unlike depth_invalid_pixel_prob
     # which always sets the pixel to the far/black depth_max_m value).
     # Set to 0.0 to disable.
-    depth_color_noise_prob: float = 0.05
+    depth_color_noise_prob: float = 0.01
 
     # Edge blur noise — simulates the mixed-pixel / depth-bleeding artefact common in
     # real ToF sensors: pixels whose sensing area straddles a depth discontinuity report
@@ -206,8 +206,13 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     #   std = depth_edge_noise_sigma_m × clamp(|∇depth| / depth_edge_gradient_threshold_m, 0, 1)
     # is added.  Only pixels at depth edges receive meaningful extra noise.
     # Set depth_edge_noise_sigma_m = 0.0 to disable entirely.
-    depth_edge_gradient_threshold_m: float = 0.35   # gradient (m/px) that gives edge_weight = 1
-    depth_edge_noise_sigma_m:        float = 0.1   # noise std at maximum-weight edges (metres)
+    depth_edge_gradient_threshold_m: float = 0.15   # gradient (m/px) that gives edge_weight = 1
+    # Mixed-pixel scatter: edge pixels randomly jump to 0 m or depth_max_m (binary wrong-side
+    # values — models the individual black/red dots seen on real ToF sensors at boundaries).
+    depth_edge_scatter_prob: float = 0.25
+    # Small continuous Gaussian blur layered on top of the scatter, adds the faint soft halo
+    # visible around object edges on the real camera alongside the point scatter.
+    depth_edge_blur_sigma_m: float = 0.06
 
     # Depth range for normalization.  Readings > depth_max_m are clamped.
     # Must match autopilot.py MAX_DISTANCE / 1000.  ArduCam supports 2000 mm or 4000 mm only.
@@ -219,7 +224,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # the observation vector.  Smaller = faster MLP convergence.
     # policy_depth_height < 0 → auto-compute from cropped aspect ratio.
     # Default 80×33 = 2640 dims (vs 240×99 = 23 760 without downsampling).
-    policy_depth_width:  int = 120
+    policy_depth_width:  int = 180
     policy_depth_height: int = -1   # -1 = auto
 
     # ════════════════════════════════════════════════════════════════════════
@@ -320,19 +325,19 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # REWARD WEIGHTS
     # ════════════════════════════════════════════════════════════════════════
     # Constant reward per step the agent stays alive (not crashed / stuck).
-    alive_weight:       float = 0.3
+    alive_weight:       float = 0.1
 
     # Distance: rewards physical metres covered each step (v × dt).
-    distance_weight:    float = 30.0
+    distance_weight:    float = 50.0
 
     # Speed bonus, normalised by max_velocity_m_s.
-    forward_weight:     float = 0.3
+    forward_weight:     float = 10
 
     # Rear-wheel slip penalty.
     slip_weight:        float = 0.0
 
     # Steering deadzone penalty: only penalises steering beyond the deadzone.
-    steer_deadzone_weight: float = 0.1
+    steer_deadzone_weight: float = 1
     steer_deadzone:        float = 0.05   # fraction of max_steer_rad that is free
 
     # Ramp per-step reward (while robot base is elevated on the ramp surface).
@@ -590,6 +595,10 @@ class ConeTrackEnv(DirectRLEnv):
         # Index of the currently active decorative asset set (-1 = none selected yet).
         self._current_asset_set: int = -1
         self._asset_step_counter: int = 0
+        # All asset sets are left visible during scene init so RTX builds their BVH
+        # structures at startup (cheap time slot). On the first physics step we hide
+        # all but one selected set. This flag tracks whether that warmup hide has run.
+        self._assets_warmup_done: bool = False
 
         # Depth observation caches (policy resolution after crop + downsample)
         _cam_flat = self._policy_depth_h * self._policy_depth_w
@@ -669,11 +678,6 @@ class ConeTrackEnv(DirectRLEnv):
             wall_rb.GetRigidBodyEnabledAttr().Set(True)
             wall_rb.GetKinematicEnabledAttr().Set(True)
             UsdGeom.Imageable(wall_root).MakeInvisible()
-
-        for set_idx in range(NUM_ASSET_SETS):
-            prim = stage.GetPrimAtPath(f"/World/Assets/Set{set_idx}")
-            if prim.IsValid():
-                UsdGeom.Imageable(prim).MakeInvisible()
 
         ramp_root = stage.GetPrimAtPath("/World/Ramps")
         if ramp_root.IsValid():
@@ -881,10 +885,7 @@ class ConeTrackEnv(DirectRLEnv):
             print(f"[Walls] Swap failed: {e}")
 
     def _set_active_assets(self, set_idx: int) -> None:
-        """Show asset set set_idx; hide all others.
-
-        set_idx == NUM_ASSET_SETS means no decorations (all sets hidden).
-        """
+        """Show asset set set_idx; hide all others."""
         try:
             import omni.usd
             from pxr import UsdGeom
@@ -919,11 +920,19 @@ class ConeTrackEnv(DirectRLEnv):
         (_prev_action) still records the undelayed policy output so the network
         can reason about what it recently commanded.
         """
+        # On the very first physics step all asset sets are still visible (RTX has
+        # already built every BVH during sim init). Now hide all but one randomly
+        # chosen set — hiding is cheap, it only removes from the BVH.
+        if not self._assets_warmup_done:
+            init_set = int(torch.randint(0, NUM_ASSET_SETS, (1,)).item())
+            self._set_active_assets(init_set)
+            self._assets_warmup_done = True
+
         # Step-based asset randomisation — decoupled from episode resets.
         self._asset_step_counter += 1
         if self._asset_step_counter >= self.cfg.asset_randomize_every_n_steps:
             self._asset_step_counter = 0
-            new_set = int(torch.randint(0, NUM_ASSET_SETS + 1, (1,)).item())
+            new_set = int(torch.randint(0, NUM_ASSET_SETS, (1,)).item())
             if new_set != self._current_asset_set:
                 self._set_active_assets(new_set)
 
@@ -1018,8 +1027,8 @@ class ConeTrackEnv(DirectRLEnv):
         depth = depth[:, top:bot, :]                                # [N, H', W]
 
         # Edge weights computed on the CLEAN signal so that only real depth
-        # discontinuities (not noise spikes) drive the edge-blur effect.
-        if self.cfg.depth_edge_noise_sigma_m > 0.0:
+        # discontinuities (not noise spikes) drive the mixed-pixel scatter effect.
+        if self.cfg.depth_edge_scatter_prob > 0.0:
             _d4  = depth.unsqueeze(1)                                        # [N,1,H',W]
             _px  = F.pad(_d4, (1, 1, 0, 0), mode="replicate")               # [N,1,H',W+2]
             _py  = F.pad(_d4, (0, 0, 1, 1), mode="replicate")               # [N,1,H'+2,W]
@@ -1050,10 +1059,23 @@ class ConeTrackEnv(DirectRLEnv):
                 depth,
             )
 
-        if self.cfg.depth_edge_noise_sigma_m > 0.0:
-            # Edge blur: extra Gaussian noise proportional to local depth gradient.
-            # Simulates mixed-pixel / depth-bleeding at depth discontinuities.
-            depth = depth + torch.randn_like(depth) * (self.cfg.depth_edge_noise_sigma_m * _edge_w)
+        if self.cfg.depth_edge_scatter_prob > 0.0:
+            # Mixed-pixel scatter: each edge pixel independently jumps to either 0 m (near)
+            # or depth_max_m (far) with probability scaled by the local edge weight.
+            # This produces the individual black dots inside objects and coloured dots in the
+            # background seen on real ToF sensors — a binary point scatter, not a smooth blur.
+            scatter_mask = torch.rand_like(depth) < (self.cfg.depth_edge_scatter_prob * _edge_w)
+            scatter_vals = torch.where(
+                torch.rand_like(depth) > 0.5,
+                torch.full_like(depth, self.cfg.depth_max_m),  # far / black
+                torch.zeros_like(depth),                        # near / red
+            )
+            depth = torch.where(scatter_mask, scatter_vals, depth)
+
+        if self.cfg.depth_edge_blur_sigma_m > 0.0 and self.cfg.depth_edge_scatter_prob > 0.0:
+            # Faint smooth halo on top of the scatter — softens the hard geometric edge
+            # slightly, matching the residual blur seen on real ToF frames.
+            depth = depth + torch.randn_like(depth) * (self.cfg.depth_edge_blur_sigma_m * _edge_w)
 
         depth = depth.clamp(0.01, self.cfg.depth_max_m)
         depth_norm = 1.0 - depth / self.cfg.depth_max_m
