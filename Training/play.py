@@ -56,7 +56,7 @@ parser.add_argument(
 parser.add_argument(
     "--vel_cap",
     type=float,
-    default=7.0,
+    default=6.0,
     help=(
         "Override the velocity cap used during play (m/s).  "
         "Sets both initial_vel_cap_m_s and vel_cap_max_m_s so the curriculum cannot "
@@ -139,8 +139,6 @@ from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
 
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper, export_policy_as_jit, export_policy_as_onnx
-from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
-
 import isaaclab_tasks  # noqa: F401
 import tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path
@@ -165,8 +163,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # vel_cap sets the top speed ceiling (default 7.0 m/s).
     env_cfg.initial_vel_cap_m_s = args_cli.vel_cap
     env_cfg.vel_cap_max_m_s     = args_cli.vel_cap
-    env_cfg.spawn_vel_min_m_s   = 2.0
-    env_cfg.spawn_vel_max_m_s   = 4.0
+    env_cfg.spawn_vel_min_m_s   = 0.0
+    env_cfg.spawn_vel_max_m_s   = 0.0
     print(f"[play] vel_cap={args_cli.vel_cap} m/s, spawn vel ~ U[2.0, 4.0] m/s")
 
     # set the environment seed
@@ -178,12 +176,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     log_root_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "rsl_rl", agent_cfg.experiment_name)
     print(f"[INFO] Loading experiment from directory: {log_root_path}")
     if args_cli.use_pretrained_checkpoint:
+        from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
         resume_path = get_published_pretrained_checkpoint("rsl_rl", train_task_name)
         if not resume_path:
             print("[INFO] Unfortunately a pre-trained checkpoint is currently unavailable for this task.")
             return
     elif args_cli.checkpoint:
-        resume_path = retrieve_file_path(args_cli.checkpoint)
+        ckpt = args_cli.checkpoint
+        if not os.path.isabs(ckpt) and not os.path.isfile(ckpt):
+            # The play alias cds to Training/ before running; if the user gave a path
+            # relative to the project root (e.g. Training/logs/...) try resolving it
+            # one directory up so both forms work without needing an absolute path.
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            candidate = os.path.join(project_root, ckpt)
+            if os.path.isfile(candidate):
+                ckpt = candidate
+        resume_path = retrieve_file_path(ckpt)
     else:
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 

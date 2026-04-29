@@ -17,3 +17,11 @@ git -C "${isaaclab_dir}" checkout --detach "${isaaclab_ref}"
 
 cd "${script_dir}"
 uv sync
+
+# Isaac Sim pulls in opencv-python-headless (no imshow support).
+# Force-replace it with the GUI-capable build; GTK3 is already present on Ubuntu 24.04.
+uv pip install --force-reinstall opencv-python
+
+# setuptools 82 removed pkg_resources which TensorBoard 2.x still imports.
+# Pin to the last version that ships it (matches the build-system constraint).
+uv pip install "setuptools<82.0.0"

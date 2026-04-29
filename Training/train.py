@@ -91,7 +91,10 @@ if version.parse(installed_version) < version.parse(RSL_RL_VERSION):
 
 import logging
 import os
+import socket
+import subprocess
 import time
+import webbrowser
 from datetime import datetime
 
 import gymnasium as gym
@@ -124,6 +127,32 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
+
+
+def _launch_tensorboard(log_root_path: str) -> None:
+    """Start TensorBoard in the background and print (and open) its URL."""
+    port = 6006
+    for candidate in range(6006, 6020):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if s.connect_ex(("localhost", candidate)) != 0:
+                port = candidate
+                break
+
+    tb_exe = os.path.join(os.path.dirname(sys.executable), "tensorboard")
+    subprocess.Popen(
+        [tb_exe, "--logdir", log_root_path, "--port", str(port)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    time.sleep(2)
+
+    url = f"http://localhost:{port}"
+    print(f"\n[TensorBoard] Watching : {log_root_path}")
+    print(f"[TensorBoard] Open at  : {url}\n")
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -168,6 +197,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if agent_cfg.run_name:
         log_dir += f"_{agent_cfg.run_name}"
     log_dir = os.path.join(log_root_path, log_dir)
+
+    _launch_tensorboard(log_root_path)
 
     # set the IO descriptors export flag if requested
     if isinstance(env_cfg, ManagerBasedRLEnvCfg):

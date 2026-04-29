@@ -9,6 +9,7 @@ description = "RL training environment for the LituanicaX intelligent robot comp
 readme = "README.md"
 requires-python = "==3.11.*"
 dependencies = [
+    "setuptools<82.0.0",
     "isaacsim[all,extscache]==5.1.0",
     "torch==2.7.0",
     "torchvision==0.22.0",
