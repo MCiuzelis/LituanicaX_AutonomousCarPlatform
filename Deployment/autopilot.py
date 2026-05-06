@@ -307,11 +307,20 @@ async def broadcast_telemetry() -> None:
             throttle = latest_action[0]
             steer    = latest_action[1]
 
+        try:
+            battery_voltage = robot.get_battery_voltage()
+            motor_current = robot.get_motor_current()
+        except Exception:
+            battery_voltage = 0.0
+            motor_current = 0.0
+
         payload = json.dumps({
             "type":     "telemetry",
             "throttle": round(throttle, 3),
             "steer":    round(steer, 3),
             "active":   space_active.is_set(),
+            "battery":  round(battery_voltage, 2),
+            "current":  round(motor_current, 3),
         })
 
         dead: set[web.WebSocketResponse] = set()
@@ -347,7 +356,7 @@ HTML = """\
   #hint { margin-top: 4px; font-size: 12px; color: #666; }
   #telemetry {
     margin-top: 14px; display: grid;
-    grid-template-columns: repeat(2, 190px); gap: 12px;
+    grid-template-columns: repeat(4, 190px); gap: 12px;
   }
   .gauge-box {
     background: #1e1e1e; border: 1px solid #444;
@@ -400,7 +409,20 @@ HTML = """\
       <div class="bar-fg" id="sbar" style="width:50%;background:#555;margin-left:50%;"></div>
     </div>
   </div>
-</div>
+  <div class="gauge-box">
+    <div class="gauge-label">BATTERY</div>
+    <div class="gauge-value" id="bval">0.00 V</div>
+    <div class="bar-bg">
+      <div class="bar-fg" id="bbar" style="width:0%;background:#4f4;"></div>
+    </div>
+  </div>
+  <div class="gauge-box">
+    <div class="gauge-label">MOTOR CURRENT</div>
+    <div class="gauge-value" id="cval">0.000 A</div>
+    <div class="bar-bg">
+      <div class="bar-fg" id="cbar" style="width:0%;background:#fa4;"></div>
+    </div>
+  </div>
 
 <div id="space-btn">SPACE \u2014 hold to activate</div>
 
@@ -411,6 +433,10 @@ const tval     = document.getElementById('tval');
 const tbar     = document.getElementById('tbar');
 const sval     = document.getElementById('sval');
 const sbar     = document.getElementById('sbar');
+const bval     = document.getElementById('bval');
+const bbar     = document.getElementById('bbar');
+const cval     = document.getElementById('cval');
+const cbar     = document.getElementById('cbar');
 const spaceBtn = document.getElementById('space-btn');
 let   held     = false;
 
@@ -441,6 +467,17 @@ ws.onmessage = ({ data }) => {
     sbar.style.width      = (-sv * 50).toFixed(1) + '%';
   }
   sbar.style.background = Math.abs(sv) > 0.05 ? '#fa4' : '#555';
+
+  // Battery: 0-10V mapped to 0-100%
+  const bv = msg.battery;
+  bval.textContent = bv.toFixed(2) + ' V';
+  bbar.style.width = Math.min(100, (bv / 10.0) * 100).toFixed(1) + '%';
+  bbar.style.background = bv < 6.0 ? '#f64' : bv < 7.0 ? '#fa4' : '#4f4';
+
+  // Current: 0-5A mapped to 0-100%
+  const cv = msg.current;
+  cval.textContent = cv.toFixed(3) + ' A';
+  cbar.style.width = Math.min(100, (cv / 5.0) * 100).toFixed(1) + '%';
 
   statusEl.textContent = msg.active ? 'AUTOPILOT ACTIVE' : 'Policy inactive \u2014 hold SPACE';
   statusEl.className   = msg.active ? 'active' : 'inactive';
