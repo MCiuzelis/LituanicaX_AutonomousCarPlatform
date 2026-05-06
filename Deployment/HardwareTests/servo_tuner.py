@@ -29,35 +29,6 @@ OFFSET_STEP = 10       # µs per press
 AMP_STEP = 0.05
 
 
-def pulse_to_duty(pulse_us):
-    """
-    Convert pulse width (µs) to duty cycle for 50Hz PWM
-    """
-    return (pulse_us / 20000.0) * 100.0
-
-
-def apply_servo(value):
-    """
-    value: -1 to 1
-    applies offset manually
-    """
-    value = max(-1.0, min(1.0, value))
-
-    # Apply amplitude + direction
-    scaled = value * robot.servo_direction * amplitude
-
-    span = (robot.servo_max_us - robot.servo_min_us) / 2
-    pulse = robot.servo_center_us + center_offset + (scaled * span)
-
-    # Clamp
-    pulse = max(robot.servo_min_us, min(robot.servo_max_us, pulse))
-
-    duty = pulse_to_duty(pulse)
-
-    # ✅ Use Robot's PWM instance
-    robot.servo_pwm.ChangeDutyCycle(duty)
-
-
 def sweep_test():
     print("Running sweep test...")
 
