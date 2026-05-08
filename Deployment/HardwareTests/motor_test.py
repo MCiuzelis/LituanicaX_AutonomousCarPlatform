@@ -1,46 +1,23 @@
-import time
-import math
-import sys
-import os
+import time, math, sys, os
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
 from hardware import Robot
 
-robot = Robot(
-    motor_direction=-1
-)
+robot = Robot(max_throttle=1.0)
 
 try:
-    print("Running sine wave test...")
-
+    print("Running sine wave test. Press Ctrl+C to exit.")
     t = 0.0
-    dt = 0.05
-
     while True:
         motor_val = math.sin(t)
-        servo_val = math.sin(t + math.pi / 2)
 
         robot.set_throttle(motor_val)
-        print(f"Motor: {motor_val:.2f}")
+        print(f"Motor: {motor_val:>5.1f} | Throttle: {motor_val*100:>5.1f}%", end="\r")
 
-        t += dt
-        time.sleep(dt)
+        t += 0.05
+        time.sleep(0.05)
 
 except KeyboardInterrupt:
     print("\nInterrupt received — stopping motor immediately!")
-
-    # 🚨 immediate hard stop (do not wait for finally)
-    try:
-        robot.set_throttle(0)
-        robot.set_steering(0)
-        robot.stop()
-    except Exception as e:
-        print("Error during emergency stop:", e)
-
 finally:
-    # backup cleanup (safe even if already stopped)
-    try:
-        robot.stop()
-    except:
-        pass
+    robot.stop()
