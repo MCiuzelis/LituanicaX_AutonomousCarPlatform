@@ -1,5 +1,4 @@
-import time
-import spidev
+import os, spidev
 import RPi.GPIO as GPIO
 from rpi_hardware_pwm import HardwarePWM
 
@@ -8,8 +7,8 @@ class Robot:
         self,
         pin_ina=24,
         pin_inb=23,
-        motor_pwm_channel=1,
-        servo_pwm_channel=0,
+        motor_gpio=12,
+        servo_gpio=13,
         motor_pwm_freq=20000,
         servo_pwm_freq=50,
         servo_min_us=500,
@@ -51,6 +50,9 @@ class Robot:
         self.k_ratio = k_ratio
         self.adc_max = adc_max
 
+        motor_chip = self._find_pwmchip(motor_gpio)
+        servo_chip = self._find_pwmchip(servo_gpio)
+
         GPIO.setmode(GPIO.BCM)
         GPIO.setup(self.pin_ina, GPIO.OUT)
         GPIO.setup(self.pin_inb, GPIO.OUT)
@@ -59,11 +61,28 @@ class Robot:
         self.spi.open(0, 0)
         self.spi.max_speed_hz = 5000
 
-        self.motor_pwm = HardwarePWM(pwm_channel=motor_pwm_channel, hz=self.motor_pwm_freq)
-        self.servo_pwm = HardwarePWM(pwm_channel=servo_pwm_channel, hz=self.servo_pwm_freq)
+        self.motor_pwm = HardwarePWM(pwm_channel=0, hz=self.motor_pwm_freq, chip=motor_chip)
+        self.servo_pwm = HardwarePWM(pwm_channel=0, hz=self.servo_pwm_freq, chip=servo_chip)
 
         self.motor_pwm.start(0)
         self.servo_pwm.start(7.5)
+
+    @staticmethod
+    def _find_pwmchip(gpio_pin):
+        for entry in os.listdir("/sys/class/pwm"):
+            if not entry.startswith("pwmchip"):
+                continue
+            chip = int(entry[7:])
+            try:
+                with open(f"/sys/class/pwm/{entry}/device/uevent") as f:
+                    for line in f:
+                        if line.startswith("OF_FULLNAME="):
+                            addr = line.strip().split("@")[-1]
+                            if int(addr, 16) == gpio_pin:
+                                return chip
+            except OSError:
+                continue
+        raise RuntimeError(f"No pwmchip found for GPIO{gpio_pin}")
 
     def _read_adc(self, channel=0):
         config = 0x80 if channel == 0 else 0xC0
