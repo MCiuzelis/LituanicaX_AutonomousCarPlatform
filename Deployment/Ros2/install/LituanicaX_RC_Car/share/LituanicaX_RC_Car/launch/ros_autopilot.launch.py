@@ -1,1 +1,0 @@
-/home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/build/LituanicaX_RC_Car/launch/ros_autopilot.launch.py
