@@ -1,0 +1,28 @@
+[0.850s] Invoking command in '/home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/build/lituanicax_rc_car': CONDA_PROMPT_MODIFIER=(ros_jazzy) PYTHONPATH=/home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/build/lituanicax_rc_car/prefix_override:/home/matasciuzelis/miniforge3/envs/ros_jazzy/lib/python3.11/site-packages/colcon_core/task/python/colcon_distutils_commands:/home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/install/lituanicax_rc_car/lib/python3.11/site-packages:${PYTHONPATH} /home/matasciuzelis/miniforge3/envs/ros_jazzy/bin/python -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py develop --editable --build-directory /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/build/lituanicax_rc_car/build --no-deps symlink_data
+[1.195s] running develop
+[1.392s] running egg_info
+[1.409s] creating lituanicax_rc_car.egg-info
+[1.409s] writing lituanicax_rc_car.egg-info/PKG-INFO
+[1.410s] writing dependency_links to lituanicax_rc_car.egg-info/dependency_links.txt
+[1.410s] writing entry points to lituanicax_rc_car.egg-info/entry_points.txt
+[1.410s] writing requirements to lituanicax_rc_car.egg-info/requires.txt
+[1.410s] writing top-level names to lituanicax_rc_car.egg-info/top_level.txt
+[1.411s] writing manifest file 'lituanicax_rc_car.egg-info/SOURCES.txt'
+[1.445s] reading manifest file 'lituanicax_rc_car.egg-info/SOURCES.txt'
+[1.446s] writing manifest file 'lituanicax_rc_car.egg-info/SOURCES.txt'
+[1.464s] running build_ext
+[1.464s] Creating /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/install/lituanicax_rc_car/lib/python3.11/site-packages/lituanicax-rc-car.egg-link (link to .)
+[1.465s] Installing dashboard_node script to /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/install/lituanicax_rc_car/lib/lituanicax_rc_car
+[1.466s] Installing drive_node script to /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/install/lituanicax_rc_car/lib/lituanicax_rc_car
+[1.466s] Installing monitoring_node script to /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/install/lituanicax_rc_car/lib/lituanicax_rc_car
+[1.466s] Installing policy_runner_node script to /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/install/lituanicax_rc_car/lib/lituanicax_rc_car
+[1.466s] Installing tof_camera_node script to /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/install/lituanicax_rc_car/lib/lituanicax_rc_car
+[1.467s] 
+[1.467s] Installed /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/build/lituanicax_rc_car
+[1.467s] running symlink_data
+[1.467s] creating /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/install/lituanicax_rc_car/share/ament_index/resource_index/packages
+[1.468s] symbolically linking /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/build/lituanicax_rc_car/resource/lituanicax_rc_car -> /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/install/lituanicax_rc_car/share/ament_index/resource_index/packages
+[1.468s] symbolically linking /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/build/lituanicax_rc_car/package.xml -> /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/install/lituanicax_rc_car/share/lituanicax_rc_car
+[1.468s] creating /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/install/lituanicax_rc_car/share/lituanicax_rc_car/launch
+[1.468s] symbolically linking /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/build/lituanicax_rc_car/launch/ros_autopilot.launch.py -> /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/install/lituanicax_rc_car/share/lituanicax_rc_car/launch
+[1.556s] Invoked command in '/home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/build/lituanicax_rc_car' returned '0': CONDA_PROMPT_MODIFIER=(ros_jazzy) PYTHONPATH=/home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/build/lituanicax_rc_car/prefix_override:/home/matasciuzelis/miniforge3/envs/ros_jazzy/lib/python3.11/site-packages/colcon_core/task/python/colcon_distutils_commands:/home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/install/lituanicax_rc_car/lib/python3.11/site-packages:${PYTHONPATH} /home/matasciuzelis/miniforge3/envs/ros_jazzy/bin/python -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py develop --editable --build-directory /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/build/lituanicax_rc_car/build --no-deps symlink_data

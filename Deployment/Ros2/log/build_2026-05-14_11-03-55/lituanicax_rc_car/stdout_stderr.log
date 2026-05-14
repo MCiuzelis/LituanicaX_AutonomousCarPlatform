@@ -1,0 +1,26 @@
+running develop
+running egg_info
+creating lituanicax_rc_car.egg-info
+writing lituanicax_rc_car.egg-info/PKG-INFO
+writing dependency_links to lituanicax_rc_car.egg-info/dependency_links.txt
+writing entry points to lituanicax_rc_car.egg-info/entry_points.txt
+writing requirements to lituanicax_rc_car.egg-info/requires.txt
+writing top-level names to lituanicax_rc_car.egg-info/top_level.txt
+writing manifest file 'lituanicax_rc_car.egg-info/SOURCES.txt'
+reading manifest file 'lituanicax_rc_car.egg-info/SOURCES.txt'
+writing manifest file 'lituanicax_rc_car.egg-info/SOURCES.txt'
+running build_ext
+Creating /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/install/lituanicax_rc_car/lib/python3.11/site-packages/lituanicax-rc-car.egg-link (link to .)
+Installing dashboard_node script to /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/install/lituanicax_rc_car/lib/lituanicax_rc_car
+Installing drive_node script to /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/install/lituanicax_rc_car/lib/lituanicax_rc_car
+Installing monitoring_node script to /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/install/lituanicax_rc_car/lib/lituanicax_rc_car
+Installing policy_runner_node script to /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/install/lituanicax_rc_car/lib/lituanicax_rc_car
+Installing tof_camera_node script to /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/install/lituanicax_rc_car/lib/lituanicax_rc_car
+
+Installed /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/build/lituanicax_rc_car
+running symlink_data
+creating /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/install/lituanicax_rc_car/share/ament_index/resource_index/packages
+symbolically linking /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/build/lituanicax_rc_car/resource/lituanicax_rc_car -> /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/install/lituanicax_rc_car/share/ament_index/resource_index/packages
+symbolically linking /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/build/lituanicax_rc_car/package.xml -> /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/install/lituanicax_rc_car/share/lituanicax_rc_car
+creating /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/install/lituanicax_rc_car/share/lituanicax_rc_car/launch
+symbolically linking /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/build/lituanicax_rc_car/launch/ros_autopilot.launch.py -> /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/install/lituanicax_rc_car/share/lituanicax_rc_car/launch

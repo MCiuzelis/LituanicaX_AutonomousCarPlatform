@@ -5,7 +5,7 @@ This package contains the standalone ROS 2 runtime for the RC car.
 ## Nodes
 
 - `tof_camera_node`: launched twice, once for CSI index `0`/left and once for CSI index `8`/right. Each launch entry is a separate OS process, preserving the Arducam SDK isolation used by the original code.
-- `policy_runner_node`: subscribes to both ToF packet topics, runs the package-local `policy/policy.onnx` at 30 Hz, and publishes `/cmd_drive`.
+- `policy_runner_node`: subscribes to both ToF packet topics, runs the package-local `lituanicax_rc_car/policy.onnx` at 30 Hz, and publishes `/cmd_drive`.
 - `monitoring_node`: owns SPI/ADC only, reads battery/current, monitors CPU usage and temperature, and publishes `/monitoring/telemetry`.
 - `drive_node`: owns GPIO/PWM only, subscribes to `/cmd_drive`, `/autopilot/enabled`, and `/monitoring/telemetry`, then drives the motor/servo only when undervoltage and overcurrent are clear.
 - `dashboard_node`: hosts the browser dashboard on port `8080`, publishes `/autopilot/enabled` from SPACE key events, serves MJPEG previews, and relays telemetry over WebSocket.
