@@ -4,3 +4,6 @@ source;share/lituanicax_rc_car/hook/pythonpath.sh
 source;share/lituanicax_rc_car/hook/ament_prefix_path.ps1
 source;share/lituanicax_rc_car/hook/ament_prefix_path.dsv
 source;share/lituanicax_rc_car/hook/ament_prefix_path.sh
+source;../../build/lituanicax_rc_car/share/lituanicax_rc_car/hook/pythonpath_develop.ps1
+source;../../build/lituanicax_rc_car/share/lituanicax_rc_car/hook/pythonpath_develop.dsv
+source;../../build/lituanicax_rc_car/share/lituanicax_rc_car/hook/pythonpath_develop.sh

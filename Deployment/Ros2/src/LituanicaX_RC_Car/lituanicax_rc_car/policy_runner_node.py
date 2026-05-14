@@ -5,6 +5,7 @@ import os
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import rclpy
@@ -13,8 +14,8 @@ from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Bool, Float32MultiArray, UInt8MultiArray
 
-from .common import ACTION_HIST, OBS_DIM, POLICY_HZ, process_for_policy, unpack_tof_packet
-from .paths import discover_policy_path
+from .common import POLICY_HZ
+from .tof_camera_node import ACTION_HIST, OBS_DIM, process_for_policy, unpack_tof_packet
 
 
 @contextmanager
@@ -38,6 +39,12 @@ def _load_onnxruntime():
     if hasattr(ort, "set_default_logger_severity"):
         ort.set_default_logger_severity(3)
     return ort
+
+
+def discover_policy_path(configured_policy_path: str = "") -> Path:
+    if configured_policy_path:
+        return Path(configured_policy_path).expanduser()
+    return Path(__file__).with_name("policy.onnx")
 
 
 def sensor_qos() -> QoSProfile:
