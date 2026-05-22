@@ -1,0 +1,22 @@
+/home/matasciuzelis/miniforge3/envs/ros_jazzy/lib/python3.11/site-packages/setuptools/_distutils/dist.py:289: UserWarning: Unknown distribution option: 'tests_require'
+  warnings.warn(msg)
+running develop
+running egg_info
+creating rosboard.egg-info
+writing rosboard.egg-info/PKG-INFO
+writing dependency_links to rosboard.egg-info/dependency_links.txt
+writing entry points to rosboard.egg-info/entry_points.txt
+writing requirements to rosboard.egg-info/requires.txt
+writing top-level names to rosboard.egg-info/top_level.txt
+writing manifest file 'rosboard.egg-info/SOURCES.txt'
+reading manifest file 'rosboard.egg-info/SOURCES.txt'
+writing manifest file 'rosboard.egg-info/SOURCES.txt'
+running build_ext
+Creating /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/install/rosboard/lib/python3.11/site-packages/rosboard.egg-link (link to .)
+Installing rosboard_node script to /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/install/rosboard/lib/rosboard
+
+Installed /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/build/rosboard
+running symlink_data
+symbolically linking /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/build/rosboard/package.xml -> /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/install/rosboard/share/rosboard
+creating /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/install/rosboard/share/ament_index/resource_index/packages
+symbolically linking /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/build/rosboard/resource/rosboard -> /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Ros2/install/rosboard/share/ament_index/resource_index/packages

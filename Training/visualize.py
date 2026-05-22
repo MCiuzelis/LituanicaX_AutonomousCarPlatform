@@ -139,7 +139,6 @@ class _KeyState:
 display_proc = None
 if os.environ.get("DISPLAY"):
     _display_env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
-    _display_env["QT_QPA_FONTDIR"] = "/usr/share/fonts"
     display_proc = subprocess.Popen(
         [sys.executable, "-c", _DISPLAY_SCRIPT], env=_display_env
     )

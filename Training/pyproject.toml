@@ -18,7 +18,6 @@ dependencies = [
     "isaaclab_assets",
     "isaaclab_tasks",
     "isaaclab_rl[rsl-rl]",
-    "runpod-flash>=1.16.0",
 ]
 
 [tool.setuptools]

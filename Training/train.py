@@ -8,11 +8,8 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
-import base64
-import io
 import os
 import sys
-import tarfile
 
 # LD_PRELOAD must be set before any shared libraries load, which means before Python
 # itself initialises its C extensions. Setting os.environ inside an already-running
@@ -28,165 +25,6 @@ if "ISAACLAB_LIBSTDCPP_FIXED" not in os.environ:
             os.environ["LD_PRELOAD"] = _libstdcpp
             os.execv(sys.executable, [sys.executable] + sys.argv)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# RunPod remote-training support
-#
-# Usage:
-#   export RUNPOD_IMAGE=docker.io/you/isaaclab-training:latest
-#   train --task ConeTrack --runpod [--num_envs N] [--max_iterations N] [--run_name v1]
-#
-# The Docker image must have Isaac Sim 5.1 + Isaac Lab 2.3 already installed
-# (run Training/install.sh inside the container once, then push to a registry).
-# Local source files (env.py, ppo_cfg.py, etc.) are packed and overlaid on the
-# remote workspace every run, so edits are always reflected without rebuilding.
-# TensorBoard event files are streamed back every ~20 s for live local viewing.
-# ─────────────────────────────────────────────────────────────────────────────
-
-_RUNPOD_IMAGE  = os.environ.get("RUNPOD_IMAGE", "")
-_RUNPOD_POLL_S = 20
-
-
-def _rp_pack_source() -> str:
-    """Tar-gz Training/source + tasks + cli_args.py → base64 string."""
-    root = os.path.dirname(os.path.abspath(__file__))
-    buf  = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        for name in ("source", "tasks", "cli_args.py", "pyproject.toml", "uv.lock"):
-            p = os.path.join(root, name)
-            if os.path.exists(p):
-                tar.add(p, arcname=name)
-    return base64.b64encode(buf.getvalue()).decode()
-
-
-def _rp_forward_args(args) -> list:
-    """Reconstruct CLI flags to pass to the remote train.py (--runpod excluded)."""
-    fwd = []
-    if getattr(args, "num_envs", None) is not None:
-        fwd += ["--num_envs", str(args.num_envs)]
-    if getattr(args, "seed", None) is not None:
-        fwd += ["--seed", str(args.seed)]
-    if getattr(args, "max_iterations", None) is not None:
-        fwd += ["--max_iterations", str(args.max_iterations)]
-    if getattr(args, "run_name", None):
-        fwd += ["--run_name", args.run_name]
-    return fwd
-
-
-async def _train_on_runpod(args) -> None:
-    """Submit training to a RunPod RTX 4090 and stream TensorBoard events locally."""
-    import asyncio, socket, subprocess, time, webbrowser
-    from datetime import datetime
-    from runpod_flash import Endpoint, GpuType
-
-    if not _RUNPOD_IMAGE:
-        print(
-            "[RunPod] ERROR: set RUNPOD_IMAGE to a Docker image with Isaac Sim + Isaac Lab.\n"
-            "Example:  export RUNPOD_IMAGE=docker.io/yourname/isaaclab-training:latest"
-        )
-        return
-
-    @Endpoint(
-        name="cone-track-training",
-        gpu=GpuType.NVIDIA_GEFORCE_RTX_4090,
-        base_image=_RUNPOD_IMAGE,
-    )
-    def _remote(payload: dict):
-        """Runs ON RunPod: unpack source overlay, train headless, stream TensorBoard chunks."""
-        import base64, glob, io, os, subprocess, tarfile, time
-
-        ws = "/workspace/Training"
-        # Overlay local source edits onto the workspace (base image already has the install).
-        with tarfile.open(fileobj=io.BytesIO(base64.b64decode(payload["src"])),
-                          mode="r:gz") as tar:
-            tar.extractall(ws)
-
-        proc = subprocess.Popen(
-            ["uv", "run", "python", os.path.join(ws, "train.py"),
-             "--task", "ConeTrack", "--headless"]
-            + payload.get("extra_args", []),
-            cwd=ws,
-        )
-
-        log_root = os.path.join(ws, "logs", "rsl_rl", "cone_track")
-        ev_file, offset = None, 0
-
-        while proc.poll() is None:
-            if ev_file is None:
-                for path in glob.glob(f"{log_root}/*/events.out.*"):
-                    ev_file = path
-                    break
-            if ev_file and os.path.exists(ev_file):
-                with open(ev_file, "rb") as fh:
-                    fh.seek(offset)
-                    chunk = fh.read()
-                if chunk:
-                    yield {"events": base64.b64encode(chunk).decode()}
-                    offset += len(chunk)
-            time.sleep(payload.get("poll_s", 20))
-
-        yield {"done": True, "exit_code": proc.returncode}
-
-    # ── local side ─────────────────────────────────────────────────────────
-    run_name  = getattr(args, "run_name", None) or "runpod"
-    log_root  = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             "logs", "rsl_rl", "cone_track")
-    local_dir = os.path.join(log_root,
-                             datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                             + f"_{run_name}_runpod")
-    os.makedirs(local_dir, exist_ok=True)
-
-    # Start local TensorBoard
-    _tb_port = 6006
-    for _p in range(6006, 6020):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _s:
-            if _s.connect_ex(("localhost", _p)) != 0:
-                _tb_port = _p
-                break
-    _tb_exe = os.path.join(os.path.dirname(sys.executable), "tensorboard")
-    subprocess.Popen([_tb_exe, "--logdir", log_root, "--port", str(_tb_port)],
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(2)
-    _tb_url = f"http://localhost:{_tb_port}"
-    print(f"\n[TensorBoard] Watching : {log_root}")
-    print(f"[TensorBoard] Open at  : {_tb_url}\n")
-    try:
-        webbrowser.open(_tb_url)
-    except Exception:
-        pass
-
-    print(f"[RunPod] Job submitted — streaming events to {local_dir}")
-    ev_local = os.path.join(local_dir, "events.out.tfevents.runpod")
-    open(ev_local, "wb").close()  # seed empty file so TensorBoard registers the run
-
-    async for msg in _remote({"src": _rp_pack_source(),
-                               "extra_args": _rp_forward_args(args),
-                               "poll_s": _RUNPOD_POLL_S}):
-        if "events" in msg:
-            data = base64.b64decode(msg["events"])
-            with open(ev_local, "ab") as fh:
-                fh.write(data)
-            print(f"[RunPod] +{len(data):,} B → TensorBoard updated")
-        if msg.get("done"):
-            print(f"[RunPod] Training finished (exit {msg.get('exit_code', '?')})")
-            break
-
-
-# Intercept --runpod BEFORE importing Isaac Sim or starting AppLauncher locally.
-if "--runpod" in sys.argv:
-    import asyncio as _asyncio
-
-    _rp_parser = argparse.ArgumentParser(add_help=False)
-    _rp_parser.add_argument("--runpod",        action="store_true")
-    _rp_parser.add_argument("--num_envs",       type=int, default=None)
-    _rp_parser.add_argument("--seed",           type=int, default=None)
-    _rp_parser.add_argument("--max_iterations", type=int, default=None)
-    _rp_parser.add_argument("--run_name",       type=str, default=None)
-    _rp_args, _ = _rp_parser.parse_known_args()
-
-    _asyncio.run(_train_on_runpod(_rp_args))
-    sys.exit(0)
-
-# ─── Local path: Isaac Sim starts here ────────────────────────────────────────
 from isaaclab.app import AppLauncher
 
 # local imports
@@ -194,8 +32,6 @@ import cli_args  # isort: skip
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
-parser.add_argument("--runpod", action="store_true", default=False,
-                    help="Run training on a RunPod RTX 4090 (requires RUNPOD_IMAGE env-var).")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
 parser.add_argument("--video_interval", type=int, default=2000, help="Interval between video recordings (in steps).")
