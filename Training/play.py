@@ -56,7 +56,7 @@ parser.add_argument(
 parser.add_argument(
     "--vel_cap",
     type=float,
-    default=6.0,
+    default=5.0,
     help=(
         "Override the velocity cap used during play (m/s).  "
         "Sets both initial_vel_cap_m_s and vel_cap_max_m_s so the curriculum cannot "
@@ -158,14 +158,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent_cfg: RslRlBaseRunnerCfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
 
-    # Override velocity cap and spawn speed range for play.
-    # Spawn vel is random [2, 4] m/s regardless of training curriculum.
-    # vel_cap sets the top speed ceiling (default 7.0 m/s).
-    env_cfg.initial_vel_cap_m_s = args_cli.vel_cap
-    env_cfg.vel_cap_max_m_s     = args_cli.vel_cap
-    env_cfg.spawn_vel_min_m_s   = 0.0
-    env_cfg.spawn_vel_max_m_s   = 0.0
-    print(f"[play] vel_cap={args_cli.vel_cap} m/s, spawn vel ~ U[2.0, 4.0] m/s")
+    env_cfg.spawn_vel_min_m_s = 0.0
+    env_cfg.spawn_vel_max_m_s = 4.0
 
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
@@ -279,6 +273,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         _mushr_env = env.unwrapped          # DirectRLEnv (ConeTrackEnv)
         if os.environ.get("DISPLAY"):
             _display_env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+            _display_env["QT_QPA_FONTDIR"] = "/usr/share/fonts"
             _fpv_proc = subprocess.Popen(
                 [sys.executable, "-c", _FPV_DISPLAY_SCRIPT], env=_display_env
             )
