@@ -53,11 +53,7 @@
       "board_outline_area",
       "ly_points"
     ],
-<<<<<<< HEAD
-    "visible_layers": "ffffffff_ffffffff_ffffffff_ffffffff",
-=======
     "visible_layers": "ffffffff_ffffffff_ffffffff_ffffffaf",
->>>>>>> origin/main
     "zone_display_mode": 0
   },
   "git": {

@@ -5217,11 +5217,7 @@
 		(uuid "5b23e971-a322-4274-a684-84ea20320385")
 		(at 125.875 60.475)
 		(property "Reference" "U1"
-<<<<<<< HEAD
-			(at -4.675 -6.475 0)
-=======
 			(at -4.875 -6.475 0)
->>>>>>> origin/main
 			(layer "F.SilkS")
 			(uuid "f5322c9b-1c3d-4632-922b-2a1a7962dc7f")
 			(effects
