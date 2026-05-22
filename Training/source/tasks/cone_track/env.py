@@ -7,7 +7,10 @@ Observation space:
     [2N:2N+2H]   last H throttle+steer pairs, oldest→newest ∈ [−1, 1]
                  H = action_history_steps (default 15) → 30 values.
                  Only appended when include_prev_action=True.
-    No velocity in observation — vehicle speed is not available from real-robot sensors.
+    [2N+2H]      average wheel surface speed ∈ [0, 1], normalized by max_velocity_m_s.
+                 Computed as mean(|joint_vel[all 4 throttle joints]|) × WHEEL_RADIUS / max_velocity_m_s.
+                 Only appended when include_wheel_vel=True.
+                 Matches real hardware: wheel encoders give rotation rate directly.
 
 Camera profile (ArduCam TOF sensor for Raspberry Pi):
     - Sensor: Time-of-Flight depth, 240×180 pixels at 30 fps
@@ -16,10 +19,11 @@ Camera profile (ArduCam TOF sensor for Raspberry Pi):
     - Policy runs at 30 Hz, synced with camera (sim 120 Hz, decimation=4)
 
 Action space (2):
-    [0]  throttle command in [-1, 1]  → remapped to [0, 1] inside the env.
-         Applied as per-wheel torque via a linear torque-speed curve:
-           T(ω) = throttle_norm × T_stall × max(0, 1 − ω/ω_noload)
-         where T_stall and ω_noload are derived from slip_threshold + max_velocity_m_s.
+    [0]  throttle command in [-1, 1], three-zone:
+           (0, 1]  → drive torque T(ω) = output × T_stall × max(0, 1 − ω/ω_noload)
+            0      → coast (zero torque)
+           [-1, 0) → braking torque T(ω) = output × brake_strength × T_stall × (ω/ω_noload)
+                     (linearly scaled: -1 = full braking, 0 = coast)
     [1]  steering command in [-1, 1]  → scaled to [-max_steer_rad, +max_steer_rad]
 
 Actuation (Ackermann / AWD, direct torque control):
@@ -189,14 +193,14 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # TOF output.  Affected pixels are set to depth_max_m (treated as far/safe by the
     # policy, matching the real camera's low-confidence masking behaviour).
     # Visible as black dots in both windows of visualize.py.  Set to 0.0 to disable.
-    depth_invalid_pixel_prob: float = 0.05
+    depth_invalid_pixel_prob: float = 0.02
 
     # Random-depth (coloured) speckle: each pixel is set to a uniform random depth in
     # [0, depth_max_m] with this probability.  Models stray reflections and multi-path
     # interference that appear as bright or mid-range dots (unlike depth_invalid_pixel_prob
     # which always sets the pixel to the far/black depth_max_m value).
     # Set to 0.0 to disable.
-    depth_color_noise_prob: float = 0.01
+    depth_color_noise_prob: float = 0.008
 
     # Edge blur noise — simulates the mixed-pixel / depth-bleeding artefact common in
     # real ToF sensors: pixels whose sensing area straddles a depth discontinuity report
@@ -209,7 +213,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     depth_edge_gradient_threshold_m: float = 0.15   # gradient (m/px) that gives edge_weight = 1
     # Mixed-pixel scatter: edge pixels randomly jump to 0 m or depth_max_m (binary wrong-side
     # values — models the individual black/red dots seen on real ToF sensors at boundaries).
-    depth_edge_scatter_prob: float = 0.25
+    depth_edge_scatter_prob: float = 0.19
     # Small continuous Gaussian blur layered on top of the scatter, adds the faint soft halo
     # visible around object edges on the real camera alongside the point scatter.
     depth_edge_blur_sigma_m: float = 0.06
@@ -224,7 +228,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # the observation vector.  Smaller = faster MLP convergence.
     # policy_depth_height < 0 → auto-compute from cropped aspect ratio.
     # Default 80×33 = 2640 dims (vs 240×99 = 23 760 without downsampling).
-    policy_depth_width:  int = 180
+    policy_depth_width:  int = 120
     policy_depth_height: int = -1   # -1 = auto
 
     # ════════════════════════════════════════════════════════════════════════
@@ -241,12 +245,15 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     #   spawn_yaw_jitter_rad is applied.
     preset_spawn_points: list = [
         # (x_m, y_m, theta_deg) — raw Blender coordinates
-        (0.756,  5.0, 20.8),
-        (3.91,  3.31, -156.0),
-        (3.62,  1.97, -154.48),
+        # (0.756,  5.0, 20.8),
+        # (3.91,  3.31, -156.0),
+        # (3.62,  1.97, -154.48),
         (0.0,  0.0, 0.0),
-        (-5.46,  3.7, 0.0),
-        (-3.6,  4.7, -217.86),
+        # (-5.46,  3.7, 0.0),
+        # (-3.6,  4.7, -217.86),
+
+        # (-5.0,  0.0, 180.0),
+        # (3.4,  0.0, 0.0),
     ]
     # Coordinate transform applied to every spawn point at runtime.
     # Blender exports X/Y inverted relative to Isaac Sim's frame, so both are -1.
@@ -255,6 +262,15 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
 
     duplicate_with_flipped_yaw: bool = True  # if True, each (x, y, θ) spawns two episodes: one with +180deg rotation around z
     spawn_yaw_jitter_rad: float = 0.15   # ± heading noise applied in both modes
+
+    # One-time bonus the first time the car moves farther than spawn_escape_radius_m
+    # from its spawn position, scaled by how fast the car is moving at that moment:
+    #   reward = spawn_escape_reward × (current_speed / max_velocity_m_s)
+    # At max speed this gives the full bonus; at crawl speed it gives nearly nothing.
+    # Teaches aggressive initial acceleration without rewarding slow drift.
+    # Set spawn_escape_reward=0 to disable.
+    spawn_escape_radius_m: float = 0.4
+    spawn_escape_reward:   float = 800
 
     # ════════════════════════════════════════════════════════════════════════
     # SPAWN SPEED — initial robot velocity at each episode reset
@@ -284,23 +300,30 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # Both derived values are printed at startup and stored as self._T_stall /
     # self._omega_noload.  No hard velocity clamp is applied anywhere.
     # ════════════════════════════════════════════════════════════════════════
-    car_mass_kg:      float = 1.3    # total robot mass (kg); must match robot_cfg mass_props
+    car_mass_kg:      float = 1.35    # total robot mass (kg); must match robot_cfg mass_props
     wheel_grip_mu_s:  float = 0.8    # effective static friction coeff (wheel × ground)
-    slip_threshold:   float = 0.8   # throttle fraction [0,1] that saturates traction at rest
-    max_velocity_m_s: float = 6.0   # top speed (m/s): full-throttle torque drops to 0 here
+    slip_threshold:   float = 0.6   # throttle fraction [0,1] that saturates traction at rest
+    max_velocity_m_s: float = 8.0   # top speed (m/s): full-throttle torque drops to 0 here
     max_steer_rad:    float = 0.488  # ≈28° max front-wheel steer angle
-    # DC-motor zero-power "brake" mode (not float).
-    # When policy outputs -1 (throttle_norm == 0) the ESC shorts both motor terminals,
-    # creating a back-EMF braking torque proportional to wheel speed:
-    #   T_brake = -brake_strength × T_stall × (ω / ω_noload)   [viscous, sign opposes rotation]
-    # At any throttle above 0 there is no braking — pure drive torque.
-    # At brake_strength=0.3, braking at 6 m/s ≈ 0.6 g deceleration.
-    brake_strength:   float = 0.3
+    # Braking strength at full brake command (policy output = -1).
+    # Braking force scales linearly with policy output magnitude: output=-0.5 → half force.
+    #   T_brake = -|output| × brake_strength × T_stall × (ω / ω_noload)
+    # At brake_strength=0.5, full-brake at max speed ≈ 1.0 g deceleration.
+    brake_strength:   float = 1.0
+
+    # Rolling-friction offset subtracted from the throttle command at the actuator
+    # stage to simulate drivetrain / rolling resistance.  The throttle channel that
+    # reaches the wheels is `policy_throttle − throttle_friction_offset`, so an
+    # output of 0 becomes a light brake (= −offset) and the car decelerates rather
+    # than coasting indefinitely.  Only affects what the actuators see; the policy's
+    # raw command is still what the obs history and reward terms read.
+    # Set to 0.0 to disable.
+    throttle_friction_offset: float = 0.05
 
     # Action latency simulation — all actuator commands are delayed by this many
     # milliseconds before reaching the wheels/steering.  At 30 Hz each step ≈ 33 ms,
     # so 100 ms ≈ 3 policy steps.  Set to 0.0 to disable.
-    action_delay_ms: float = 33
+    action_delay_ms: float = 0.0
 
     # ════════════════════════════════════════════════════════════════════════
     # TERMINATION THRESHOLDS
@@ -310,35 +333,92 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
 
     # slow_stop_speed_fraction — episode terminates when speed falls below this
     # (catches truly stuck / reversed agents; keep low so normal braking is fine)
-    slow_stop_speed_fraction:    float = 0.04  # terminate if speed < 3 % of vel_cap
+    slow_stop_speed_fraction:    float = 0.02  # terminate if speed < 3 % of vel_cap
 
     # ════════════════════════════════════════════════════════════════════════
     # OBSERVATION EXTRAS
     # ════════════════════════════════════════════════════════════════════════
     # Append the previous policy actions (throttle + steer, each ∈ [-1,1]) to
-    # the observation.  With forward velocity removed, this is the policy's only
-    # speed cue — longer history allows better speed inference from throttle commands.
-    include_prev_action:  bool = True
-    action_history_steps: int  = 15   # number of past (throttle, steer) pairs to include
+    # the observation.  Gives the policy temporal context on what it recently commanded.
+    include_prev_action:  bool = False
+    action_history_steps: int  = 5   # number of past (throttle, steer) pairs to include
+
+    # Append the current average wheel surface speed to the observation.
+    # Normalized: 0 = stopped, 1 = max_velocity_m_s.
+    # This is the primary speed signal — essential for braking-before-corners.
+    # On real hardware: read wheel encoder RPM, average all 4, multiply by WHEEL_RADIUS,
+    # divide by max_velocity_m_s, clamp to [0, 1].
+    include_wheel_vel: bool = True
 
     # ════════════════════════════════════════════════════════════════════════
     # REWARD WEIGHTS
     # ════════════════════════════════════════════════════════════════════════
     # Constant reward per step the agent stays alive (not crashed / stuck).
-    alive_weight:       float = 0.1
+    alive_weight:       float = 0.0
 
     # Distance: rewards physical metres covered each step (v × dt).
-    distance_weight:    float = 50.0
+    distance_weight:    float = 20.0
 
     # Speed bonus, normalised by max_velocity_m_s.
-    forward_weight:     float = 10
+    forward_weight:     float = 0 #2
 
     # Rear-wheel slip penalty.
     slip_weight:        float = 0.0
 
     # Steering deadzone penalty: only penalises steering beyond the deadzone.
-    steer_deadzone_weight: float = 1
-    steer_deadzone:        float = 0.05   # fraction of max_steer_rad that is free
+    steer_deadzone_weight: float = 0.2
+    steer_deadzone:        float = 0.06   # fraction of max_steer_rad that is free
+
+    # Proximity speed penalty: penalises going fast when a wall is close along the
+    # car's current velocity direction.  Each step a 2D ray is cast from the car
+    # along its world-frame linear velocity vector against /World/Walls (the same
+    # invisible mesh used for termination — visibility, collision, and termination
+    # behaviour are untouched, only the cached 2D footprint is read once at startup).
+    # The closest intersection along the ray gives `dist_m`; the penalty is then
+    #     r = -weight × speed_norm × max(0, 1 − dist_m / proximity_lookahead_m)
+    # so it is largest when the car is fast AND the wall is close in front of it
+    # (corner entry).  Set to 0.0 to disable entirely.
+    proximity_speed_weight: float = 3.0
+    proximity_lookahead_m:  float = 2.0   # walls farther than this give zero signal
+
+    # Braking reward: encourages sustained, uninterrupted high-speed braking.
+    # A "braking session" starts when the agent outputs negative throttle while
+    # moving at >= brake_reward_start_speed_m_s.  The session (and reward) continues
+    # as long as the agent keeps braking; any non-negative throttle output resets it,
+    # meaning a second braking attempt below start_speed gets no reward.
+    # The session also ends when forward speed drops below brake_reward_stop_speed_m_s.
+    # Reward per step = weight × cbrt(|throttle_output|).
+    braking_reward_weight:        float = 0.0  # DISABLED — superseded by braking_v2_weight below
+    brake_reward_start_speed_m_s: float = 2.5   # m/s — speed required to open a session
+    brake_reward_stop_speed_m_s:  float = 1.0   # m/s — session closes below this speed
+
+    # Braking reward V2: dense, instantaneous, no session state.
+    #   r_braking_v2 = weight × forward_speed² × |brake_input|       (only when throttle < 0)
+    # Quadratic in speed: braking at low speeds is nearly free reward-wise, while
+    # braking at high speed delivers a much larger payout — incentivises braking
+    # specifically where it matters (corner entries) rather than continuously.
+    #   At v = max_velocity, |brake| = 1 → r_braking_v2 = weight × v_max²
+    #   r_distance at v = max_velocity   ≈ distance_weight × dt × 1.0
+    # With weight = 0.1, v_max = 8 m/s   → r_braking_v2 = 6.4/step at full brake at top speed.
+    # At v = 2 m/s the same brake input yields only 0.4/step — 16× weaker than at top speed.
+    braking_v2_weight: float = 0.0
+
+    # ── Lap completion reward ────────────────────────────────────────────────
+    # Sparse reward fired when the agent crosses the start line (the line through
+    # the spawn point perpendicular to the spawn heading) while back inside the
+    # `lap_return_radius_m` start circle, after having left that circle.  Reward scales
+    # inversely with lap time, so faster laps yield much more reward:
+    #   r_lap = lap_reward_weight × lap_max_time_s / clamp(lap_time_s, lap_min, lap_max)
+    # At weight=500 and a 30 s lap → +500.  A 10 s lap → +1500.  Designed to be the
+    # primary improvement driver once the agent can complete laps, dwarfing the
+    # dense distance reward (~25/sec at top speed → ~750 per 30 s lap).
+    # Until the agent can actually finish a lap this reward stays at 0, so it has
+    # no effect on early training.
+    lap_reward_weight:    float = 300.0
+    lap_return_radius_m:  float = 0.3   # start circle: leaving it starts the lap timer; crossing the
+                                        # start line while back inside closes the lap
+    lap_min_time_s:       float = 20.0   # lower clamp (caps maximum reward per lap)
+    lap_max_time_s:       float = 40.0  # upper clamp & numerator anchor
 
     # Ramp per-step reward (while robot base is elevated on the ramp surface).
     ramp_reward_weight: float = 0
@@ -350,10 +430,10 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     ramp_speed_penalty_weight: float = 0.0
     ramp_approach_radius_m:    float = 4.0  # extend penalty zone this far beyond ramp bbox
 
-    # How often to switch the active decorative asset set (in policy steps).
-    # Decoupled from episode resets so the background changes at a steady rate
-    # regardless of how fast agents are crashing.
-    asset_randomize_every_n_steps: int = 500
+    # How often to advance to the next asset set in the round-robin cycle (in policy steps).
+    # Set to num_steps_per_env / (NUM_ASSET_SETS * 2) so every set appears exactly twice
+    # per PPO iteration.  At num_steps_per_env=2000: 2000 / (5*2) = 200.
+    asset_randomize_every_n_steps: int = 200
 
     # ════════════════════════════════════════════════════════════════════════
     # HARDWARE CONFIG  (robot articulation + camera sensor)
@@ -432,7 +512,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     #             right: (cos30°, -sin30°, 0) = (0.866, -0.500, 0.000)
     camera_left_cfg: TiledCameraCfg = TiledCameraCfg(
         prim_path="/World/envs/env_.*/Robot/mushr_nano/base_link/camera_left",
-        update_period=0.0,
+        update_period=4.0 / 120.0,  # render only at policy steps (decimation=4, sim=120Hz)
         height=180,
         width=240,
         data_types=["distance_to_image_plane"],
@@ -451,7 +531,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     )
     camera_right_cfg: TiledCameraCfg = TiledCameraCfg(
         prim_path="/World/envs/env_.*/Robot/mushr_nano/base_link/camera_right",
-        update_period=0.0,
+        update_period=4.0 / 120.0,  # render only at policy steps (decimation=4, sim=120Hz)
         height=180,
         width=240,
         data_types=["distance_to_image_plane"],
@@ -509,9 +589,11 @@ class ConeTrackEnv(DirectRLEnv):
 
         depth_obs_size = self._policy_depth_h * self._policy_depth_w
 
-        extra_obs = 0  # lin_vel removed — not available on real hardware
+        extra_obs = 0
         if cfg.include_prev_action:
             extra_obs += cfg.action_history_steps * 2  # N × (throttle + steer)
+        if cfg.include_wheel_vel:
+            extra_obs += 1  # scalar: avg wheel surface speed normalized to [0, 1]
         cfg.observation_space = depth_obs_size * 2 + extra_obs  # left + right cameras
 
         print(
@@ -584,6 +666,26 @@ class ConeTrackEnv(DirectRLEnv):
         )
 
 
+        # Braking reward session state: True while an uninterrupted high-speed braking session is active.
+        self._braking_session_active = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+        # Lap-tracking state.
+        # _lap_state: 0 = inside the start circle (lap timer running, awaiting departure),
+        #             1 = outside the start circle (lap timer running, awaiting line crossing).
+        # _lap_start_step: episode_length_buf value when the CURRENT lap's timer started —
+        #     0 at episode reset, or the completion step of the previous lap.  The timer is
+        #     therefore continuous from spawn, restarting on every lap closure.
+        # _fastest_lap_s_global: scalar best lap time observed across all envs, all episodes.
+        # _spawn_heading_{cos,sin}: unit vector along the spawn heading, captured at reset.
+        # _lap_prev_forward: previous step's signed forward position (pos − spawn) · heading,
+        #     used to detect start-line crossings via a sign flip (prev * now < 0).
+        self._lap_state            = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._lap_start_step       = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._fastest_lap_s_global = torch.tensor(0.0, device=self.device)
+        self._spawn_heading_cos    = torch.ones(self.num_envs, device=self.device)
+        self._spawn_heading_sin    = torch.zeros(self.num_envs, device=self.device)
+        self._lap_prev_forward     = torch.zeros(self.num_envs, device=self.device)
+
         # Contact / termination flags
         self._wall_terminated    = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._on_ramp            = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -592,9 +694,13 @@ class ConeTrackEnv(DirectRLEnv):
 
         # Average-speed reward accumulator: sum of clamped forward velocity per env.
         self._cumulative_forward_vel = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        # Spawn-escape bonus tracking: world XY position at reset + one-time fired flag.
+        self._spawn_pos     = torch.zeros(self.num_envs, 2, device=self.device)
+        self._spawn_escaped = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         # Index of the currently active decorative asset set (-1 = none selected yet).
         self._current_asset_set: int = -1
         self._asset_step_counter: int = 0
+        self._asset_round_robin_idx: int = 0  # advances each switch; modulo NUM_ASSET_SETS gives current set
         # All asset sets are left visible during scene init so RTX builds their BVH
         # structures at startup (cheap time slot). On the first physics step we hide
         # all but one selected set. This flag tracks whether that warmup hide has run.
@@ -605,6 +711,20 @@ class ConeTrackEnv(DirectRLEnv):
         self._camera_left_obs  = torch.zeros(self.num_envs, _cam_flat, device=self.device)
         self._camera_right_obs = torch.zeros(self.num_envs, _cam_flat, device=self.device)
         self._last_camera_update_step = -1
+
+        # Wall geometry for the proximity_speed reward — ray-cast against the same
+        # /World/Walls mesh used for termination (visibility / collision untouched).
+        # Extracted once here and cached on-device for fast batched intersection.
+        _wall_segs = self._extract_wall_segments_xy()
+        if _wall_segs:
+            import numpy as _np
+            _seg_arr = torch.from_numpy(_np.asarray(_wall_segs, dtype=_np.float32)).to(self.device)
+            self._wall_seg_a = _seg_arr[:, 0, :].contiguous()   # [M, 2]
+            self._wall_seg_b = _seg_arr[:, 1, :].contiguous()   # [M, 2]
+            print(f"[ConeTrackEnv] Proximity ray-cast: cached {_seg_arr.shape[0]} wall segments")
+        else:
+            self._wall_seg_a = None
+            self._wall_seg_b = None
 
     # ------------------------------------------------------------------
     # Scene setup
@@ -884,6 +1004,74 @@ class ConeTrackEnv(DirectRLEnv):
         except Exception as e:
             print(f"[Walls] Swap failed: {e}")
 
+    def _extract_wall_segments_xy(self):
+        """Extract 2D line segments from /World/Walls for proximity ray-cast.
+
+        Read-only pass over the same wall mesh used for termination.  Each triangle
+        edge is projected to the XY plane; we keep only edges whose endpoints have
+        nearly equal Z so vertical wall edges (which collapse to a single point in
+        XY) are discarded and the wall's footprint is what remains.
+
+        Visibility, collision, and termination logic on /World/Walls are not modified.
+        Returns a list of [[ax, ay], [bx, by]] entries (world frame), or [] on failure.
+        """
+        try:
+            import omni.usd
+            from pxr import Usd, UsdGeom, Gf
+            stage = omni.usd.get_context().get_stage()
+            wall_root = stage.GetPrimAtPath("/World/Walls")
+            if not wall_root.IsValid():
+                print("[ConeTrackEnv] /World/Walls not found — proximity ray-cast disabled")
+                return []
+
+            xf_cache = UsdGeom.XformCache()
+            segments: list = []
+
+            for prim in Usd.PrimRange(wall_root):
+                if not prim.IsA(UsdGeom.Mesh):
+                    continue
+                mesh = UsdGeom.Mesh(prim)
+                points_attr = mesh.GetPointsAttr().Get()
+                if points_attr is None:
+                    continue
+                counts_attr = mesh.GetFaceVertexCountsAttr().Get()
+                indices_attr = mesh.GetFaceVertexIndicesAttr().Get()
+                if counts_attr is None or indices_attr is None:
+                    continue
+
+                world_xf = xf_cache.GetLocalToWorldTransform(prim)
+                world_pts = [
+                    world_xf.Transform(Gf.Vec3d(float(p[0]), float(p[1]), float(p[2])))
+                    for p in points_attr
+                ]
+
+                idx_ptr = 0
+                for fc in counts_attr:
+                    face = [int(indices_attr[idx_ptr + i]) for i in range(fc)]
+                    idx_ptr += fc
+                    # Fan-triangulate, walk each triangle's 3 edges.
+                    for k in range(1, fc - 1):
+                        tri = (face[0], face[k], face[k + 1])
+                        pts3 = (world_pts[tri[0]], world_pts[tri[1]], world_pts[tri[2]])
+                        for e in range(3):
+                            a3 = pts3[e]
+                            b3 = pts3[(e + 1) % 3]
+                            # Drop vertical edges — they project to a point in XY.
+                            if abs(a3[2] - b3[2]) > 0.05:
+                                continue
+                            dx = b3[0] - a3[0]
+                            dy = b3[1] - a3[1]
+                            if dx * dx + dy * dy < 1e-4:
+                                continue
+                            segments.append(
+                                [[float(a3[0]), float(a3[1])],
+                                 [float(b3[0]), float(b3[1])]]
+                            )
+            return segments
+        except Exception as e:
+            print(f"[ConeTrackEnv] Wall segment extraction failed: {e}")
+            return []
+
     def _set_active_assets(self, set_idx: int) -> None:
         """Show asset set set_idx; hide all others."""
         try:
@@ -921,20 +1109,18 @@ class ConeTrackEnv(DirectRLEnv):
         can reason about what it recently commanded.
         """
         # On the very first physics step all asset sets are still visible (RTX has
-        # already built every BVH during sim init). Now hide all but one randomly
-        # chosen set — hiding is cheap, it only removes from the BVH.
+        # already built every BVH during sim init). Now hide all but set 0.
         if not self._assets_warmup_done:
-            init_set = int(torch.randint(0, NUM_ASSET_SETS, (1,)).item())
-            self._set_active_assets(init_set)
+            self._set_active_assets(0)
             self._assets_warmup_done = True
 
-        # Step-based asset randomisation — decoupled from episode resets.
+        # Round-robin asset cycling — each set appears exactly twice per PPO iteration.
+        # Sequence: 0,1,2,3,4,0,1,2,3,4,... advancing every asset_randomize_every_n_steps.
         self._asset_step_counter += 1
         if self._asset_step_counter >= self.cfg.asset_randomize_every_n_steps:
             self._asset_step_counter = 0
-            new_set = int(torch.randint(0, NUM_ASSET_SETS, (1,)).item())
-            if new_set != self._current_asset_set:
-                self._set_active_assets(new_set)
+            self._asset_round_robin_idx += 1
+            self._set_active_assets(self._asset_round_robin_idx % NUM_ASSET_SETS)
 
         raw = actions[:, :2].clamp(-1.0, 1.0)   # [N, 2]  — undelayed policy output
 
@@ -943,11 +1129,20 @@ class ConeTrackEnv(DirectRLEnv):
         self._action_delay_buf[:, -1] = raw
         delayed = self._action_delay_buf[:, 0]   # [N, 2]  — what the actuators act on
 
-        # Policy output [-1, 1] split at 0:
-        #   [0, 1]  → drive  (throttle_norm = output directly)
-        #   [-1, 0) → brake  (ESC shorts motor terminals; magnitude is irrelevant)
-        throttle_norm = delayed[:, 0].clamp(min=0.0)          # drive: [0, 1]
-        is_braking    = delayed[:, 0] < 0.0                   # brake: any negative value
+        # Apply rolling-friction offset BEFORE the three-zone mapping.  The offset
+        # shifts the drive/coast/brake boundary to the right: an output of
+        # +friction_offset is now "coast", anything below it brakes proportionally.
+        # Models drivetrain / rolling resistance so a stationary policy decays speed.
+        effective_throttle = delayed[:, 0] - self.cfg.throttle_friction_offset
+
+        # Policy output [-1, 1] three-zone mapping (post-friction):
+        #   (offset, 1]      → drive:  proportional forward torque
+        #    offset          → coast:  zero torque (no drive, no brake)
+        #   [-1, offset)     → brake:  braking force scales linearly with magnitude;
+        #                              effective = -1 = full brake_strength
+        throttle_norm   = effective_throttle.clamp(min=0.0)          # drive range  [0, 1]
+        is_braking      = effective_throttle < 0.0                   # any negative effective output
+        brake_magnitude = (-effective_throttle).clamp(0.0, 1.0)      # braking intensity [0, 1]
 
         # Per-wheel speed — abs for rolloff, signed for braking direction
         wheel_vel_signed = self.robot.data.joint_vel[:, self._all_throttle_ids]
@@ -956,17 +1151,18 @@ class ConeTrackEnv(DirectRLEnv):
         # Linear torque-speed rolloff: full torque at standstill, zero at no-load speed
         torque_rolloff = (1.0 - wheel_omega / self._omega_noload).clamp(0.0, 1.0)
 
-        # Drive torque: positive effort, forward only
+        # Drive torque: proportional to throttle, with back-EMF rolloff
         drive_torque = throttle_norm.unsqueeze(-1) * self._T_stall * torque_rolloff
 
-        # DC-motor zero-power "brake" mode (not float).
-        # The ESC shorts both motor terminals only when the throttle command is exactly 0
-        # (policy output -1). The resulting back-EMF current creates a braking torque
-        # proportional to wheel speed: T = -k * ω. Using signed velocity means the
-        # torque always opposes rotation and reaches 0 as ω → 0, so the car cannot
-        # reverse even without an extra clamp.
-        # At brake_strength=0.3, full-speed braking ≈ 0.6 g deceleration.
-        brake_torque = -self.cfg.brake_strength * self._T_stall * (wheel_vel_signed / self._omega_noload)
+        # Braking torque: proportional to brake_magnitude (output in [-1, 0]).
+        # Models back-EMF braking: T = -magnitude × brake_strength × T_stall × (ω/ω_noload).
+        # Torque opposes rotation and reaches 0 as ω → 0 (car cannot reverse).
+        brake_torque = (
+            -brake_magnitude.unsqueeze(-1)
+            * self.cfg.brake_strength
+            * self._T_stall
+            * (wheel_vel_signed / self._omega_noload)
+        )
 
         per_wheel_torque = torch.where(is_braking.unsqueeze(-1), brake_torque, drive_torque)
         self._wheel_torque_rear  = per_wheel_torque[:, :2]
@@ -1106,6 +1302,10 @@ class ConeTrackEnv(DirectRLEnv):
         parts = [self._camera_left_obs, self._camera_right_obs]
         if self.cfg.include_prev_action:
             parts.append(self._prev_action.view(self.num_envs, -1))   # [N, H*2]
+        if self.cfg.include_wheel_vel:
+            wheel_omega_mean = self.robot.data.joint_vel[:, self._all_throttle_ids].abs().mean(dim=-1)
+            wheel_vel_norm = (wheel_omega_mean * WHEEL_RADIUS / self.cfg.max_velocity_m_s).clamp(0.0, 1.0)
+            parts.append(wheel_vel_norm.unsqueeze(-1))                 # [N, 1]
 
         obs = torch.cat(parts, dim=-1)
         return {"policy": obs}
@@ -1120,19 +1320,21 @@ class ConeTrackEnv(DirectRLEnv):
         lin_vel_b = self.robot.data.root_lin_vel_b[:, 0]   # m/s forward
         dt = self.cfg.decimation * self.cfg.sim.dt          # ≈ 0.0333 s
 
+        lin_vel_augmented = torch.sign(lin_vel_b.clamp(min=0.0) / self.cfg.max_velocity_m_s) * torch.pow(torch.abs(lin_vel_b.clamp(min=0.0) / self.cfg.max_velocity_m_s), 3/4)
+
         # Distance covered this step
         r_distance = self.cfg.distance_weight * lin_vel_b * dt
+        # r_distance = self.cfg.distance_weight * lin_vel_augmented * dt
 
-        # Average-speed bonus: accumulate positive forward velocity each step and
-        # reward the running mean, so the policy must sustain speed, not just burst.
-        self._cumulative_forward_vel += lin_vel_b.clamp(min=0.0)
-        avg_vel = self._cumulative_forward_vel / self.episode_length_buf.float().clamp(min=1)
-        r_forward = self.cfg.forward_weight * (avg_vel / self.cfg.max_velocity_m_s)
+
+        # Per-step speed bonus: reward current forward speed directly each step.
+        r_forward = self.cfg.forward_weight * (lin_vel_b.clamp(min=0.0) / self.cfg.max_velocity_m_s)
 
         pos_xy = self.robot.data.root_pos_w[:, :2]
 
         # ── Wheel slip (AWD — all 4 wheels) ──────────────────────────────────────
-        wheel_vel  = self.robot.data.joint_vel[:, self._all_throttle_ids].mean(dim=-1) * WHEEL_RADIUS
+        wheel_vel     = self.robot.data.joint_vel[:, self._all_throttle_ids].abs().mean(dim=-1) * WHEEL_RADIUS
+        wheel_vel_norm_rew = (wheel_vel / self.cfg.max_velocity_m_s).clamp(0.0, 1.0)
         slip_speed = torch.abs(wheel_vel - lin_vel_b)
         r_slip     = -self.cfg.slip_weight * slip_speed / self.cfg.max_velocity_m_s * (~self._on_ramp).float()
 
@@ -1172,7 +1374,189 @@ class ConeTrackEnv(DirectRLEnv):
 
         r_alive = torch.full((self.num_envs,), self.cfg.alive_weight, device=self.device)
 
-        total = r_alive + r_distance + r_forward + r_slip + r_steer_shape + r_ramp + r_airborne
+        # ── Spawn-escape bonus ────────────────────────────────────────────────
+        # One-time reward scaled by speed at the moment of escape.  Full bonus only
+        # if the car is already moving at max speed when it crosses the radius.
+        spawn_dist = torch.linalg.vector_norm(pos_xy - self._spawn_pos, dim=-1)
+        just_escaped = (~self._spawn_escaped) & (spawn_dist > self.cfg.spawn_escape_radius_m)
+        self._spawn_escaped |= just_escaped
+        speed_frac = (lin_vel_b / self.cfg.max_velocity_m_s).clamp(0.0, 1.0)
+        r_spawn_escape = self.cfg.spawn_escape_reward * just_escaped.float() * speed_frac
+
+        # ── Proximity speed penalty (ray-cast against /World/Walls) ──────────────
+        # Cast a virtual ray from the car's XY position along its world-frame
+        # linear-velocity vector and find the closest hit on the (invisible) wall
+        # geometry.  Walls remain hidden / termination-only — this only reads the
+        # cached 2D footprint built once at startup.
+        #
+        # Closeness = 1 − dist / proximity_lookahead_m, clamped to [0, 1].  Walls
+        # beyond the lookahead give zero signal; walls right ahead give 1.0.
+        # Penalty = -weight × speed_norm × closeness.  Strongest exactly when the
+        # car is fast AND a wall is close along the heading of motion (corner entry).
+        if self.cfg.proximity_speed_weight > 0.0 and self._wall_seg_a is not None:
+            vel_w   = self.robot.data.root_lin_vel_w[:, :2]                    # [N, 2]
+            speed_w = torch.linalg.vector_norm(vel_w, dim=-1)                  # [N]
+            moving  = speed_w > 0.5
+            dir_w   = vel_w / speed_w.clamp(min=1e-3).unsqueeze(-1)            # [N, 2]
+
+            # Vectorised 2D ray-vs-segment intersection across [N envs, M segs].
+            # Ray:     P(t) = origin + t · dir_w,        t ≥ 0
+            # Segment: Q(u) = a + u · (b − a),           0 ≤ u ≤ 1
+            # With s = b − a:
+            #     t = ((a − origin) × s)   / (dir × s)
+            #     u = ((a − origin) × dir) / (dir × s)
+            # where × is the 2D pseudo-cross (a × b = a_x*b_y − a_y*b_x).
+            a   = self._wall_seg_a.unsqueeze(0)                                # [1, M, 2]
+            b   = self._wall_seg_b.unsqueeze(0)                                # [1, M, 2]
+            s   = b - a                                                         # [1, M, 2]
+            r   = dir_w.unsqueeze(1)                                            # [N, 1, 2]
+            ap  = a - pos_xy.unsqueeze(1)                                       # [N, M, 2]
+
+            cross_rs   = r[..., 0]  * s[..., 1]  - r[..., 1]  * s[..., 0]      # [N, M]
+            cross_ap_s = ap[..., 0] * s[..., 1]  - ap[..., 1] * s[..., 0]
+            cross_ap_r = ap[..., 0] * r[..., 1]  - ap[..., 1] * r[..., 0]
+
+            denom = torch.where(
+                cross_rs.abs() > 1e-8,
+                cross_rs,
+                torch.full_like(cross_rs, 1e-8),
+            )
+            t_hit = cross_ap_s / denom
+            u_hit = cross_ap_r / denom
+
+            hit = (cross_rs.abs() > 1e-8) & (t_hit > 0.0) & (u_hit >= 0.0) & (u_hit <= 1.0)
+            t_masked = torch.where(hit, t_hit, torch.full_like(t_hit, float("inf")))
+            nearest_dist = t_masked.min(dim=1).values                          # [N]
+
+            closeness  = 1.0 - (nearest_dist / self.cfg.proximity_lookahead_m).clamp(0.0, 1.0)
+            speed_norm = (speed_w / self.cfg.max_velocity_m_s).clamp(0.0, 1.0)
+            r_proximity_speed = (
+                -self.cfg.proximity_speed_weight * closeness * torch.pow(speed_norm,2) * moving.float()
+            )
+        else:
+            r_proximity_speed = torch.zeros(self.num_envs, device=self.device)
+
+        # ── Braking reward ────────────────────────────────────────────────────
+        if self.cfg.braking_reward_weight > 0.0:
+            throttle_cmd    = self._action_delay_buf[:, 0, 0]
+            is_braking_now  = throttle_cmd < 0.0
+            brake_magnitude_rew = (-throttle_cmd).clamp(0.0, 1.0)
+            speed = lin_vel_b.clamp(min=0.0)
+            # Open a new session only if speed ≥ start threshold and currently braking
+            newly_activated = (~self._braking_session_active) & is_braking_now & (speed >= self.cfg.brake_reward_start_speed_m_s)
+            self._braking_session_active |= newly_activated
+            # Kill session if not braking or speed fell below stop threshold
+            self._braking_session_active &= is_braking_now
+            self._braking_session_active &= (speed > self.cfg.brake_reward_stop_speed_m_s)
+            r_braking = (
+                self.cfg.braking_reward_weight
+                * torch.pow(brake_magnitude_rew, 1.0 / 3.0)
+                * self._braking_session_active.float()
+            )
+        else:
+            r_braking = torch.zeros(self.num_envs, device=self.device)
+
+        # ── Lap completion reward ─────────────────────────────────────────────
+        # State machine: 0 = at-start, 1 = away-from-start, lap closes on 1→0.
+        # The 1→0 transition requires *crossing the start line* — the line through
+        # the spawn point perpendicular to the spawn heading — while inside
+        # `lap_return_radius_m`.  Crossing is detected as a sign flip of the car's
+        # signed forward position (pos − spawn) · heading_unit between this step
+        # and the last.  The radius gate disambiguates: a round track intersects
+        # the start line twice (near spawn and on the far side); only the spawn-
+        # side crossing counts.
+        pos_rel             = pos_xy - self._spawn_pos
+        forward_now         = pos_rel[:, 0] * self._spawn_heading_cos + pos_rel[:, 1] * self._spawn_heading_sin
+        spawn_dist_for_lap  = torch.linalg.vector_norm(pos_rel, dim=-1)
+        in_grace_lap        = self.episode_length_buf < self.cfg.spawn_grace_steps
+
+        crossed_start_line  = (self._lap_prev_forward * forward_now) < 0.0
+        in_return_radius    = spawn_dist_for_lap < self.cfg.lap_return_radius_m
+
+        # Timer runs continuously.  `_lap_start_step` is the step the *current* lap began:
+        #   - at reset:           0 (timer counts from the moment of spawn)
+        #   - on lap completion:  the completion step (next lap restarts immediately)
+        # State machine sequences the lap:
+        #   - 0 → 1 when the agent leaves the start circle (timer keeps running)
+        #   - 1 → 0 when the start line is crossed while back inside the circle
+        #           (lap closes here, new lap's timer starts on the same step)
+        # Multiple completions per episode are supported — each closure logs a lap.
+        leaving = (self._lap_state == 0) & (~in_return_radius) & (~in_grace_lap)
+        self._lap_state = torch.where(leaving, torch.ones_like(self._lap_state), self._lap_state)
+
+        completing = (self._lap_state == 1) & crossed_start_line & in_return_radius
+        self._lap_state = torch.where(completing, torch.zeros_like(self._lap_state), self._lap_state)
+
+        # Save signed forward for next-step crossing detection.
+        self._lap_prev_forward = forward_now.detach()
+
+        lap_steps_elapsed = (self.episode_length_buf - self._lap_start_step).float().clamp(min=1.0)
+        lap_time_s        = lap_steps_elapsed * dt
+        lap_time_clamped  = lap_time_s.clamp(self.cfg.lap_min_time_s, self.cfg.lap_max_time_s)
+        r_lap = torch.where(
+            completing,
+            self.cfg.lap_reward_weight * self.cfg.lap_max_time_s / lap_time_clamped,
+            torch.zeros_like(lap_time_s),
+        )
+
+        # Restart the timer on the same step a lap closes, so the next lap measures from here.
+        self._lap_start_step = torch.where(completing, self.episode_length_buf.clone(), self._lap_start_step)
+
+        # Lap metrics → RSL-RL extras → tensorboard.
+        # rsl_rl aggregates per iteration via torch.mean(torch.cat(values_across_steps))
+        # (on_policy_runner.py: see the ep_infos loop).  To keep iter-means meaningful
+        # we avoid padding with zeros across the thousands of non-event steps:
+        #   - lap_time_s    : empty on non-completion steps, vector of completed
+        #                     lap times on completion steps.  Iter-mean = average
+        #                     lap time across completions during the iteration.
+        #   - fastest_lap_s : empty on non-completion steps, the (updated) global
+        #                     scalar on completion steps.  Iter-mean is monotonic
+        #                     non-increasing as the global improves and equals the
+        #                     global exactly on iterations where it didn't change.
+        #   - laps_per_min  : kept as a per-step value (k * 60/dt, k = laps closed
+        #                     this step).  Iter MEAN = total_laps / iter_minutes,
+        #                     summed across envs.  Padding zeros are REQUIRED here
+        #                     for that rate interpretation.
+        # rsl_rl drops any key absent in ep_infos[0]; an empty tensor still counts
+        # as "present" and contributes nothing to torch.cat.
+        empty = torch.tensor([], device=self.device)
+        if completing.any():
+            lap_times_done = lap_time_s[completing].detach()
+            new_min = lap_times_done.min()
+            self._fastest_lap_s_global = torch.where(
+                self._fastest_lap_s_global > 0,
+                torch.minimum(self._fastest_lap_s_global, new_min),
+                new_min,
+            )
+            fastest_log = self._fastest_lap_s_global.detach().unsqueeze(0).clone()
+        else:
+            lap_times_done = empty
+            fastest_log    = empty
+
+        laps_per_min = completing.float().sum().unsqueeze(0) * (60.0 / dt)
+
+        self.extras["log"] = {
+            "Lap/lap_time_s":    lap_times_done,
+            "Lap/fastest_lap_s": fastest_log,
+            "Lap/laps_per_min":  laps_per_min,
+        }
+
+        # ── Braking reward V2 ────────────────────────────────────────────────
+        # Instantaneous, no session state: r = weight × v_forward² × |brake_input|.
+        # The v² scaling means braking at low speed contributes almost nothing,
+        # while braking at high speed dominates — strong incentive to brake
+        # specifically when going fast (e.g., before corners) rather than always.
+        if self.cfg.braking_v2_weight > 0.0:
+            throttle_cmd_v2  = self._action_delay_buf[:, 0, 0]
+            brake_input_v2   = (-throttle_cmd_v2).clamp(0.0, 1.0)  # 0 if not braking
+            speed_fwd_v2     = lin_vel_b.clamp(min=0.0)
+            # r_braking_v2 = self.cfg.braking_v2_weight * speed_fwd_v2 * brake_input_v2
+
+            r_braking_v2 = self.cfg.braking_v2_weight * torch.pow(speed_fwd_v2, 2) * brake_input_v2
+        else:
+            r_braking_v2 = torch.zeros(self.num_envs, device=self.device)
+
+        total = r_alive + r_distance + r_forward + r_slip + r_steer_shape + r_ramp + r_airborne + r_spawn_escape + r_proximity_speed + r_braking + r_braking_v2 + r_lap
 
         return total
 
@@ -1247,9 +1631,10 @@ class ConeTrackEnv(DirectRLEnv):
         idx  = torch.randint(0, len(pts), (n,), device="cpu").tolist()
         xs   = torch.tensor([pts[i][0] * self.cfg.spawn_x_scale for i in idx], dtype=torch.float32, device=self.device)
         ys   = torch.tensor([pts[i][1] * self.cfg.spawn_y_scale for i in idx], dtype=torch.float32, device=self.device)
-        yaw  = torch.tensor(
+        base_yaw = torch.tensor(
             [math.radians(pts[i][2]) for i in idx], dtype=torch.float32, device=self.device
         )
+        yaw = base_yaw.clone()
         if self.cfg.spawn_yaw_jitter_rad > 0.0:
             yaw = yaw + (torch.rand(n, device=self.device) - 0.5) * 2.0 * self.cfg.spawn_yaw_jitter_rad
         spawn_xy = torch.stack([xs, ys], dim=-1)
@@ -1276,9 +1661,18 @@ class ConeTrackEnv(DirectRLEnv):
         self._prev_action[env_ids]    = 0.0         # clears full [H, 2] history
         self._action_delay_buf[env_ids] = 0.0       # clears latency FIFO
 
-        self._ramp_ascended[env_ids]     = False
-        self._wall_ever_touched[env_ids] = False
+        self._ramp_ascended[env_ids]         = False
+        self._wall_ever_touched[env_ids]     = False
         self._cumulative_forward_vel[env_ids] = 0.0
+        self._spawn_pos[env_ids_t]           = spawn_xy
+        self._spawn_escaped[env_ids_t]       = False
+        self._braking_session_active[env_ids_t] = False
+        self._lap_state[env_ids_t]              = 0
+        self._lap_start_step[env_ids_t]         = 0
+        self._spawn_heading_cos[env_ids_t]      = torch.cos(base_yaw)
+        self._spawn_heading_sin[env_ids_t]      = torch.sin(base_yaw)
+        self._lap_prev_forward[env_ids_t]       = 0.0
+        # Note: _fastest_lap_s_global is intentionally NOT reset — it tracks the best ever.
 
         joint_pos = self.robot.data.default_joint_pos[env_ids]
         joint_vel = torch.zeros_like(joint_pos)
