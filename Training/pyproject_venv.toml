@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools<82.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lituanicax-irc"
+version = "0.1.0"
+description = "RL training environment for the LituanicaX intelligent robot competition."
+readme = "README.md"
+requires-python = "==3.11.*"
+dependencies = [
+    "setuptools<82.0.0",
+    "isaacsim[all,extscache]==5.1.0",
+    "torch==2.7.0",
+    "torchvision==0.22.0",
+    "tensordict",
+    "isaaclab",
+    "isaaclab_assets",
+    "isaaclab_tasks",
+    "isaaclab_rl[rsl-rl]",
+]
+
+[tool.setuptools]
+package-dir = {"" = "source"}
+
+[tool.setuptools.packages.find]
+where = ["source"]
+include = ["tasks*"]
+
+[tool.uv]
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64' and python_full_version == '3.11.*'"]
+
+[tool.uv.sources]
+isaacsim = { index = "nvidia" }
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+isaaclab = { path = "IsaacLab/source/isaaclab", editable = true }
+isaaclab_assets = { path = "IsaacLab/source/isaaclab_assets", editable = true }
+isaaclab_tasks = { path = "IsaacLab/source/isaaclab_tasks", editable = true }
+isaaclab_rl = { path = "IsaacLab/source/isaaclab_rl", editable = true }
+
+[tool.uv.extra-build-dependencies]
+flatdict = ["setuptools<82"]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+explicit = false
