@@ -24,11 +24,12 @@ This package contains the standalone ROS 2 runtime for the RC car.
 
 ## Build
 
-From `Deployment/Ros2`:
+From the repository root:
 
 ```bash
-colcon build --symlink-install
-source install/setup.bash
+Deployment/install.sh
+source ~/ros2_jazzy/install/setup.bash
+source Deployment/Ros2/install/setup.bash
 ```
 
 The package installs its own policy artifact, so no old `Deployment` Python files are required at runtime.

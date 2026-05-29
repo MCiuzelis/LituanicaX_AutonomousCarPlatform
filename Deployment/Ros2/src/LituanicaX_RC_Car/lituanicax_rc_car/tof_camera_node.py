@@ -14,8 +14,14 @@ from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import MultiArrayDimension, UInt8MultiArray
 
+from .common import (
+    CAMERA_LEFT_FLIP_VERTICAL,
+    CAMERA_LEFT_INDEX,
+    CAMERA_RIGHT_FLIP_VERTICAL,
+    CAMERA_RIGHT_INDEX,
+    CAMERA_SWAP_LEFT_RIGHT,
+)
 
-CAMERA_INDICES = {"left": 0, "right": 8}
 MAX_DISTANCE_MM = 2000
 CONF_THRESHOLD = 30
 
@@ -34,13 +40,37 @@ ACTION_HIST = 30
 OBS_DIM = PER_CAM_DIM * 2 + ACTION_HIST
 
 
+def camera_index_for_side(side: str) -> int:
+    if side not in ("left", "right"):
+        raise ValueError(f"Unknown camera side: {side}")
+    left_index = CAMERA_RIGHT_INDEX if CAMERA_SWAP_LEFT_RIGHT else CAMERA_LEFT_INDEX
+    right_index = CAMERA_LEFT_INDEX if CAMERA_SWAP_LEFT_RIGHT else CAMERA_RIGHT_INDEX
+    return left_index if side == "left" else right_index
+
+
+def vertical_flip_for_side(side: str) -> bool:
+    if side == "left":
+        return CAMERA_LEFT_FLIP_VERTICAL
+    if side == "right":
+        return CAMERA_RIGHT_FLIP_VERTICAL
+    raise ValueError(f"Unknown camera side: {side}")
+
+
+def orient_camera_frame(depth_buf: np.ndarray, conf_buf: np.ndarray, vertical_flip: bool) -> Tuple[np.ndarray, np.ndarray]:
+    depth = np.flip(depth_buf, (0, 1))
+    confidence = np.flip(conf_buf, (0, 1))
+    if vertical_flip:
+        depth = np.flip(depth, 0)
+        confidence = np.flip(confidence, 0)
+    return np.ascontiguousarray(depth), np.ascontiguousarray(confidence)
+
+
 def depth_to_jpeg(depth_buf: np.ndarray, conf_buf: np.ndarray, depth_range: float) -> bytes:
     depth = np.nan_to_num(depth_buf)
     depth[conf_buf < CONF_THRESHOLD] = 0
     color = (depth * (255.0 / depth_range)).astype(np.uint8)
     color = cv2.applyColorMap(color, cv2.COLORMAP_RAINBOW)
     color[conf_buf < CONF_THRESHOLD] = (0, 0, 0)
-    color = cv2.flip(color, -1)
     ok, jpeg = cv2.imencode(".jpg", color, [cv2.IMWRITE_JPEG_QUALITY, 80])
     if not ok:
         return b""
@@ -131,7 +161,8 @@ class TofCameraNode(Node):
 
         self.side = str(self.get_parameter("side").value)
         configured_index = int(self.get_parameter("camera_index").value)
-        self.camera_index = configured_index if configured_index >= 0 else CAMERA_INDICES[self.side]
+        self.camera_index = configured_index if configured_index >= 0 else camera_index_for_side(self.side)
+        self.vertical_flip = vertical_flip_for_side(self.side)
         self.frame_id = str(self.get_parameter("frame_id").value) or f"tof_{self.side}"
         self.max_distance_mm = int(self.get_parameter("max_distance_mm").value)
 
@@ -147,7 +178,7 @@ class TofCameraNode(Node):
 
         self.get_logger().info(
             f"Starting {self.side} ToF camera node: CSI index={self.camera_index}, "
-            f"packet={packet_topic}, preview={preview_topic}"
+            f"vertical_flip={self.vertical_flip}, packet={packet_topic}, preview={preview_topic}"
         )
 
     def _camera_loop(self) -> None:
@@ -170,22 +201,33 @@ class TofCameraNode(Node):
                     frame = cam.requestFrame(1000)
                     if frame is None or not isinstance(frame, ac.DepthData):
                         continue
+                    if not rclpy.ok() or self._stop.is_set():
+                        cam.releaseFrame(frame)
+                        break
 
                     # Deep-copy before releaseFrame. This is the critical guard against
                     # SDK-owned shared buffers bleeding between the two cameras.
                     depth = np.array(frame.depth_data, copy=True).astype(np.float32)
                     confidence = np.array(frame.confidence_data, copy=True)
                     cam.releaseFrame(frame)
+                    if not rclpy.ok() or self._stop.is_set():
+                        break
 
-                    jpeg = depth_to_jpeg(depth, confidence, depth_range)
+                    depth_oriented, confidence_oriented = orient_camera_frame(
+                        depth,
+                        confidence,
+                        self.vertical_flip,
+                    )
+                    jpeg = depth_to_jpeg(depth_oriented, confidence_oriented, depth_range)
 
-                    depth_flipped = np.ascontiguousarray(np.flip(depth, (0, 1)))
-                    confidence_flipped = np.ascontiguousarray(np.flip(confidence, (0, 1)))
-
+                    if not rclpy.ok() or self._stop.is_set():
+                        break
                     stamp = self.get_clock().now().to_msg()
-                    self.packet_pub.publish(make_tof_packet(depth_flipped, confidence_flipped))
+                    self.packet_pub.publish(make_tof_packet(depth_oriented, confidence_oriented))
                     self.preview_pub.publish(make_compressed_image(jpeg, self.frame_id, stamp))
                 except Exception as exc:
+                    if not rclpy.ok() or self._stop.is_set():
+                        break
                     self.get_logger().error(f"Camera {self.camera_index} loop error: {exc}")
                     time.sleep(1.0)
         finally:
