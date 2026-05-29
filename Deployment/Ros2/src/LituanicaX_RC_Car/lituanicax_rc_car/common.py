@@ -3,12 +3,18 @@ from __future__ import annotations
 FPS_TARGET = 15
 POLICY_HZ = 30
 
+CAMERA_LEFT_INDEX = 0
+CAMERA_RIGHT_INDEX = 8
+CAMERA_SWAP_LEFT_RIGHT = True
+CAMERA_LEFT_FLIP_VERTICAL = False
+CAMERA_RIGHT_FLIP_VERTICAL = False
+
 # Hardware configuration lives here so pinning, calibration, and limits are
 # visible in one place.
 PIN_INA = 24
 PIN_INB = 23
-MOTOR_GPIO = 12
-SERVO_GPIO = 13
+MOTOR_PWM_CHANNEL = 0
+SERVO_PWM_CHANNEL = 1
 MOTOR_PWM_FREQ = 20000
 SERVO_PWM_FREQ = 50
 

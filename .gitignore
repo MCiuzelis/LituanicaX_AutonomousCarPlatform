@@ -4,6 +4,13 @@ outputs/
 Training/.venv/
 Deployment/.venv/
 Deployment/Ros2/log/
+Deployment/Ros2/logs/
+Deployment/Ros2/build/
+Deployment/Ros2/install/
+Deployment/Ros2/log*/
+Deployment/Ros2/**/*.log
+/launch
+Deployment/launch_ros.sh
 
 # Python cache
 __pycache__/

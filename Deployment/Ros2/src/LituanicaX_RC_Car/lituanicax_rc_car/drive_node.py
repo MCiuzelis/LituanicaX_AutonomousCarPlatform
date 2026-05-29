@@ -7,7 +7,6 @@ import RPi.GPIO as GPIO
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
-from rpi_hardware_pwm import HardwarePWM
 from std_msgs.msg import Bool, Float32MultiArray
 
 from .common import (
@@ -16,19 +15,58 @@ from .common import (
     MAX_THROTTLE,
     MONITORING_TIMEOUT_SEC,
     MOTOR_DIRECTION,
-    MOTOR_GPIO,
+    MOTOR_PWM_CHANNEL,
     MOTOR_PWM_FREQ,
     PIN_INA,
     PIN_INB,
     SERVO_AMPLITUDE,
     SERVO_CENTER_US,
     SERVO_DIRECTION,
-    SERVO_GPIO,
     SERVO_MAX_US,
     SERVO_MIN_US,
     SERVO_OFFSET_US,
+    SERVO_PWM_CHANNEL,
     SERVO_PWM_FREQ,
 )
+
+
+PWM_CHIP_PATH = "/sys/class/pwm/pwmchip0"
+
+
+class SysfsHardwarePWM:
+    def __init__(self, channel: int, frequency_hz: int, initial_pulse_ns: int = 0) -> None:
+        self.channel = channel
+        self.period_ns = int(1_000_000_000 / frequency_hz)
+        self.path = f"{PWM_CHIP_PATH}/pwm{self.channel}"
+
+        if not os.path.exists(self.path):
+            self._write(f"{PWM_CHIP_PATH}/export", str(self.channel))
+            time.sleep(0.1)
+
+        self._write("enable", "0")
+        self._write("duty_cycle", "0")
+        self._write("period", str(self.period_ns))
+        self.set_pulse_ns(initial_pulse_ns)
+        self._write("enable", "1")
+
+    def _write(self, name_or_path: str, value: str) -> None:
+        path = name_or_path if name_or_path.startswith("/") else f"{self.path}/{name_or_path}"
+        with open(path, "w") as f:
+            f.write(value)
+
+    def set_duty_fraction(self, duty_fraction: float) -> None:
+        duty_fraction = max(0.0, min(1.0, duty_fraction))
+        self.set_pulse_ns(int(self.period_ns * duty_fraction))
+
+    def set_pulse_ns(self, pulse_ns: int) -> None:
+        pulse_ns = max(0, min(self.period_ns, int(pulse_ns)))
+        self._write("duty_cycle", str(pulse_ns))
+
+    def stop(self) -> None:
+        try:
+            self._write("enable", "0")
+        except OSError:
+            pass
 
 
 class DriveNode(Node):
@@ -50,17 +88,16 @@ class DriveNode(Node):
         self.last_steer = 0.0
         self._stopped = False
 
-        motor_chip = self._find_pwmchip(MOTOR_GPIO)
-        servo_chip = self._find_pwmchip(SERVO_GPIO)
-
         GPIO.setmode(GPIO.BCM)
         GPIO.setup(PIN_INA, GPIO.OUT)
         GPIO.setup(PIN_INB, GPIO.OUT)
 
-        self.motor_pwm = HardwarePWM(pwm_channel=0, hz=MOTOR_PWM_FREQ, chip=motor_chip)
-        self.servo_pwm = HardwarePWM(pwm_channel=0, hz=SERVO_PWM_FREQ, chip=servo_chip)
-        self.motor_pwm.start(0)
-        self.servo_pwm.start(7.5)
+        self.motor_pwm = SysfsHardwarePWM(MOTOR_PWM_CHANNEL, MOTOR_PWM_FREQ, initial_pulse_ns=0)
+        self.servo_pwm = SysfsHardwarePWM(
+            SERVO_PWM_CHANNEL,
+            SERVO_PWM_FREQ,
+            initial_pulse_ns=self._steering_pulse_ns(0.0),
+        )
 
         self.telemetry_pub = self.create_publisher(Float32MultiArray, "/drive/telemetry", 1)
         self.create_subscription(Float32MultiArray, "/cmd_drive", self._cmd_cb, 1)
@@ -71,23 +108,6 @@ class DriveNode(Node):
         self.timer = self.create_timer(telemetry_period, self._telemetry_tick)
 
         self.get_logger().info("Drive node initialized")
-
-    @staticmethod
-    def _find_pwmchip(gpio_pin: int) -> int:
-        for entry in os.listdir("/sys/class/pwm"):
-            if not entry.startswith("pwmchip"):
-                continue
-            chip = int(entry[7:])
-            try:
-                with open(f"/sys/class/pwm/{entry}/device/uevent") as f:
-                    for line in f:
-                        if line.startswith("OF_FULLNAME="):
-                            addr = line.strip().split("@")[-1]
-                            if int(addr, 16) == gpio_pin:
-                                return chip
-            except OSError:
-                continue
-        raise RuntimeError(f"No pwmchip found for GPIO{gpio_pin}")
 
     def _enabled_cb(self, msg: Bool) -> None:
         self.enabled = bool(msg.data)
@@ -133,18 +153,20 @@ class DriveNode(Node):
 
         GPIO.output(PIN_INA, GPIO.HIGH if value >= 0 else GPIO.LOW)
         GPIO.output(PIN_INB, GPIO.HIGH if value < 0 else GPIO.LOW)
-        self.motor_pwm.change_duty_cycle(abs(value) * 100.0)
+        self.motor_pwm.set_duty_fraction(abs(value))
 
-    def _set_steering(self, value: float) -> None:
+    @staticmethod
+    def _steering_pulse_ns(value: float) -> int:
         value = max(-1.0, min(1.0, value))
         value = value * SERVO_DIRECTION * SERVO_AMPLITUDE
 
         span = (SERVO_MAX_US - SERVO_MIN_US) / 2
         pulse = SERVO_CENTER_US + SERVO_OFFSET_US + (value * span)
         pulse = max(SERVO_MIN_US, min(SERVO_MAX_US, pulse))
+        return int(pulse * 1000)
 
-        duty = (pulse / 20000.0) * 100.0
-        self.servo_pwm.change_duty_cycle(duty)
+    def _set_steering(self, value: float) -> None:
+        self.servo_pwm.set_pulse_ns(self._steering_pulse_ns(value))
 
     def _telemetry_tick(self) -> None:
         if time.monotonic() - self.last_command_time > self.command_timeout_sec or not self._can_drive():

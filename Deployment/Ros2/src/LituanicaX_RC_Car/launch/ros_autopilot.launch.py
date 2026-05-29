@@ -27,7 +27,6 @@ def generate_launch_description() -> LaunchDescription:
                 parameters=[
                     {
                         "side": "left",
-                        "camera_index": 0,
                         "frame_id": "tof_left",
                     }
                 ],
@@ -40,7 +39,6 @@ def generate_launch_description() -> LaunchDescription:
                 parameters=[
                     {
                         "side": "right",
-                        "camera_index": 8,
                         "frame_id": "tof_right",
                     }
                 ],
