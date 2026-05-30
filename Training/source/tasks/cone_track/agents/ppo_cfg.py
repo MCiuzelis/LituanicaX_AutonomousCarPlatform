@@ -10,7 +10,7 @@ from isaaclab_rl.rsl_rl import (
 
 @configclass
 class ConeTrackPPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    num_steps_per_env: int = 1800
+    num_steps_per_env: int = 1200
     max_iterations:    int = 3000
     save_interval:     int = 10
     experiment_name:   str = "cone_track"
@@ -32,12 +32,12 @@ class ConeTrackPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         learning_rate=1e-4,   
         schedule="adaptive",     
         num_learning_epochs=6, 
-        num_mini_batches=5,   
+        num_mini_batches=24,   
         clip_param=0.2,
         entropy_coef=0.002,
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
-        gamma=0.997,
+        gamma=0.998,
         lam=0.95,
         desired_kl=0.02,
         max_grad_norm=0.75,
