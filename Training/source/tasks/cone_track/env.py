@@ -159,7 +159,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
 
     # ── Core env parameters ────────────────────────────────────────────────
     decimation:        int   = 4      # policy at ~30 Hz  (sim 120 Hz / 4)
-    episode_length_s:  float = 150.0  # 150 s × 30 Hz = 4 500 steps
+    episode_length_s:  float = 90.0  # 90 s × 30 Hz = 2 700 steps
     action_space:      int   = 2
     # observation_space is patched in ConeTrackEnv.__init__ after computing
     # the exact cropped depth image size.  The placeholder below keeps
@@ -220,7 +220,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
 
     # Depth range for normalization.  Readings > depth_max_m are clamped.
     # Must match autopilot.py MAX_DISTANCE / 1000.  ArduCam supports 2000 mm or 4000 mm only.
-    depth_max_m: float = 2.0
+    depth_max_m: float = 4.0
 
     # ── Policy image downsampling ──────────────────────────────────────────
     # After cropping the raw depth frame (240×≈99 at defaults) the image is
@@ -261,7 +261,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     spawn_y_scale: float = -1.15
 
     duplicate_with_flipped_yaw: bool = True  # if True, each (x, y, θ) spawns two episodes: one with +180deg rotation around z
-    spawn_yaw_jitter_rad: float = 0.15   # ± heading noise applied in both modes
+    spawn_yaw_jitter_rad: float = 0.1   # ± heading noise applied in both modes
 
     # One-time bonus the first time the car moves farther than spawn_escape_radius_m
     # from its spawn position, scaled by how fast the car is moving at that moment:
@@ -270,7 +270,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # Teaches aggressive initial acceleration without rewarding slow drift.
     # Set spawn_escape_reward=0 to disable.
     spawn_escape_radius_m: float = 0.4
-    spawn_escape_reward:   float = 800
+    spawn_escape_reward:   float = 200
 
     # ════════════════════════════════════════════════════════════════════════
     # SPAWN SPEED — initial robot velocity at each episode reset
@@ -303,7 +303,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     car_mass_kg:      float = 1.35    # total robot mass (kg); must match robot_cfg mass_props
     wheel_grip_mu_s:  float = 0.8    # effective static friction coeff (wheel × ground)
     slip_threshold:   float = 0.6   # throttle fraction [0,1] that saturates traction at rest
-    max_velocity_m_s: float = 8.0   # top speed (m/s): full-throttle torque drops to 0 here
+    max_velocity_m_s: float = 6.0   # top speed (m/s): full-throttle torque drops to 0 here
     max_steer_rad:    float = 0.488  # ≈28° max front-wheel steer angle
     # Braking strength at full brake command (policy output = -1).
     # Braking force scales linearly with policy output magnitude: output=-0.5 → half force.
@@ -333,7 +333,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
 
     # slow_stop_speed_fraction — episode terminates when speed falls below this
     # (catches truly stuck / reversed agents; keep low so normal braking is fine)
-    slow_stop_speed_fraction:    float = 0.02  # terminate if speed < 3 % of vel_cap
+    slow_stop_speed_fraction:    float = 0.03  # terminate if speed < 3 % of vel_cap
 
     # ════════════════════════════════════════════════════════════════════════
     # OBSERVATION EXTRAS
@@ -354,10 +354,10 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # REWARD WEIGHTS
     # ════════════════════════════════════════════════════════════════════════
     # Constant reward per step the agent stays alive (not crashed / stuck).
-    alive_weight:       float = 0.0
+    alive_weight:       float = 0.1
 
     # Distance: rewards physical metres covered each step (v × dt).
-    distance_weight:    float = 20.0
+    distance_weight:    float = 300.0
 
     # Speed bonus, normalised by max_velocity_m_s.
     forward_weight:     float = 0 #2
@@ -378,7 +378,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     #     r = -weight × speed_norm × max(0, 1 − dist_m / proximity_lookahead_m)
     # so it is largest when the car is fast AND the wall is close in front of it
     # (corner entry).  Set to 0.0 to disable entirely.
-    proximity_speed_weight: float = 3.0
+    proximity_speed_weight: float = 0.0
     proximity_lookahead_m:  float = 2.0   # walls farther than this give zero signal
 
     # Braking reward: encourages sustained, uninterrupted high-speed braking.
@@ -401,7 +401,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     #   r_distance at v = max_velocity   ≈ distance_weight × dt × 1.0
     # With weight = 0.1, v_max = 8 m/s   → r_braking_v2 = 6.4/step at full brake at top speed.
     # At v = 2 m/s the same brake input yields only 0.4/step — 16× weaker than at top speed.
-    braking_v2_weight: float = 0.0
+    braking_v2_weight: float = 5.0
 
     # ── Lap completion reward ────────────────────────────────────────────────
     # Sparse reward fired when the agent crosses the start line (the line through
@@ -414,7 +414,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # dense distance reward (~25/sec at top speed → ~750 per 30 s lap).
     # Until the agent can actually finish a lap this reward stays at 0, so it has
     # no effect on early training.
-    lap_reward_weight:    float = 300.0
+    lap_reward_weight:    float = 100.0
     lap_return_radius_m:  float = 0.3   # start circle: leaving it starts the lap timer; crossing the
                                         # start line while back inside closes the lap
     lap_min_time_s:       float = 20.0   # lower clamp (caps maximum reward per lap)
@@ -1323,7 +1323,7 @@ class ConeTrackEnv(DirectRLEnv):
         lin_vel_augmented = torch.sign(lin_vel_b.clamp(min=0.0) / self.cfg.max_velocity_m_s) * torch.pow(torch.abs(lin_vel_b.clamp(min=0.0) / self.cfg.max_velocity_m_s), 3/4)
 
         # Distance covered this step
-        r_distance = self.cfg.distance_weight * lin_vel_b * dt
+        r_distance = self.cfg.distance_weight * lin_vel_b / self.cfg.max_velocity_m_s * dt
         # r_distance = self.cfg.distance_weight * lin_vel_augmented * dt
 
 
@@ -1549,10 +1549,10 @@ class ConeTrackEnv(DirectRLEnv):
         if self.cfg.braking_v2_weight > 0.0:
             throttle_cmd_v2  = self._action_delay_buf[:, 0, 0]
             brake_input_v2   = (-throttle_cmd_v2).clamp(0.0, 1.0)  # 0 if not braking
-            speed_fwd_v2     = lin_vel_b.clamp(min=0.0)
+            speed_fwd_v2     = lin_vel_b.clamp(min=0.0) / self.cfg.max_velocity_m_s
             # r_braking_v2 = self.cfg.braking_v2_weight * speed_fwd_v2 * brake_input_v2
 
-            r_braking_v2 = self.cfg.braking_v2_weight * torch.pow(speed_fwd_v2, 2) * brake_input_v2
+            r_braking_v2 = self.cfg.braking_v2_weight * torch.pow(speed_fwd_v2, 2) * torch.pow(brake_input_v2, 1/2)
         else:
             r_braking_v2 = torch.zeros(self.num_envs, device=self.device)
 
@@ -1677,4 +1677,3 @@ class ConeTrackEnv(DirectRLEnv):
         joint_pos = self.robot.data.default_joint_pos[env_ids]
         joint_vel = torch.zeros_like(joint_pos)
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
-
