@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import time
 
 import RPi.GPIO as GPIO
@@ -15,6 +16,7 @@ from .common import (
     MAX_THROTTLE,
     MONITORING_TIMEOUT_SEC,
     MOTOR_DIRECTION,
+    MOTOR_GPIO,
     MOTOR_PWM_CHANNEL,
     MOTOR_PWM_FREQ,
     PIN_INA,
@@ -22,10 +24,10 @@ from .common import (
     SERVO_AMPLITUDE,
     SERVO_CENTER_US,
     SERVO_DIRECTION,
+    SERVO_GPIO,
     SERVO_MAX_US,
     SERVO_MIN_US,
     SERVO_OFFSET_US,
-    SERVO_PWM_CHANNEL,
     SERVO_PWM_FREQ,
 )
 
@@ -92,12 +94,14 @@ class DriveNode(Node):
         GPIO.setup(PIN_INA, GPIO.OUT)
         GPIO.setup(PIN_INB, GPIO.OUT)
 
+        # Motor: hardware PWM via sysfs (channel 0, 20 kHz)
+        self._pinctrl_set(MOTOR_GPIO, "a0", "pd")
         self.motor_pwm = SysfsHardwarePWM(MOTOR_PWM_CHANNEL, MOTOR_PWM_FREQ, initial_pulse_ns=0)
-        self.servo_pwm = SysfsHardwarePWM(
-            SERVO_PWM_CHANNEL,
-            SERVO_PWM_FREQ,
-            initial_pulse_ns=self._steering_pulse_ns(0.0),
-        )
+
+        # Servo: software PWM via RPi.GPIO (GPIO 13, 50 Hz)
+        GPIO.setup(SERVO_GPIO, GPIO.OUT)
+        self.servo_pwm = GPIO.PWM(SERVO_GPIO, SERVO_PWM_FREQ)
+        self.servo_pwm.start(0)
 
         self.telemetry_pub = self.create_publisher(Float32MultiArray, "/drive/telemetry", 1)
         self.create_subscription(Float32MultiArray, "/cmd_drive", self._cmd_cb, 1)
@@ -108,6 +112,40 @@ class DriveNode(Node):
         self.timer = self.create_timer(telemetry_period, self._telemetry_tick)
 
         self.get_logger().info("Drive node initialized")
+
+    # --- pinctrl ---
+
+    @staticmethod
+    def _pinctrl_set(pin: int, *args: str) -> None:
+        subprocess.run(["pinctrl", "set", str(pin), *args], check=True)
+
+    # --- motor: hardware PWM via sysfs + direction GPIOs ---
+
+    def _set_throttle(self, value: float) -> None:
+        value = max(-1.0, min(1.0, value))
+        value *= max(0.0, min(1.0, MAX_THROTTLE))
+        value *= MOTOR_DIRECTION
+
+        GPIO.output(PIN_INA, GPIO.HIGH if value >= 0 else GPIO.LOW)
+        GPIO.output(PIN_INB, GPIO.HIGH if value < 0 else GPIO.LOW)
+        self.motor_pwm.set_duty_fraction(abs(value))
+
+    # --- servo: software PWM via RPi.GPIO ---
+
+    @staticmethod
+    def _steering_duty(value: float) -> float:
+        value = max(-1.0, min(1.0, value))
+        value = value * SERVO_DIRECTION * SERVO_AMPLITUDE
+
+        span = (SERVO_MAX_US - SERVO_MIN_US) / 2
+        pulse = SERVO_CENTER_US + SERVO_OFFSET_US + (value * span)
+        pulse = max(SERVO_MIN_US, min(SERVO_MAX_US, pulse))
+        return (pulse / 20000.0) * 100.0
+
+    def _set_steering(self, value: float) -> None:
+        self.servo_pwm.ChangeDutyCycle(self._steering_duty(value))
+
+    # --- callbacks ---
 
     def _enabled_cb(self, msg: Bool) -> None:
         self.enabled = bool(msg.data)
@@ -146,28 +184,6 @@ class DriveNode(Node):
         self._set_throttle(throttle)
         self._set_steering(steer)
 
-    def _set_throttle(self, value: float) -> None:
-        value = max(-1.0, min(1.0, value))
-        value *= max(0.0, min(1.0, MAX_THROTTLE))
-        value *= MOTOR_DIRECTION
-
-        GPIO.output(PIN_INA, GPIO.HIGH if value >= 0 else GPIO.LOW)
-        GPIO.output(PIN_INB, GPIO.HIGH if value < 0 else GPIO.LOW)
-        self.motor_pwm.set_duty_fraction(abs(value))
-
-    @staticmethod
-    def _steering_pulse_ns(value: float) -> int:
-        value = max(-1.0, min(1.0, value))
-        value = value * SERVO_DIRECTION * SERVO_AMPLITUDE
-
-        span = (SERVO_MAX_US - SERVO_MIN_US) / 2
-        pulse = SERVO_CENTER_US + SERVO_OFFSET_US + (value * span)
-        pulse = max(SERVO_MIN_US, min(SERVO_MAX_US, pulse))
-        return int(pulse * 1000)
-
-    def _set_steering(self, value: float) -> None:
-        self.servo_pwm.set_pulse_ns(self._steering_pulse_ns(value))
-
     def _telemetry_tick(self) -> None:
         if time.monotonic() - self.last_command_time > self.command_timeout_sec or not self._can_drive():
             self._apply_drive(0.0, 0.0)
@@ -185,15 +201,27 @@ class DriveNode(Node):
         try:
             if not self._stopped:
                 self._apply_drive(0.0, 0.0)
-                self.motor_pwm.stop()
                 self.servo_pwm.stop()
+                del self.servo_pwm
+                self.motor_pwm.stop()
                 GPIO.cleanup()
+                self._pinctrl_set(MOTOR_GPIO, "a0", "pd")
                 self._stopped = True
         finally:
             return super().destroy_node()
 
 
 def main(args=None) -> None:
+    # Raise this process to real-time priority so lgpio's software PWM
+    # kernel timers fire consistently even under CPU load from cameras
+    # and policy inference.  SCHED_RR at priority 1 is the lowest
+    # real-time level — it won't starve the system.
+    try:
+        param = os.sched_param(1)
+        os.sched_setscheduler(0, os.SCHED_RR, param)
+    except PermissionError:
+        pass
+
     rclpy.init(args=args)
     node = DriveNode()
     try:
