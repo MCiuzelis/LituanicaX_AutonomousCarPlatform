@@ -1,6 +1,10 @@
-# import spidev
-# import RPi.GPIO as GPIO
-# from rpi_hardware_pwm import HardwarePWM
+import os
+import time
+import subprocess
+import RPi.GPIO as GPIO
+
+PWM_CHIP_PATH = "/sys/class/pwm/pwmchip0"
+
 
 class Robot:
     def __init__(
@@ -30,6 +34,8 @@ class Robot:
     ):
         self.pin_ina = pin_ina
         self.pin_inb = pin_inb
+        self.motor_gpio = motor_gpio
+        self.servo_gpio = servo_gpio
         self.motor_pwm_freq = motor_pwm_freq
         self.servo_pwm_freq = servo_pwm_freq
         self.servo_min_us = servo_min_us
@@ -50,45 +56,56 @@ class Robot:
         self.k_ratio = k_ratio
         self.adc_max = adc_max
 
-        # ── Hardware PWM / GPIO init (commented out for headless testing) ──
-        # motor_chip = self._find_pwmchip(motor_gpio)
-        # servo_chip = self._find_pwmchip(servo_gpio)
-        #
-        # GPIO.setmode(GPIO.BCM)
-        # GPIO.setup(self.pin_ina, GPIO.OUT)
-        # GPIO.setup(self.pin_inb, GPIO.OUT)
-        #
-        # self.spi = spidev.SpiDev()
-        # self.spi.open(0, 0)
-        # self.spi.max_speed_hz = 5000
-        #
-        # self.motor_pwm = HardwarePWM(pwm_channel=0, hz=self.motor_pwm_freq, chip=motor_chip)
-        # self.servo_pwm = HardwarePWM(pwm_channel=0, hz=self.servo_pwm_freq, chip=servo_chip)
-        #
-        # self.motor_pwm.start(0)
-        # self.servo_pwm.start(7.5)
+        self._setup_motor_hardware_pwm()
+        self._setup_servo_software_pwm()
 
-    # @staticmethod
-    # def _find_pwmchip(gpio_pin):
-    #     for entry in os.listdir("/sys/class/pwm"):
-    #         if not entry.startswith("pwmchip"):
-    #             continue
-    #         chip = int(entry[7:])
-    #         try:
-    #             with open(f"/sys/class/pwm/{entry}/device/uevent") as f:
-    #                 for line in f:
-    #                     if line.startswith("OF_FULLNAME="):
-    #                         addr = line.strip().split("@")[-1]
-    #                         if int(addr, 16) == gpio_pin:
-    #                             return chip
-    #         except OSError:
-    #             continue
-    #     raise RuntimeError(f"No pwmchip found for GPIO{gpio_pin}")
+    # --- pinctrl helpers ---
+
+    def _pinctrl_set(self, pin, *args):
+        subprocess.run(["pinctrl", "set", str(pin), *args], check=True)
+
+    def _pinctrl_output(self, pin, high):
+        self._pinctrl_set(pin, "op", "dh" if high else "dl")
+
+    # --- Motor: hardware PWM via sysfs (channel 0, 20 kHz) ---
+
+    def _export_pwm(self, channel):
+        path = f"{PWM_CHIP_PATH}/pwm{channel}"
+        if not os.path.exists(path):
+            with open(f"{PWM_CHIP_PATH}/export", "w") as f:
+                f.write(str(channel))
+            time.sleep(0.1)
+        return path
+
+    def _pwm_write(self, path, attr, value):
+        with open(f"{path}/{attr}", "w") as f:
+            f.write(str(value))
+
+    def _setup_motor_hardware_pwm(self):
+        self._pinctrl_set(self.motor_gpio, "a0", "pd")
+        period_ns = int(1_000_000_000 / self.motor_pwm_freq)
+        path = self._export_pwm(channel=0)
+        self._pwm_write(path, "enable", 0)
+        self._pwm_write(path, "period", period_ns)
+        self._pwm_write(path, "duty_cycle", 0)
+        self._pwm_write(path, "enable", 1)
+        self.motor_pwm_path = path
+        self.motor_period_ns = period_ns
+
+        self._pinctrl_output(self.pin_ina, high=False)
+        self._pinctrl_output(self.pin_inb, high=False)
+
+    # --- Servo: software PWM via RPi.GPIO (50 Hz) ---
+
+    def _setup_servo_software_pwm(self):
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setup(self.servo_gpio, GPIO.OUT)
+        self.servo_pwm = GPIO.PWM(self.servo_gpio, self.servo_pwm_freq)
+        self.servo_pwm.start(0)
+
+    # --- ADC stubs ---
 
     def _read_adc(self, channel=0):
-        # config = 0x80 if channel == 0 else 0xC0
-        # adc_resp = self.spi.xfer2([1, config, 0])
-        # return ((adc_resp[1] & 0x0F) << 8) + adc_resp[2]
         return 0
 
     def _adc_to_voltage(self, raw):
@@ -104,34 +121,43 @@ class Robot:
         v_adc = self._adc_to_voltage(raw)
         return v_adc * (self.r_divider_top + self.r_divider_bottom) / self.r_divider_bottom
 
+    # --- Motor ---
+
     def set_throttle(self, value):
-        # value = max(-1.0, min(1.0, value))
-        # value *= self.max_throttle
-        # value *= self.motor_direction
-        #
-        # GPIO.output(self.pin_ina, GPIO.HIGH if value >= 0 else GPIO.LOW)
-        # GPIO.output(self.pin_inb, GPIO.HIGH if value < 0 else GPIO.LOW)
-        #
-        # self.motor_pwm.change_duty_cycle(abs(value) * 100.0)
-        pass
+        value = max(-1.0, min(1.0, value)) * self.motor_direction
+        magnitude = abs(value) * self.max_throttle
+
+        if value >= 0:
+            self._pinctrl_output(self.pin_ina, high=True)
+            self._pinctrl_output(self.pin_inb, high=False)
+        else:
+            self._pinctrl_output(self.pin_ina, high=False)
+            self._pinctrl_output(self.pin_inb, high=True)
+
+        duty_ns = int(magnitude * self.motor_period_ns)
+        self._pwm_write(self.motor_pwm_path, "duty_cycle", duty_ns)
+
+    # --- Servo ---
 
     def set_steering(self, value):
-        # value = max(-1.0, min(1.0, value))
-        # value = value * self.servo_direction * self.servo_amplitude
-        #
-        # span = (self.servo_max_us - self.servo_min_us) / 2
-        # pulse = self.servo_center_us + self.servo_offset_us + (value * span)
-        # pulse = max(self.servo_min_us, min(self.servo_max_us, pulse))
-        #
-        # duty = (pulse / 20000.0) * 100.0
-        # self.servo_pwm.change_duty_cycle(duty)
-        pass
+        value = max(-1.0, min(1.0, value))
+        actual = value * self.servo_direction * self.servo_amplitude
+
+        span = (self.servo_max_us - self.servo_min_us) / 2.0
+        pulse_us = self.servo_center_us + self.servo_offset_us + (actual * span)
+        pulse_us = max(self.servo_min_us, min(self.servo_max_us, pulse_us))
+
+        duty = (pulse_us / 20000.0) * 100.0
+        self.servo_pwm.ChangeDutyCycle(duty)
+
+    # --- Cleanup ---
 
     def stop(self):
-        pass
-        # try:
-        #     self.motor_pwm.stop()
-        #     self.servo_pwm.stop()
-        # finally:
-        #     self.spi.close()
-        #     GPIO.cleanup()
+        self.servo_pwm.stop()
+        GPIO.cleanup()
+        self._pinctrl_set(self.motor_gpio, "a0", "pd")
+        try:
+            self._pwm_write(self.motor_pwm_path, "duty_cycle", 0)
+            self._pwm_write(self.motor_pwm_path, "enable", 0)
+        except Exception:
+            pass

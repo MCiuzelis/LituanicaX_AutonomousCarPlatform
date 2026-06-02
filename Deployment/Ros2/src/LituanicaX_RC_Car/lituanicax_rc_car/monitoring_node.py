@@ -16,6 +16,7 @@ from .common import (
     ADC_V_REF,
     FPS_TARGET,
     K_RATIO,
+    MOTOR_CURRENT_LPF_ALPHA,
     OVERCURRENT_THRESHOLD,
     R_DIVIDER_BOTTOM,
     R_DIVIDER_TOP,
@@ -32,6 +33,7 @@ class MonitoringNode(Node):
 
         self.battery_voltage = 0.0
         self.motor_current = 0.0
+        self._motor_current_filtered = 0.0
         self.cpu_usage = 0.0
         self.cpu_temperature = 0.0
         self.undervoltage = False
@@ -106,11 +108,17 @@ class MonitoringNode(Node):
     def _telemetry_tick(self) -> None:
         try:
             self.battery_voltage = self._read_battery_voltage()
-            self.motor_current = self._read_motor_current()
+            raw_current = self._read_motor_current()
+            self._motor_current_filtered = (
+                MOTOR_CURRENT_LPF_ALPHA * raw_current
+                + (1.0 - MOTOR_CURRENT_LPF_ALPHA) * self._motor_current_filtered
+            )
+            self.motor_current = self._motor_current_filtered
         except Exception as exc:
             self.get_logger().warning(f"ADC telemetry read failed: {exc}")
             self.battery_voltage = 0.0
             self.motor_current = 0.0
+            self._motor_current_filtered = 0.0
 
         self.cpu_usage = self._read_cpu_usage()
         self.cpu_temperature = self._read_cpu_temperature()

@@ -3,53 +3,50 @@ import sys
 import termios
 import tty
 import os
+import RPi.GPIO as GPIO
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from hardware import Robot
+PIN = 13
+FREQ = 50
+SERVO_MIN_US = 500
+SERVO_MAX_US = 2500
+SERVO_CENTER_US = 1500
 
-# -------- KEYBOARD INPUT (non-blocking) --------
-def get_key():
-    import select
-    dr, _, _ = select.select([sys.stdin], [], [], 0)
-    if dr:
-        return sys.stdin.read(1)
-    return None
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(PIN, GPIO.OUT)
+servo_pwm = GPIO.PWM(PIN, FREQ)
+servo_pwm.start(0)
 
-# -------- SETUP --------
-robot = Robot(
-    servo_amplitude=0.5,
-    servo_direction=1
-)
+def set_servo(value):
+    value = max(-1.0, min(1.0, value))
+    span = (SERVO_MAX_US - SERVO_MIN_US) / 2.0
+    pulse_us = SERVO_CENTER_US + offset_us + (value * amplitude * span)
+    pulse_us = max(SERVO_MIN_US, min(SERVO_MAX_US, pulse_us))
+    duty = (pulse_us / 20000.0) * 100.0
+    servo_pwm.ChangeDutyCycle(duty)
 
-# Tuning parameters
-center_offset = 0      # in microseconds
-amplitude = 0.5
-
-OFFSET_STEP = 10       # µs per press
-AMP_STEP = 0.05
-
+def apply_servo(value):
+    set_servo(value)
 
 def sweep_test():
     print("Running sweep test...")
-
     apply_servo(-1)
     time.sleep(1)
-
     apply_servo(1)
     time.sleep(1)
-
     apply_servo(0)
     time.sleep(1)
 
+offset_us = 0
+amplitude = 0.5
+OFFSET_STEP = 10
+AMP_STEP = 0.05
 
-# -------- MAIN LOOP --------
 def main():
-    global center_offset, amplitude
+    global offset_us, amplitude
 
     print("Servo tuning controls:")
     print("A/D: center offset | W/S: amplitude | T: test | C: center | Q: quit")
 
-    # Setup terminal
     old_settings = termios.tcgetattr(sys.stdin)
     tty.setcbreak(sys.stdin.fileno())
 
@@ -57,13 +54,15 @@ def main():
         apply_servo(0)
 
         while True:
-            key = get_key()
+            import select
+            dr, _, _ = select.select([sys.stdin], [], [], 0)
+            key = sys.stdin.read(1) if dr else None
 
             if key:
                 if key == 'a':
-                    center_offset -= OFFSET_STEP
+                    offset_us -= OFFSET_STEP
                 elif key == 'd':
-                    center_offset += OFFSET_STEP
+                    offset_us += OFFSET_STEP
                 elif key == 'w':
                     amplitude += AMP_STEP
                 elif key == 's':
@@ -75,21 +74,18 @@ def main():
                 elif key == 'q':
                     break
 
-                # Clamp amplitude
                 amplitude = max(0.0, min(2.0, amplitude))
 
-                print(f"\rOffset: {center_offset} µs | Amplitude: {amplitude:.2f}   ", end="")
+                print(f"\rOffset: {offset_us} us | Amplitude: {amplitude:.2f}   ", end="")
 
             time.sleep(0.02)
 
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
-
-        # ✅ Stop via Robot (handles PWM + cleanup)
-        robot.stop()
-
+        servo_pwm.stop()
+        del servo_pwm
+        GPIO.cleanup()
         print("\nStopped.")
-
 
 if __name__ == "__main__":
     main()
