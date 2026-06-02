@@ -56,7 +56,7 @@ parser.add_argument(
 parser.add_argument(
     "--vel_cap",
     type=float,
-    default=5.0,
+    default=8.0,
     help=(
         "Override the velocity cap used during play (m/s).  "
         "Sets both initial_vel_cap_m_s and vel_cap_max_m_s so the curriculum cannot "
@@ -159,7 +159,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
 
     env_cfg.spawn_vel_min_m_s = 0.0
-    env_cfg.spawn_vel_max_m_s = 4.0
+    env_cfg.spawn_vel_max_m_s = 0.0
 
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here

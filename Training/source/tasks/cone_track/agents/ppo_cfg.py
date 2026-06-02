@@ -31,14 +31,14 @@ class ConeTrackPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     algorithm: RslRlPpoAlgorithmCfg = RslRlPpoAlgorithmCfg(
         learning_rate=1e-4,   
         schedule="adaptive",     
-        num_learning_epochs=6, 
+        num_learning_epochs=4, 
         num_mini_batches=24,   
         clip_param=0.2,
-        entropy_coef=0.002,
+        entropy_coef=0.008, #0.007
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
-        gamma=0.998,
+        gamma=0.99,
         lam=0.95,
-        desired_kl=0.02,
+        desired_kl=0.01,
         max_grad_norm=0.75,
     )
