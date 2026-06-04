@@ -181,8 +181,8 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # Crop fractions (fraction of raw pixel rows discarded before the policy):
     #   top  → removes ceiling / sky (depth = max / inf)
     #   bottom → removes near-ground clutter and the robot's own body shadow
-    depth_crop_top_fraction:    float = 0.4
-    depth_crop_bottom_fraction: float = 0.35
+    depth_crop_top_fraction:    float = 0.425
+    depth_crop_bottom_fraction: float = 0.375
 
     # Gaussian depth noise: σ ≈ 0.007 m gives a ±2 cm (3σ) error band,
     # matching the ArduCam TOF spec.  Set to 0.0 to disable.
@@ -227,9 +227,13 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # bilinearly downsampled to this resolution before being flattened into
     # the observation vector.  Smaller = faster MLP convergence.
     # policy_depth_height < 0 → auto-compute from cropped aspect ratio.
-    # Default 80×33 = 2640 dims (vs 240×99 = 23 760 without downsampling).
-    policy_depth_width:  int = 120
-    policy_depth_height: int = -1   # -1 = auto
+    # PINNED to 12 (not auto): this decouples the final policy image size from the
+    # camera render resolution, so sim (rendering 120×90) and deployment (real
+    # 240×180) both produce the identical 80×12 policy image.  With auto-height a
+    # float-rounding edge in the crop made 120×90 land on 11 rows, mismatching the
+    # deployed pipeline — pinning avoids that.
+    policy_depth_width:  int = 80
+    policy_depth_height: int = 12
 
     # ════════════════════════════════════════════════════════════════════════
     # SPAWN — initial robot position, heading, and speed
@@ -276,7 +280,10 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # SPAWN SPEED — initial robot velocity at each episode reset
     # ════════════════════════════════════════════════════════════════════════
     spawn_vel_min_m_s: float = 0.0   # minimum spawn speed (m/s)
-    spawn_vel_max_m_s: float = 0.0   # maximum spawn speed (m/s)
+    # Curriculum: spawn across a velocity range so the policy practises control at
+    # speed instead of over-sampling the slow start regime (which reinforces the
+    # cautious / slow-acceleration local optimum).  play.py forces this to 0.
+    spawn_vel_max_m_s: float = 3.0   # maximum spawn speed (m/s)
 
     # ════════════════════════════════════════════════════════════════════════
     # DYNAMICS — physics-based motor model (AWD, direct torque control)
@@ -329,21 +336,18 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # TERMINATION THRESHOLDS
     # ════════════════════════════════════════════════════════════════════════
     # Horizontal contact force on any robot link that counts as a wall hit.
-    wall_contact_force_thresh_n: float = 8.0  # Newtonsgz
+    wall_contact_force_thresh_n: float = 1.0  # Newtonsgz
 
     # slow_stop_speed_fraction — episode terminates when speed falls below this
     # (catches truly stuck / reversed agents; keep low so normal braking is fine)
     slow_stop_speed_fraction:    float = 0.01  # terminate if speed < 3 % of vel_cap
-
-    # One-time penalty applied on the step the car latches a wall contact.
-    wall_hit_penalty_weight: float = 25.0
 
     # ════════════════════════════════════════════════════════════════════════
     # OBSERVATION EXTRAS
     # ════════════════════════════════════════════════════════════════════════
     # Append the previous policy actions (throttle + steer, each ∈ [-1,1]) to
     # the observation.  Gives the policy temporal context on what it recently commanded.
-    include_prev_action:  bool = True
+    include_prev_action:  bool = False
     action_history_steps: int  = 5   # number of past (throttle, steer) pairs to include
 
     # Append the current average wheel surface speed to the observation.
@@ -360,21 +364,26 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     alive_weight:       float = 0#0.05
 
     # Distance: rewards physical metres covered each step (v × dt).
-    distance_weight:    float = 120.0
+    distance_weight:    float = 4.0
 
     # Speed bonus, normalised by max_velocity_m_s.
     forward_weight:     float = 0.0 #2
 
     # Average-speed bonus: every step rewards the episode's mean forward speed
     # from reset through the current step, normalized by max_velocity_m_s.
-    average_speed_weight: float = 2.0
+    average_speed_weight: float = 0.0   # redundant with distance + non-Markovian; off
 
     # Rear-wheel slip penalty.
     slip_weight:        float = 0.0
 
     # Steering deadzone penalty: only penalises steering beyond the deadzone.
-    steer_deadzone_weight: float = 0.15
+    steer_deadzone_weight: float = 0.005
     steer_deadzone:        float = 0.05   # fraction of max_steer_rad that is free
+
+    # Steering-rate (smoothness) penalty: penalises the change in steering command
+    # between consecutive policy steps, r = -weight × |steer_t − steer_{t-1}|.
+    # Directly suppresses the jerky servo chatter; encourages smooth, committed lines.
+    steer_rate_weight: float = 0.08
 
     # Proximity speed penalty: penalises going fast when a wall is close along the
     # car's current velocity direction.  Each step a 2D ray is cast from the car
@@ -385,7 +394,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     #     r = -weight × speed_norm × max(0, 1 − dist_m / proximity_lookahead_m)
     # so it is largest when the car is fast AND the wall is close in front of it
     # (corner entry).  Set to 0.0 to disable entirely.
-    proximity_speed_weight: float = 2.0
+    proximity_speed_weight: float = 0.07
     proximity_lookahead_m:  float = 2.0   # walls farther than this give zero signal
 
     # Braking reward: encourages sustained, uninterrupted high-speed braking.
@@ -416,7 +425,8 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # dense distance reward (~25/sec at top speed → ~750 per 30 s lap).
     # Until the agent can actually finish a lap this reward stays at 0, so it has
     # no effect on early training.
-    lap_reward_weight:    float = 0.0 #60
+    lap_reward_weight:    float = 3.0   # rescaled to the new O(10) return scale; pays
+                                        # more for faster laps (lap_max/lap_time, 20-40 s)
     lap_return_radius_m:  float = 0.3   # start circle: leaving it starts the lap timer; crossing the
                                         # start line while back inside closes the lap
     lap_min_time_s:       float = 20.0   # lower clamp (caps maximum reward per lap)
@@ -502,21 +512,33 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
 
     # Two ArduCam TOF depth cameras:
     #   Position: 122 mm forward of base_link, ±50 mm left/right, 70 mm above base_link.
-    #   Orientation: ±30° yaw outward only — no pitch.
+    #   Orientation: ±27° yaw outward only — no pitch.
+    #
+    # Yaw is 27° (< HFOV/2 ≈ 29.26°) so the two camera frusta OVERLAP by ~4.5°
+    # dead-ahead, eliminating the forward blind cone that ±30° left between them.
+    # The car can now see straight ahead — needed to sense the wall at the end of
+    # a straight and to accelerate confidently out of the spawn.
+    # NOTE: this is a physical mounting angle — the real cameras must be remounted
+    # to ±27° for sim-to-real transfer to hold (autopilot.py uses the same pipeline).
     #
     # Rotation derivation (all quaternions in (w, x, y, z) ROS convention):
     #   Start: q_forward = (-0.5, 0.5, -0.5, 0.5)  (camera level, pointing fwd in ROS)
-    #   Yaw  : q_yaw_z(±30°) * q_forward
-    #             left  (+30°): (-0.6124, 0.6124, -0.3536, 0.3536)
-    #             right (-30°): (-0.3536, 0.3536, -0.6124, 0.6124)
+    #   Yaw  : q_yaw_z(±27°) * q_forward
+    #             left  (+27°): (-0.6029, 0.6029, -0.3695, 0.3695)
+    #             right (-27°): (-0.3695, 0.3695, -0.6029, 0.6029)
     #   Result forward vectors in base_link frame:
-    #             left : (cos30°, sin30°, 0) = (0.866, 0.500, 0.000)
-    #             right: (cos30°, -sin30°, 0) = (0.866, -0.500, 0.000)
+    #             left : (cos27°, sin27°, 0) = (0.891, 0.454, 0.000)
+    #             right: (cos27°, -sin27°, 0) = (0.891, -0.454, 0.000)
     camera_left_cfg: TiledCameraCfg = TiledCameraCfg(
         prim_path="/World/envs/env_.*/Robot/mushr_nano/base_link/camera_left",
         update_period=8.0 / 240.0,  # render only at policy steps (decimation=8, sim=240Hz)
-        height=180,
-        width=240,
+        # Render at 120x90 (not the sensor's native 240x180): the policy image is
+        # downsampled to 80x12 px anyway, and 120x90 yields the *identical* final
+        # resolution at ~4x less camera VRAM — letting us run ~4x more envs.
+        # Deployment feeds the real 240x180 frame through the same downsample, so
+        # the final 80x12 policy image matches; sim-to-real transfer is unaffected.
+        height=90,
+        width=120,
         data_types=["distance_to_image_plane"],
         spawn=sim_utils.PinholeCameraCfg(
             focal_length=_TOF_FOCAL_MM,
@@ -526,7 +548,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
         ),
         offset=TiledCameraCfg.OffsetCfg(
             pos=(0.122, 0.05, 0.07),   # 122 mm fwd, 50 mm left, 70 mm up from base_link
-            rot=(-0.6124, 0.6124, -0.3536, 0.3536),   # 30° yaw left, no pitch
+            rot=(-0.6029, 0.6029, -0.3695, 0.3695),   # 27° yaw left, no pitch
             convention="ros",
         ),
         debug_vis=False,
@@ -534,8 +556,8 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     camera_right_cfg: TiledCameraCfg = TiledCameraCfg(
         prim_path="/World/envs/env_.*/Robot/mushr_nano/base_link/camera_right",
         update_period=8.0 / 240.0,  # render only at policy steps (decimation=8, sim=240Hz)
-        height=180,
-        width=240,
+        height=90,    # see camera_left_cfg — render 120x90, downsample to identical 80x12
+        width=120,
         data_types=["distance_to_image_plane"],
         spawn=sim_utils.PinholeCameraCfg(
             focal_length=_TOF_FOCAL_MM,
@@ -545,7 +567,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
         ),
         offset=TiledCameraCfg.OffsetCfg(
             pos=(0.122, -0.05, 0.07),  # 122 mm fwd, 50 mm right, 70 mm up from base_link
-            rot=(-0.3536, 0.3536, -0.6124, 0.6124),   # 30° yaw right, no pitch
+            rot=(-0.3695, 0.3695, -0.6029, 0.6029),   # 27° yaw right, no pitch
             convention="ros",
         ),
         debug_vis=False,
@@ -634,9 +656,6 @@ class ConeTrackEnv(DirectRLEnv):
 
         # Steering LPF state
         self._filtered_steer = torch.zeros(self.num_envs, device=self.device)
-        self._steer_integral  = torch.zeros(self.num_envs, device=self.device)
-        self._prev_steer      = torch.zeros(self.num_envs, device=self.device)
-        self._steer_hp        = torch.zeros(self.num_envs, device=self.device)
 
         # Action history for observation: action_history_steps most-recent (throttle, steer) pairs.
         # Shape [N, H, 2]; flattened to [N, H*2] when appended to obs.
@@ -689,7 +708,6 @@ class ConeTrackEnv(DirectRLEnv):
         self._wall_terminated    = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._on_ramp            = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._wall_ever_touched  = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        self._ramp_ascended      = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         # Average-speed reward accumulator: sum of clamped forward velocity per env.
         self._cumulative_forward_vel = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
@@ -1352,6 +1370,12 @@ class ConeTrackEnv(DirectRLEnv):
         steer_excess_norm = steer_excess / max(1.0 - self.cfg.steer_deadzone, 1e-6)
         r_steer_shape = -self.cfg.steer_deadzone_weight * steer_excess_norm
 
+        # ── Steering-rate (smoothness) penalty ───────────────────────────────────
+        # Penalise the change in commanded steering between the two most recent
+        # policy steps (both stored in the action history) to suppress jerky chatter.
+        steer_rate    = (self._prev_action[:, -1, 1] - self._prev_action[:, -2, 1]).abs()
+        r_steer_rate  = -self.cfg.steer_rate_weight * steer_rate
+
         # ── Ramp reward ──────────────────────────────────────────────────────────
         r_ramp = (
             self.cfg.ramp_reward_weight
@@ -1570,7 +1594,7 @@ class ConeTrackEnv(DirectRLEnv):
         else:
             r_braking_v2 = torch.zeros(self.num_envs, device=self.device)
 
-        total = r_alive + r_distance + r_forward + r_average_speed + r_slip + r_steer_shape + r_ramp + r_airborne + r_spawn_escape + r_proximity_speed + r_braking + r_braking_v2 + r_lap
+        total = r_alive + r_distance + r_forward + r_average_speed + r_slip + r_steer_shape + r_steer_rate + r_ramp + r_airborne + r_spawn_escape + r_proximity_speed + r_braking + r_braking_v2 + r_lap
 
         return total
 
@@ -1670,12 +1694,9 @@ class ConeTrackEnv(DirectRLEnv):
 
         # Body velocity already seeded above via write_root_velocity_to_sim
         self._filtered_steer[env_ids] = 0.0
-        self._steer_integral[env_ids] = 0.0
-        self._prev_steer[env_ids]     = 0.0
         self._prev_action[env_ids]    = 0.0         # clears full [H, 2] history
         self._action_delay_buf[env_ids] = 0.0       # clears latency FIFO
 
-        self._ramp_ascended[env_ids]         = False
         self._wall_ever_touched[env_ids]     = False
         self._cumulative_forward_vel[env_ids] = 0.0
         self._spawn_pos[env_ids_t]           = spawn_xy

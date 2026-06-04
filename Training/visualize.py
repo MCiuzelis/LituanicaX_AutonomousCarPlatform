@@ -40,6 +40,8 @@ if "ISAACLAB_LIBSTDCPP_FIXED" not in os.environ:
             os.environ["LD_PRELOAD"] = _libstdcpp
             os.execv(sys.executable, [sys.executable] + sys.argv)
 
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description="Visualize MuSHR TOF depth streams (no policy).")
