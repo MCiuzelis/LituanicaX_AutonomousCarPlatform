@@ -56,7 +56,7 @@ parser.add_argument(
 parser.add_argument(
     "--vel_cap",
     type=float,
-    default=8.0,
+    default=5.0,
     help=(
         "Override the velocity cap used during play (m/s).  "
         "Sets both initial_vel_cap_m_s and vel_cap_max_m_s so the curriculum cannot "

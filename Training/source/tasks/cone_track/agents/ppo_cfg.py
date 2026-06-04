@@ -24,7 +24,6 @@ class ConeTrackPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         critic_obs_normalization=True,
         actor_hidden_dims=[512, 256, 128],                                                                                          
         critic_hidden_dims=[1024, 512, 256],
-        # critic_hidden_dims=[512, 256, 128],
         activation="elu",
     )
 
@@ -34,7 +33,7 @@ class ConeTrackPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         num_learning_epochs=4, 
         num_mini_batches=24,   
         clip_param=0.2,
-        entropy_coef=0.008, #0.007
+        entropy_coef=0.006,
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         gamma=0.99,

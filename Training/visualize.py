@@ -58,7 +58,7 @@ parser.add_argument("--color_noise_prob", type=float, default=None,
 parser.add_argument("--edge_grad_thresh", type=float, default=None,
     help="Override depth_edge_gradient_threshold_m (gradient m/px that gives edge_weight=1).")
 parser.add_argument("--edge_noise_sigma", type=float, default=None,
-    help="Override depth_edge_noise_sigma_m (Gaussian std at full edges, metres).")
+    help="Override depth_edge_blur_sigma_m (Gaussian std at full edges, metres).")
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -196,7 +196,7 @@ def main():
     if args_cli.invalid_prob     is not None: env_cfg.depth_invalid_pixel_prob           = args_cli.invalid_prob
     if args_cli.color_noise_prob is not None: env_cfg.depth_color_noise_prob             = args_cli.color_noise_prob
     if args_cli.edge_grad_thresh is not None: env_cfg.depth_edge_gradient_threshold_m    = args_cli.edge_grad_thresh
-    if args_cli.edge_noise_sigma is not None: env_cfg.depth_edge_noise_sigma_m           = args_cli.edge_noise_sigma
+    if args_cli.edge_noise_sigma is not None: env_cfg.depth_edge_blur_sigma_m           = args_cli.edge_noise_sigma
 
     cam_h     = env_cfg.camera_left_cfg.height   # 180
     cam_w     = env_cfg.camera_left_cfg.width    # 240
@@ -222,7 +222,7 @@ def main():
         f"gaussian={env_cfg.depth_noise_sigma_m:.3f} m  "
         f"| invalid_prob={env_cfg.depth_invalid_pixel_prob:.3f}  "
         f"| color_prob={env_cfg.depth_color_noise_prob:.3f}  "
-        f"| edge_sigma={env_cfg.depth_edge_noise_sigma_m:.3f} m  "
+        f"| edge_sigma={env_cfg.depth_edge_blur_sigma_m:.3f} m  "
         f"| edge_thresh={env_cfg.depth_edge_gradient_threshold_m:.3f} m/px"
     )
     print(f"[visualize] Frames → {out_dir}/   |   Press Ctrl+C to stop.")
@@ -279,7 +279,7 @@ def main():
             f"g={env_cfg.depth_noise_sigma_m:.3f} "
             f"inv={env_cfg.depth_invalid_pixel_prob:.2f} "
             f"col={env_cfg.depth_color_noise_prob:.2f} "
-            f"edge={env_cfg.depth_edge_noise_sigma_m:.3f}@{env_cfg.depth_edge_gradient_threshold_m:.2f}"
+            f"edge={env_cfg.depth_edge_blur_sigma_m:.3f}@{env_cfg.depth_edge_gradient_threshold_m:.2f}"
         )
         cv2.putText(
             pol_bgr, noise_txt,
