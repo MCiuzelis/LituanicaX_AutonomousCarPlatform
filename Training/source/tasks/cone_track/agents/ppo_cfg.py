@@ -10,7 +10,7 @@ from isaaclab_rl.rsl_rl import (
 
 @configclass
 class ConeTrackPPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    num_steps_per_env: int = 600
+    num_steps_per_env: int = 1550
     max_iterations:    int = 3000
     save_interval:     int = 10
     experiment_name:   str = "cone_track"
@@ -19,7 +19,7 @@ class ConeTrackPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     obs_groups = {"policy": ["policy"], "critic": ["policy"]}
 
     policy: RslRlPpoActorCriticRecurrentCfg = RslRlPpoActorCriticRecurrentCfg(
-        init_noise_std=0.75,
+        init_noise_std=0.5,
         actor_obs_normalization=True,
         critic_obs_normalization=True,
         actor_hidden_dims=[256, 128],                                                                                          
@@ -41,12 +41,12 @@ class ConeTrackPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         # BPTT through the LSTM (24 would fragment them and hurt recurrence).
         num_mini_batches=2,
         clip_param=0.2,
-        entropy_coef=0.008,
+        entropy_coef=0.004,
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         # Longer credit-assignment horizon (~330 steps ≈ 11 s) so the "brake now
         # to avoid a corner 1-2 s ahead" signal propagates back to the decision.
-        gamma=0.99,
+        gamma=0.993,
         lam=0.95,
         desired_kl=0.01,
         max_grad_norm=0.75,

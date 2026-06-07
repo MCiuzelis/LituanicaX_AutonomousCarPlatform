@@ -182,25 +182,25 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     #   top  → removes ceiling / sky (depth = max / inf)
     #   bottom → removes near-ground clutter and the robot's own body shadow
     depth_crop_top_fraction:    float = 0.425
-    depth_crop_bottom_fraction: float = 0.375
+    depth_crop_bottom_fraction: float = 0.35
 
     # Gaussian depth noise: σ ≈ 0.007 m gives a ±2 cm (3σ) error band,
     # matching the ArduCam TOF spec.  Set to 0.0 to disable.
-    depth_noise_sigma_m: float = 0.008
+    depth_noise_sigma_m: float = 0.007
 
     # Random invalid-pixel dropout: each pixel is independently zeroed with this
     # probability, replicating the black-spec speckle noise visible in real ArduCam
     # TOF output.  Affected pixels are set to depth_max_m (treated as far/safe by the
     # policy, matching the real camera's low-confidence masking behaviour).
     # Visible as black dots in both windows of visualize.py.  Set to 0.0 to disable.
-    depth_invalid_pixel_prob: float = 0.02
+    depth_invalid_pixel_prob: float = 0.015
 
     # Random-depth (coloured) speckle: each pixel is set to a uniform random depth in
     # [0, depth_max_m] with this probability.  Models stray reflections and multi-path
     # interference that appear as bright or mid-range dots (unlike depth_invalid_pixel_prob
     # which always sets the pixel to the far/black depth_max_m value).
     # Set to 0.0 to disable.
-    depth_color_noise_prob: float = 0.008
+    depth_color_noise_prob: float = 0.006
 
     # Edge blur noise — simulates the mixed-pixel / depth-bleeding artefact common in
     # real ToF sensors: pixels whose sensing area straddles a depth discontinuity report
@@ -233,7 +233,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # float-rounding edge in the crop made 120×90 land on 11 rows, mismatching the
     # deployed pipeline — pinning avoids that.
     policy_depth_width:  int = 80
-    policy_depth_height: int = 12
+    policy_depth_height: int = -1
 
     # ════════════════════════════════════════════════════════════════════════
     # SPAWN — initial robot position, heading, and speed
@@ -377,13 +377,13 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     slip_weight:        float = 0.0
 
     # Steering deadzone penalty: only penalises steering beyond the deadzone.
-    steer_deadzone_weight: float = 0.005
+    steer_deadzone_weight: float = 0.006
     steer_deadzone:        float = 0.05   # fraction of max_steer_rad that is free
 
     # Steering-rate (smoothness) penalty: penalises the change in steering command
     # between consecutive policy steps, r = -weight × |steer_t − steer_{t-1}|.
     # Directly suppresses the jerky servo chatter; encourages smooth, committed lines.
-    steer_rate_weight: float = 0.08
+    steer_rate_weight: float = 0.01
 
     # Proximity speed penalty: penalises going fast when a wall is close along the
     # car's current velocity direction.  Each step a 2D ray is cast from the car
@@ -394,7 +394,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     #     r = -weight × speed_norm × max(0, 1 − dist_m / proximity_lookahead_m)
     # so it is largest when the car is fast AND the wall is close in front of it
     # (corner entry).  Set to 0.0 to disable entirely.
-    proximity_speed_weight: float = 0.07
+    proximity_speed_weight: float = 0.0
     proximity_lookahead_m:  float = 2.0   # walls farther than this give zero signal
 
     # Braking reward: encourages sustained, uninterrupted high-speed braking.
@@ -412,7 +412,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     #   r_distance at v = max_velocity   ≈ distance_weight × dt × 1.0
     # With weight = 0.1, v_max = 8 m/s   → r_braking_v2 = 6.4/step at full brake at top speed.
     # At v = 2 m/s the same brake input yields only 0.4/step — 16× weaker than at top speed.
-    braking_v2_weight: float = 0.0#2.5
+    braking_v2_weight: float = 0.02
 
     # ── Lap completion reward ────────────────────────────────────────────────
     # Sparse reward fired when the agent crosses the start line (the line through
@@ -430,7 +430,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     lap_return_radius_m:  float = 0.3   # start circle: leaving it starts the lap timer; crossing the
                                         # start line while back inside closes the lap
     lap_min_time_s:       float = 20.0   # lower clamp (caps maximum reward per lap)
-    lap_max_time_s:       float = 40.0  # upper clamp & numerator anchor
+    lap_max_time_s:       float = 90.0  # upper clamp & numerator anchor
 
     # Ramp per-step reward (while robot base is elevated on the ramp surface).
     ramp_reward_weight: float = 0
@@ -1589,7 +1589,7 @@ class ConeTrackEnv(DirectRLEnv):
             r_braking_v2 = (
                 self.cfg.braking_v2_weight
                 * torch.pow(speed_fwd_v2, 2)
-                * torch.pow(brake_input_v2, 1 / 2)
+                * brake_input_v2
             )
         else:
             r_braking_v2 = torch.zeros(self.num_envs, device=self.device)
