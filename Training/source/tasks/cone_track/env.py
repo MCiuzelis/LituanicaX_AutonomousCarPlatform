@@ -4,10 +4,7 @@ Observation space:
     [0:N]        flattened depth image from LEFT ArduCam TOF camera (+35° yaw), after crop.
                  Normalized: 1.0 = object at 0 m (danger), 0.0 = object at depth_max_m (clear).
     [N:2N]       flattened depth image from RIGHT ArduCam TOF camera (−35° yaw), same pipeline.
-    [2N:2N+2H]   last H throttle+steer pairs, oldest→newest ∈ [−1, 1]
-                 H = action_history_steps (default 15) → 30 values.
-                 Only appended when include_prev_action=True.
-    [2N+2H]      average wheel surface speed ∈ [0, 1], normalized by max_velocity_m_s.
+    [2N]         average wheel surface speed ∈ [0, 1], normalized by max_velocity_m_s.
                  Computed as mean(|joint_vel[all 4 throttle joints]|) × WHEEL_RADIUS / max_velocity_m_s.
                  Only appended when include_wheel_vel=True.
                  Matches real hardware: wheel encoders give rotation rate directly.
@@ -19,17 +16,20 @@ Camera profile (ArduCam TOF sensor for Raspberry Pi):
     - Policy runs at 30 Hz, synced with camera (sim 240 Hz, decimation=8)
 
 Action space (2):
-    [0]  throttle command in [-1, 1], three-zone:
-           (0, 1]  → drive torque T(ω) = output × T_stall × max(0, 1 − ω/ω_noload)
-            0      → coast (zero torque)
-           [-1, 0) → braking torque T(ω) = output × brake_strength × T_stall × (ω/ω_noload)
-                     (linearly scaled: -1 = full braking, 0 = coast)
+    [0]  throttle command in [-1, 1] — forward-only (the car never reverses):
+           (0, 1]  → DRIVE  torque = drive_torque × (1 − ω/(throttle·ω_noload))  (DC curve)
+            0      → COAST  (zero torque, free roll)
+           [-1, 0) → BRAKE  torque = −(brake_torque_base + brake_torque_gain × level),
+                     level = |throttle| × brake_throttle_scale (policy −1 = the slip
+                     ceiling).  Opposes motion, fades to 0 near standstill → stops then
+                     coasts, never spinning the wheels backward.
     [1]  steering command in [-1, 1]  → scaled to [-max_steer_rad, +max_steer_rad]
 
-Actuation (Ackermann / AWD, direct torque control):
-    - All 4 wheels receive a torque target (Nm) via set_joint_effort_target.
-      Torque follows a linear torque-speed curve: T = throttle × T_stall × (1 − ω/ω_noload).
-      Wheel spin occurs naturally when applied torque exceeds PhysX traction limit.
+Actuation (Ackermann / AWD, effort-controlled DC motor):
+    - All 4 wheels receive a torque (Nm) via set_joint_effort_target.  Drive follows a
+      DC torque-speed curve (tops out at the no-load speed max_velocity_m_s); braking is
+      an independent, throttle-graded reverse torque.  Wheel slip occurs naturally when
+      the commanded torque exceeds the PhysX contact-friction limit (μ·N).
     - Front wheel steer receives position target (rad) = tan(steering_angle)
       (tan-convention matches the joint representation in mushr_nano_v2.usd)
 
@@ -39,8 +39,6 @@ Why depth camera vs RGB cone mask:
     in depth the wall is visibly close.  This makes braking-before-corners learnable:
     the agent can correlate "high depth values filling the frame → wall approaching →
     reduce throttle" without needing to understand color or stripe classification.
-    The previous throttle command in the observation provides temporal credit for
-    learning to anticipate braking rather than reacting after a collision.
 
 Termination conditions:
     - Wall contact: any horizontal normal force on robot links above wall_contact_force_thresh_n
@@ -51,7 +49,8 @@ TUNING NOTES (first run):
     - All adjustable parameters are in ConeTrackEnvCfg in one place below.
     - Spawn position: set preset_spawn_points in cfg.
     - Camera crop: depth_crop_top_fraction, depth_crop_bottom_fraction.
-    - Motor model: slip_threshold (wheel-spin sensitivity) and max_velocity_m_s (top speed).
+    - Drivetrain: drive_torque (acceleration), brake_torque_gain (braking strength),
+      max_velocity_m_s (no-load top speed), brake_release_omega, suspension_stiffness.
 """
 
 from __future__ import annotations
@@ -90,7 +89,6 @@ _EXPORT_DIR = os.path.join(_REPO_ROOT, "CAD", "Track", "Export")
 MUSHR_USD        = os.path.join(_ASSETS_DIR, "mushr_nano_v2.usd")
 TRACK_USD        = os.path.join(_EXPORT_DIR, "Track.usdc")
 WALL_USD         = os.path.join(_EXPORT_DIR, "Walls.usdc")
-RAMP_USD         = os.path.join(_ASSETS_DIR, "RAMPS.usd")
 
 # Decorative asset sets — purely visual objects the depth cameras see.
 # Index NUM_ASSET_SETS means "no decorations" (all sets hidden).
@@ -108,7 +106,7 @@ NUM_ASSET_SETS = len(ASSET_SET_USDS)   # randomisation draws from [0, NUM_ASSET_
 # These match mushr_nano_v2.usd geometry and are NOT user-adjustable without
 # also modifying the robot USD.
 # ---------------------------------------------------------------------------
-WHEEL_RADIUS = 0.041   # m  (82 mm diameter wheels)
+WHEEL_RADIUS = 0.037   # m  (82 mm diameter wheels)
 
 # ---------------------------------------------------------------------------
 # ArduCam TOF camera optics  (derived from 70° diagonal FOV, 240×180 sensor)
@@ -153,13 +151,13 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     SPAWN SPEED     — initial episode velocity range
     DYNAMICS        — physics-based motor model, steering limit
     TERMINATION     — contact-force threshold, slow-speed detection
-    OBSERVATION     — whether to include previous action in obs
+    OBSERVATION     — optional wheel-speed channel
     REWARD WEIGHTS  — all reward scale factors
     """
 
     # ── Core env parameters ────────────────────────────────────────────────
     decimation:        int   = 8      # policy at ~30 Hz  (sim 240 Hz / 8)
-    episode_length_s:  float = 180.0  # 180 s × 30 Hz = 5 400 steps
+    episode_length_s:  float = 60.0  # 180 s × 30 Hz = 5 400 steps
     action_space:      int   = 2
     # observation_space is patched in ConeTrackEnv.__init__ after computing
     # the exact cropped depth image size.  The placeholder below keeps
@@ -181,8 +179,8 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # Crop fractions (fraction of raw pixel rows discarded before the policy):
     #   top  → removes ceiling / sky (depth = max / inf)
     #   bottom → removes near-ground clutter and the robot's own body shadow
-    depth_crop_top_fraction:    float = 0.425
-    depth_crop_bottom_fraction: float = 0.35
+    depth_crop_top_fraction:    float = 0.375
+    depth_crop_bottom_fraction: float = 0.425
 
     # Gaussian depth noise: σ ≈ 0.007 m gives a ±2 cm (3σ) error band,
     # matching the ArduCam TOF spec.  Set to 0.0 to disable.
@@ -193,7 +191,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # TOF output.  Affected pixels are set to depth_max_m (treated as far/safe by the
     # policy, matching the real camera's low-confidence masking behaviour).
     # Visible as black dots in both windows of visualize.py.  Set to 0.0 to disable.
-    depth_invalid_pixel_prob: float = 0.015
+    depth_invalid_pixel_prob: float = 0.008
 
     # Random-depth (coloured) speckle: each pixel is set to a uniform random depth in
     # [0, depth_max_m] with this probability.  Models stray reflections and multi-path
@@ -213,25 +211,20 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     depth_edge_gradient_threshold_m: float = 0.15   # gradient (m/px) that gives edge_weight = 1
     # Mixed-pixel scatter: edge pixels randomly jump to 0 m or depth_max_m (binary wrong-side
     # values — models the individual black/red dots seen on real ToF sensors at boundaries).
-    depth_edge_scatter_prob: float = 0.19
+    depth_edge_scatter_prob: float = 0.25
     # Small continuous Gaussian blur layered on top of the scatter, adds the faint soft halo
     # visible around object edges on the real camera alongside the point scatter.
-    depth_edge_blur_sigma_m: float = 0.06
+    depth_edge_blur_sigma_m: float = 0.085
 
     # Depth range for normalization.  Readings > depth_max_m are clamped.
     # Must match autopilot.py MAX_DISTANCE / 1000.  ArduCam supports 2000 mm or 4000 mm only.
     depth_max_m: float = 2.0
 
     # ── Policy image downsampling ──────────────────────────────────────────
-    # After cropping the raw depth frame (240×≈99 at defaults) the image is
+    # After cropping the raw depth frame (240×≈40 at defaults) the image is
     # bilinearly downsampled to this resolution before being flattened into
     # the observation vector.  Smaller = faster MLP convergence.
     # policy_depth_height < 0 → auto-compute from cropped aspect ratio.
-    # PINNED to 12 (not auto): this decouples the final policy image size from the
-    # camera render resolution, so sim (rendering 120×90) and deployment (real
-    # 240×180) both produce the identical 80×12 policy image.  With auto-height a
-    # float-rounding edge in the crop made 120×90 land on 11 rows, mismatching the
-    # deployed pipeline — pinning avoids that.
     policy_depth_width:  int = 80
     policy_depth_height: int = -1
 
@@ -274,7 +267,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # Teaches aggressive initial acceleration without rewarding slow drift.
     # Set spawn_escape_reward=0 to disable.
     spawn_escape_radius_m: float = 0.5
-    spawn_escape_reward:   float = 0
+    spawn_escape_reward:   float = 3.0
 
     # ════════════════════════════════════════════════════════════════════════
     # SPAWN SPEED — initial robot velocity at each episode reset
@@ -283,49 +276,54 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # Curriculum: spawn across a velocity range so the policy practises control at
     # speed instead of over-sampling the slow start regime (which reinforces the
     # cautious / slow-acceleration local optimum).  play.py forces this to 0.
-    spawn_vel_max_m_s: float = 3.0   # maximum spawn speed (m/s)
+    spawn_vel_max_m_s: float = 0.0   # maximum spawn speed (m/s)
 
     # ════════════════════════════════════════════════════════════════════════
-    # DYNAMICS — physics-based motor model (AWD, direct torque control)
+    # DYNAMICS — effort-controlled DC-motor drivetrain (AWD), tuned to real car
     #
-    # Motor torque-speed curve (linear, same for all 4 wheels):
-    #   T(throttle, ω) = throttle_norm × T_stall × max(0, 1 − ω/ω_noload)
+    # Each step the policy throttle ∈ [-1, 1] is turned into a per-wheel TORQUE
+    # (applied via set_joint_effort_target).  Three zones — forward-only:
     #
-    # T_stall and ω_noload are DERIVED from two intuitive parameters:
+    #   throttle > 0  DRIVE: T = drive_torque · clamp(1 − ω/ω_noload(throttle), 0, 1)
+    #                 where ω_noload(throttle) = throttle · max_velocity_m_s / r.
+    #                 A DC-motor torque-speed curve: full drive_torque at standstill,
+    #                 tapering to 0 at the (throttle-scaled) no-load speed.  So full
+    #                 throttle tops out at max_velocity_m_s; half throttle at half that.
+    #   throttle = 0  COAST: T = 0 (free roll; ground/contact losses only).
+    #   throttle < 0  BRAKE: T = −brake_torque_gain · |throttle|, opposing rotation,
+    #                 faded to 0 below brake_release_omega so the car can never be
+    #                 driven backwards (brake → coast at standstill).
     #
-    #   slip_threshold   — throttle fraction [0,1] that just saturates wheel
-    #                      traction at rest (ω=0).  At this point motor torque
-    #                      equals the grip limit μ_s×(m×g/N_wheels)×r_wheel:
-    #                        T_stall = μ_s × (m×g/4) × r / slip_threshold
+    # Drive and brake torques are INDEPENDENT (the real car brakes far harder than it
+    # accelerates), and traction-induced wheel slip emerges naturally from the PhysX
+    # contact friction when the commanded torque exceeds μ·N (e.g. hard braking).
     #
-    #   max_velocity_m_s — vehicle speed where full-throttle torque drops to 0
-    #                      (the motor's no-load speed times wheel radius).  This
-    #                      is a SOFT physics limit — the car simply cannot
-    #                      accelerate past it on a flat straight.
-    #                        ω_noload = max_velocity_m_s / WHEEL_RADIUS
-    #
-    # Both derived values are printed at startup and stored as self._T_stall /
-    # self._omega_noload.  No hard velocity clamp is applied anywhere.
+    # TUNABLE DRIVETRAIN PARAMETERS — single source of truth.  Edit them here;
+    # __post_init__ / _pre_physics_step read them, so train / play / visualize /
+    # acceleration_test all pick them up automatically (none override these).
     # ════════════════════════════════════════════════════════════════════════
-    car_mass_kg:      float = 1.4    # total robot mass (kg); must match robot_cfg mass_props
-    wheel_grip_mu_s:  float = 0.8    # effective static friction coeff (wheel × ground)
-    slip_threshold:   float = 0.6   # throttle fraction [0,1] that saturates traction at rest
-    max_velocity_m_s: float = 5.0   # top speed (m/s): full-throttle torque drops to 0 here
-    max_steer_rad:    float = 0.488  # ≈28° max front-wheel steer angle
-    # Braking strength at full brake command (policy output = -1).
-    # Braking force scales linearly with policy output magnitude: output=-0.5 → half force.
-    #   T_brake = -|output| × brake_strength × T_stall × (ω / ω_noload)
-    # At brake_strength=0.5, full-brake at max speed ≈ 1.0 g deceleration.
-    brake_strength:   float = 1
-
-    # Rolling-friction offset subtracted from the throttle command at the actuator
-    # stage to simulate drivetrain / rolling resistance.  The throttle channel that
-    # reaches the wheels is `policy_throttle − throttle_friction_offset`, so an
-    # output of 0 becomes a light brake (= −offset) and the car decelerates rather
-    # than coasting indefinitely.  Only affects what the actuators see; the policy's
-    # raw command is still what the obs history and reward terms read.
-    # Set to 0.0 to disable.
-    throttle_friction_offset: float = 0.06
+    car_mass_kg:          float = 1.27    # total robot mass (kg); USD per-body masses are scaled to this in __init__
+    max_velocity_m_s:     float = 6.7     # no-load top speed (m/s); full-throttle drive torque → 0 here. Also the reward normaliser
+    drive_torque:         float = 0.068   # per-wheel stall drive torque (Nm) → sets acceleration (gentle, low-slip)
+    # Braking torque per wheel = brake_torque_base + brake_torque_gain·|throttle| (Nm), opposing motion.
+    # Fit to the real car: F_total ≈ 2.5 N + 26.6·|throttle|  →  per wheel 0.023 + 0.246·|throttle|.
+    # The base term is the motor's regen/drag braking present at any brake input; the gain term is
+    # the throttle-graded component.  Hard braking (≳|0.3|) exceeds μ·N → natural wheel slip.
+    brake_torque_base:    float = 0.028   # constant brake torque/wheel when braking (Nm)
+    brake_torque_gain:    float = 0.310   # additional brake torque/wheel per unit braking level (Nm)
+    # Policy brake remap: a policy throttle of −1 maps to this braking level (the value that
+    # used to require throttle −0.5).  The tyres already slip at this level, so braking harder
+    # buys no extra deceleration — capping it here gives the policy a more useful action range.
+    # Effective braking level = |throttle| × brake_throttle_scale, fed into base + gain·level.
+    brake_throttle_scale: float = 0.5     # |throttle|=1 → braking level 0.5 (the slip ceiling)
+    brake_release_omega:  float = 2.0     # wheel speed (rad/s ≈ 0.07 m/s) below which braking fades to coast → no reverse
+    # Tyre–ground friction (sets traction / wheel-slip onset).  Combined with the bound wheel-rubber
+    # material (μ=1.0, "multiply") these are the effective μ.  Tuned so the car grips up to ≈|0.3|
+    # braking and only slips under the hardest braking (−0.5), matching the real car.
+    ground_static_friction:  float = 2.0  # static μ (grip before slip); traction ≈ μ·m·g
+    ground_dynamic_friction: float = 1.6  # sliding μ (once a wheel breaks traction)
+    suspension_stiffness: float = 1e8     # suspension-joint lock stiffness (rigid; stops energy-sapping travel)
+    max_steer_rad:        float = 0.488   # ≈28° max front-wheel steer angle
 
     # Action latency simulation — all actuator commands are delayed by this many
     # milliseconds before reaching the wheels/steering.  At 30 Hz each step ≈ 33 ms,
@@ -345,11 +343,6 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # ════════════════════════════════════════════════════════════════════════
     # OBSERVATION EXTRAS
     # ════════════════════════════════════════════════════════════════════════
-    # Append the previous policy actions (throttle + steer, each ∈ [-1,1]) to
-    # the observation.  Gives the policy temporal context on what it recently commanded.
-    include_prev_action:  bool = False
-    action_history_steps: int  = 5   # number of past (throttle, steer) pairs to include
-
     # Append the current average wheel surface speed to the observation.
     # Normalized: 0 = stopped, 1 = max_velocity_m_s.
     # This is the primary speed signal — essential for braking-before-corners.
@@ -366,15 +359,9 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # Distance: rewards physical metres covered each step (v × dt).
     distance_weight:    float = 4.0
 
-    # Speed bonus, normalised by max_velocity_m_s.
-    forward_weight:     float = 0.0 #2
-
     # Average-speed bonus: every step rewards the episode's mean forward speed
     # from reset through the current step, normalized by max_velocity_m_s.
     average_speed_weight: float = 0.0   # redundant with distance + non-Markovian; off
-
-    # Rear-wheel slip penalty.
-    slip_weight:        float = 0.0
 
     # Steering deadzone penalty: only penalises steering beyond the deadzone.
     steer_deadzone_weight: float = 0.006
@@ -396,12 +383,6 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # (corner entry).  Set to 0.0 to disable entirely.
     proximity_speed_weight: float = 0.0
     proximity_lookahead_m:  float = 2.0   # walls farther than this give zero signal
-
-    # Braking reward: encourages sustained, uninterrupted high-speed braking.
-    # Disabled for this run; kept here so saved configs from the run load cleanly.
-    braking_reward_weight:        float = 0.0
-    brake_reward_start_speed_m_s: float = 2.5
-    brake_reward_stop_speed_m_s:  float = 1.0
 
     # Braking reward V2: dense, instantaneous, no session state.
     #   r_braking_v2 = weight × forward_speed² × |brake_input|       (only when throttle < 0)
@@ -432,16 +413,6 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     lap_min_time_s:       float = 20.0   # lower clamp (caps maximum reward per lap)
     lap_max_time_s:       float = 90.0  # upper clamp & numerator anchor
 
-    # Ramp per-step reward (while robot base is elevated on the ramp surface).
-    ramp_reward_weight: float = 0
-
-    # Ramp speed penalty: fires every step the robot is inside the ramp XY bounding
-    # box (or within ramp_approach_radius_m of it) and its forward speed exceeds
-    # ramp_speed_threshold_m_s.  Penalty scales linearly with the excess speed.
-    ramp_speed_threshold_m_s:  float = 3.0
-    ramp_speed_penalty_weight: float = 0.0
-    ramp_approach_radius_m:    float = 4.0  # extend penalty zone this far beyond ramp bbox
-
     # How often to advance to the next asset set in the round-robin cycle (in policy steps).
     # Set to num_steps_per_env / (NUM_ASSET_SETS * 2) so every set appears exactly twice
     # per PPO iteration.  At num_steps_per_env=2000: 2000 / (5*2) = 200.
@@ -455,9 +426,12 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
         prim_path="/World/envs/env_.*/Robot",
         spawn=sim_utils.UsdFileCfg(
             usd_path=MUSHR_USD,
-            scale=(1.0, 1.0, 1.0),
+            scale=(0.755, 0.755, 0.755),
             activate_contact_sensors=True,
-            mass_props=sim_utils.MassPropertiesCfg(mass=1.3),
+            # NOTE: no MassPropertiesCfg here.  A blanket mass=X override stamps the SAME
+            # mass onto every one of the 17 rigid bodies (→ 17× too heavy: 21.6 kg for a
+            # 1.27 kg car), crippling acceleration.  Instead the USD-native per-body mass
+            # distribution (~4.11 kg total) is scaled to car_mass_kg in __init__.
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 rigid_body_enabled=True,
                 max_linear_velocity=10000.0,
@@ -489,6 +463,10 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
                 "back_right_wheel_suspension": 0.0,
             },
         ),
+        # Only the (fixed) steering actuator is defined here.  The velocity-controlled
+        # DC-motor "throttle" group and the rigid "suspension" group are built in
+        # __post_init__ from the tunable scalar fields above, so they have a single
+        # source of truth.
         actuators={
             "steering": ImplicitActuatorCfg(
                 joint_names_expr=["front_left_wheel_steer", "front_right_wheel_steer"],
@@ -497,18 +475,30 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
                 # → 0.976 / 0.150 = 6.51 rad/s.  PhysX enforces this as a hard cap.
                 velocity_limit_sim=6.51, effort_limit_sim=3.2,
             ),
-            "rear_throttle": ImplicitActuatorCfg(
-                joint_names_expr=["back_left_wheel_throttle", "back_right_wheel_throttle"],
-                stiffness=0.0, damping=0.0,       # direct torque control via effort target
-                velocity_limit_sim=450.0, effort_limit_sim=5.0,
-            ),
-            "front_throttle": ImplicitActuatorCfg(
-                joint_names_expr=["front_left_wheel_throttle", "front_right_wheel_throttle"],
-                stiffness=0.0, damping=0.0,       # direct torque control via effort target
-                velocity_limit_sim=450.0, effort_limit_sim=5.0,
-            ),
         },
     )
+
+    def __post_init__(self):
+        """Build the drivetrain actuators from the tunable scalar fields so that a
+        single edit in this cfg propagates to every script that uses the env."""
+        # Throttle wheels: pure effort (torque) control.  Zero stiffness/damping so the
+        # per-wheel torque computed in _pre_physics_step (DC drive curve + graded brake)
+        # is applied verbatim via set_joint_effort_target.  effort_limit_sim is set well
+        # above any commanded torque so PhysX never clips it; real traction limiting comes
+        # from the ground contact friction (slip emerges when torque exceeds μ·N).
+        self.robot_cfg.actuators["throttle"] = ImplicitActuatorCfg(
+            joint_names_expr=[".*_wheel_throttle"],
+            stiffness=0.0, damping=0.0, friction=0.0,
+            effort_limit_sim=5.0, velocity_limit_sim=1e9,
+        )
+        # Suspension joints locked rigid.  mushr_nano_v2.usd ships these joints; left
+        # unconfigured, Isaac Lab keeps their raw USD drive gains (compliant + dissipative)
+        # which bleeds energy and caps top speed.  High stiffness welds them at zero travel.
+        self.robot_cfg.actuators["suspension"] = ImplicitActuatorCfg(
+            joint_names_expr=[".*_wheel_suspension"],
+            stiffness=self.suspension_stiffness, damping=0.0, friction=0.0,
+            effort_limit_sim=1e9, velocity_limit_sim=1e9,
+        )
 
     # Two ArduCam TOF depth cameras:
     #   Position: 122 mm forward of base_link, ±50 mm left/right, 70 mm above base_link.
@@ -532,13 +522,11 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     camera_left_cfg: TiledCameraCfg = TiledCameraCfg(
         prim_path="/World/envs/env_.*/Robot/mushr_nano/base_link/camera_left",
         update_period=8.0 / 240.0,  # render only at policy steps (decimation=8, sim=240Hz)
-        # Render at 120x90 (not the sensor's native 240x180): the policy image is
-        # downsampled to 80x12 px anyway, and 120x90 yields the *identical* final
-        # resolution at ~4x less camera VRAM — letting us run ~4x more envs.
-        # Deployment feeds the real 240x180 frame through the same downsample, so
-        # the final 80x12 policy image matches; sim-to-real transfer is unaffected.
-        height=90,
-        width=120,
+        # Render at the sensor's native 240x180 to match the real ArduCam TOF.
+        # All noise effects are applied at this full resolution before cropping
+        # and downsampling, mirroring how the real camera produces noisy depth.
+        height=180,
+        width=240,
         data_types=["distance_to_image_plane"],
         spawn=sim_utils.PinholeCameraCfg(
             focal_length=_TOF_FOCAL_MM,
@@ -547,7 +535,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
             clipping_range=(0.01, 5.0),
         ),
         offset=TiledCameraCfg.OffsetCfg(
-            pos=(0.122, 0.05, 0.07),   # 122 mm fwd, 50 mm left, 70 mm up from base_link
+            pos=(0.185, 0.04, -0.008),   # 122 mm fwd, 50 mm left, 70 mm up from base_link
             rot=(-0.6029, 0.6029, -0.3695, 0.3695),   # 27° yaw left, no pitch
             convention="ros",
         ),
@@ -556,8 +544,8 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     camera_right_cfg: TiledCameraCfg = TiledCameraCfg(
         prim_path="/World/envs/env_.*/Robot/mushr_nano/base_link/camera_right",
         update_period=8.0 / 240.0,  # render only at policy steps (decimation=8, sim=240Hz)
-        height=90,    # see camera_left_cfg — render 120x90, downsample to identical 80x12
-        width=120,
+        height=180,
+        width=240,
         data_types=["distance_to_image_plane"],
         spawn=sim_utils.PinholeCameraCfg(
             focal_length=_TOF_FOCAL_MM,
@@ -566,7 +554,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
             clipping_range=(0.01, 5.0),
         ),
         offset=TiledCameraCfg.OffsetCfg(
-            pos=(0.122, -0.05, 0.07),  # 122 mm fwd, 50 mm right, 70 mm up from base_link
+            pos=(0.185, -0.04, -0.008),  # 122 mm fwd, 50 mm right, 70 mm up from base_link
             rot=(-0.3695, 0.3695, -0.6029, 0.6029),   # 27° yaw right, no pitch
             convention="ros",
         ),
@@ -614,8 +602,6 @@ class ConeTrackEnv(DirectRLEnv):
         depth_obs_size = self._policy_depth_h * self._policy_depth_w
 
         extra_obs = 0
-        if cfg.include_prev_action:
-            extra_obs += cfg.action_history_steps * 2  # N × (throttle + steer)
         if cfg.include_wheel_vel:
             extra_obs += 1  # scalar: avg wheel surface speed normalized to [0, 1]
         cfg.observation_space = depth_obs_size * 2 + extra_obs  # left + right cameras
@@ -650,17 +636,34 @@ class ConeTrackEnv(DirectRLEnv):
             dtype=torch.long, device=self.device,
         )
 
-        # Per-wheel torque commands (split rear/front for set_joint_effort_target)
-        self._wheel_torque_rear  = torch.zeros(self.num_envs, 2, device=self.device)
-        self._wheel_torque_front = torch.zeros(self.num_envs, 2, device=self.device)
+        # Per-wheel drive/brake torque commands (Nm), ordered to match
+        # self._all_throttle_ids = [rear_L, rear_R, front_L, front_R].
+        self._wheel_torque = torch.zeros(self.num_envs, 4, device=self.device)
+
+        # ── Correct the total mass ───────────────────────────────────────────────
+        # mushr_nano_v2.usd authors per-body masses summing to ~4.11 kg (sensible light
+        # wheels, placeholder 1.0 kg chassis links).  Scale that native distribution
+        # uniformly so the articulation total = car_mass_kg, and scale the inertia
+        # tensors by the same ratio to keep them geometry-consistent (Isaac Lab's own
+        # mass-randomization convention; masses/inertias live on CPU in the PhysX view).
+        _pv = self.robot.root_physx_view
+        _masses = _pv.get_masses()                                  # [N, n_bodies] (CPU)
+        _native_total = _masses[0].sum().item()
+        _mass_scale = cfg.car_mass_kg / _native_total
+        _env_ids_cpu = torch.arange(self.num_envs, dtype=torch.int, device="cpu")
+        _pv.set_masses(_masses * _mass_scale, _env_ids_cpu)
+        _pv.set_inertias(_pv.get_inertias() * _mass_scale, _env_ids_cpu)
+        print(
+            f"[ConeTrackEnv] Mass: USD-native {_native_total:.3f} kg → scaled ×{_mass_scale:.4f} "
+            f"to total {cfg.car_mass_kg:.3f} kg ({_masses.shape[1]} bodies, distribution preserved)"
+        )
 
         # Steering LPF state
         self._filtered_steer = torch.zeros(self.num_envs, device=self.device)
 
-        # Action history for observation: action_history_steps most-recent (throttle, steer) pairs.
-        # Shape [N, H, 2]; flattened to [N, H*2] when appended to obs.
-        H = cfg.action_history_steps
-        self._prev_action = torch.zeros(self.num_envs, H, 2, device=self.device)
+        # Last two raw steering commands (undelayed), kept for the steer-rate penalty.
+        self._steer_cmd_curr = torch.zeros(self.num_envs, device=self.device)
+        self._steer_cmd_prev = torch.zeros(self.num_envs, device=self.device)
 
         # Action delay buffer — holds the last (delay_steps+1) raw actions so that
         # actuators receive the command issued delay_steps policy ticks ago.
@@ -672,22 +675,13 @@ class ConeTrackEnv(DirectRLEnv):
         self._action_delay_buf = torch.zeros(self.num_envs, buf_len, 2, device=self.device)
         print(f"[ConeTrackEnv] Action delay: {cfg.action_delay_ms:.0f} ms → {self._delay_steps} policy step(s)")
 
-        # Derived motor parameters — computed once from physics-based config fields.
-        # T_stall: stall torque per wheel = traction limit / slip_threshold
-        # ω_noload: no-load angular velocity = max_velocity / wheel_radius
-        _g = 9.81
-        _traction_limit = cfg.wheel_grip_mu_s * (cfg.car_mass_kg * _g / 4.0) * WHEEL_RADIUS
-        self._T_stall      = _traction_limit / cfg.slip_threshold
-        self._omega_noload = cfg.max_velocity_m_s / WHEEL_RADIUS
+        # No-load wheel speed (rad/s) at full throttle — drive torque rolls off to 0 here.
+        self._omega_noload_full = cfg.max_velocity_m_s / WHEEL_RADIUS
         print(
-            f"[ConeTrackEnv] Motor model: T_stall={self._T_stall:.4f} Nm/wheel, "
-            f"ω_noload={self._omega_noload:.2f} rad/s  "
-            f"(slip_threshold={cfg.slip_threshold:.2f}, μ_s={cfg.wheel_grip_mu_s}, "
-            f"m={cfg.car_mass_kg} kg, v_max={cfg.max_velocity_m_s} m/s)"
+            f"[ConeTrackEnv] Drivetrain: effort-controlled DC motor — "
+            f"no-load {cfg.max_velocity_m_s:.2f} m/s ({self._omega_noload_full:.1f} rad/s/wheel), "
+            f"drive_torque {cfg.drive_torque:.3f} Nm/wheel, brake_gain {cfg.brake_torque_gain:.3f} Nm/wheel/|u|"
         )
-        # Braking reward session state: True while an uninterrupted high-speed braking session is active.
-        self._braking_session_active = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-
         # Lap-tracking state.
         # _lap_state: 0 = inside the start circle (lap timer running, awaiting departure),
         #             1 = outside the start circle (lap timer running, awaiting line crossing).
@@ -705,8 +699,6 @@ class ConeTrackEnv(DirectRLEnv):
         self._spawn_heading_sin    = torch.zeros(self.num_envs, device=self.device)
         self._lap_prev_forward     = torch.zeros(self.num_envs, device=self.device)
         # Contact / termination flags
-        self._wall_terminated    = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        self._on_ramp            = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._wall_ever_touched  = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         # Average-speed reward accumulator: sum of clamped forward velocity per env.
@@ -761,27 +753,6 @@ class ConeTrackEnv(DirectRLEnv):
             asset_cfg.func(f"/World/Assets/Set{set_idx}", asset_cfg,
                            translation=(0.0, 0.0, 0.0), orientation=(0.0, 0.0, 0.0, 1.0))
 
-
-        try:
-            import omni.usd
-            from pxr import UsdPhysics, Usd
-            stage = omni.usd.get_context().get_stage()
-            for wall_path in ("/World/Walls",):
-                wall_root = stage.GetPrimAtPath(wall_path)
-                if wall_root.IsValid():
-                    for prim in Usd.PrimRange(wall_root):
-                        if prim.HasAPI(UsdPhysics.MeshCollisionAPI):
-                            UsdPhysics.MeshCollisionAPI(prim).GetApproximationAttr().Set("convexDecomposition")
-                        elif prim.HasAPI(UsdPhysics.CollisionAPI):
-                            mesh_api = UsdPhysics.MeshCollisionAPI.Apply(prim)
-                            mesh_api.GetApproximationAttr().Set("convexDecomposition")
-        except Exception as e:
-            print(f"[Wall] convexDecomposition setup failed: {e}")
-
-        # DISABLED: ramp temporarily removed
-        # ramp_cfg = sim_utils.UsdFileCfg(usd_path=RAMP_USD, scale=(0.003, 0.003, 0.003))
-        # ramp_cfg.func("/World/Ramps", ramp_cfg, translation=(16, 0.0, 0.0), orientation=(0.0, 0.0, 0.0, 0.0))
-
         import omni.usd
         from pxr import Usd, UsdGeom, UsdPhysics, UsdShade
         stage = omni.usd.get_context().get_stage()
@@ -816,17 +787,6 @@ class ConeTrackEnv(DirectRLEnv):
             wall_rb.GetKinematicEnabledAttr().Set(True)
             UsdGeom.Imageable(wall_root).MakeInvisible()
 
-        ramp_root = stage.GetPrimAtPath("/World/Ramps")
-        if ramp_root.IsValid():
-            UsdGeom.Imageable(ramp_root).MakeVisible()
-            for prim in Usd.PrimRange(ramp_root):
-                if not prim.IsA(UsdGeom.Mesh):
-                    continue
-                ramp_collision = UsdPhysics.CollisionAPI.Apply(prim)
-                ramp_collision.GetCollisionEnabledAttr().Set(True)
-                ramp_mesh_col = UsdPhysics.MeshCollisionAPI.Apply(prim)
-                ramp_mesh_col.GetApproximationAttr().Set("none")
-
         suspension_joint_names = (
             "front_left_wheel_suspension", "front_right_wheel_suspension",
             "back_left_wheel_suspension",  "back_right_wheel_suspension",
@@ -846,7 +806,9 @@ class ConeTrackEnv(DirectRLEnv):
 
         ground_cfg = sim_utils.GroundPlaneCfg(
             physics_material=sim_utils.RigidBodyMaterialCfg(
-                static_friction=0.8, dynamic_friction=0.7, restitution=0.05,
+                static_friction=self.cfg.ground_static_friction,
+                dynamic_friction=self.cfg.ground_dynamic_friction,
+                restitution=0.05,
                 friction_combine_mode="multiply", restitution_combine_mode="min",
             )
         )
@@ -947,79 +909,12 @@ class ConeTrackEnv(DirectRLEnv):
         for link_name, sensor in self._wall_contact_sensors.items():
             self.scene.sensors[f"wall_contact_{link_name}"] = sensor
 
-        # Ramp XY bounding box for contact masking
-        try:
-            from pxr import UsdGeom
-            bbox_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_])
-            ramp_prim = stage.GetPrimAtPath("/World/Ramps")
-            if ramp_prim.IsValid():
-                bb = bbox_cache.ComputeWorldBound(ramp_prim).GetRange()
-                margin = 1.0
-                self._ramp_xy_min = torch.tensor(
-                    [bb.GetMin()[0] - margin, bb.GetMin()[1] - margin],
-                    dtype=torch.float32, device=self.device,
-                )
-                self._ramp_xy_max = torch.tensor(
-                    [bb.GetMax()[0] + margin, bb.GetMax()[1] + margin],
-                    dtype=torch.float32, device=self.device,
-                )
-                print(f"[Ramp] XY bbox (±{margin} m margin): "
-                      f"min={self._ramp_xy_min.tolist()}  max={self._ramp_xy_max.tolist()}")
-            else:
-                self._ramp_xy_min = self._ramp_xy_max = None
-        except Exception as e:
-            print(f"[Ramp] Bounding-box computation failed: {e}")
-            self._ramp_xy_min = self._ramp_xy_max = None
-
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
     # ------------------------------------------------------------------
-    # Ramp / wall curriculum helpers
+    # Wall geometry helper
     # ------------------------------------------------------------------
-
-    def _enable_ramp(self) -> None:
-        try:
-            import omni.usd
-            from pxr import Usd, UsdGeom, UsdPhysics
-            stage = omni.usd.get_context().get_stage()
-            ramp_root = stage.GetPrimAtPath("/World/Ramps")
-            if ramp_root.IsValid():
-                UsdGeom.Imageable(ramp_root).MakeVisible()
-                for prim in Usd.PrimRange(ramp_root):
-                    if not prim.IsA(UsdGeom.Mesh):
-                        continue
-                    col_api = UsdPhysics.CollisionAPI(prim)
-                    if col_api:
-                        col_api.GetCollisionEnabledAttr().Set(True)
-                print(f"[Ramp] ENABLED after {self._ramp_enabled} total laps!")
-        except Exception as e:
-            print(f"[Ramp] Enable failed: {e}")
-
-    def _swap_walls(self) -> None:
-        try:
-            import omni.usd
-            from pxr import Usd, UsdGeom, UsdPhysics
-            stage = omni.usd.get_context().get_stage()
-            initial_root = stage.GetPrimAtPath("/World/WallsInitial")
-            if initial_root.IsValid():
-                for prim in Usd.PrimRange(initial_root):
-                    if not prim.IsA(UsdGeom.Mesh):
-                        continue
-                    col_api = UsdPhysics.CollisionAPI(prim)
-                    if col_api:
-                        col_api.GetCollisionEnabledAttr().Set(False)
-            full_root = stage.GetPrimAtPath("/World/Walls")
-            if full_root.IsValid():
-                for prim in Usd.PrimRange(full_root):
-                    if not prim.IsA(UsdGeom.Mesh):
-                        continue
-                    col_api = UsdPhysics.CollisionAPI(prim)
-                    if col_api:
-                        col_api.GetCollisionEnabledAttr().Set(True)
-            print(f"[Walls] Swapped to WALLS.usd after {self._ramp_enabled} total laps!")
-        except Exception as e:
-            print(f"[Walls] Swap failed: {e}")
 
     def _extract_wall_segments_xy(self):
         """Extract 2D line segments from /World/Walls for proximity ray-cast.
@@ -1112,18 +1007,13 @@ class ConeTrackEnv(DirectRLEnv):
     # ------------------------------------------------------------------
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
-        """Convert actions → Ackermann commands (direct torque control, AWD).
+        """Convert actions → Ackermann commands (effort-controlled DC motor, AWD).
 
-        Throttle (actions[:,0]) ∈ [-1,1]:
-            Remapped to [0,1], then applied as wheel torque following a
-            linear torque-speed curve (models motor back-EMF):
-                T(ω) = throttle_norm × T_stall × max(0, 1 − ω/ω_noload)
-            Wheel spin occurs naturally when T > traction limit.
+        Throttle (actions[:,0]) ∈ [-1,1] is mapped to a per-wheel drive/brake torque
+        (forward-only; see the zone description below) applied via set_joint_effort_target.
 
         Latency model: raw actions are pushed into _action_delay_buf; actuators
-        receive the command from delay_steps ticks ago.  The observation history
-        (_prev_action) still records the undelayed policy output so the network
-        can reason about what it recently commanded.
+        receive the command from delay_steps ticks ago.
         """
         # On the very first physics step all asset sets are still visible (RTX has
         # already built every BVH during sim init). Now hide all but set 0.
@@ -1146,53 +1036,47 @@ class ConeTrackEnv(DirectRLEnv):
         self._action_delay_buf[:, -1] = raw
         delayed = self._action_delay_buf[:, 0]   # [N, 2]  — what the actuators act on
 
-        # Apply rolling-friction offset BEFORE the three-zone mapping.  The offset
-        # shifts the drive/coast/brake boundary to the right: an output of
-        # +friction_offset is now "coast", anything below it brakes proportionally.
-        # Models drivetrain / rolling resistance so a stationary policy decays speed.
-        effective_throttle = delayed[:, 0] - self.cfg.throttle_friction_offset
+        # ── Throttle → per-wheel torque (forward-only, effort-controlled DC motor) ──
+        # Three zones (the car can NEVER be driven in reverse):
+        #   throttle > 0  DRIVE: T = drive_torque · clamp(1 − ω/(throttle·ω_noload), 0, 1)
+        #                 — DC torque-speed curve, full torque at standstill tapering to
+        #                   0 at the throttle-scaled no-load speed (full throttle → max_velocity_m_s).
+        #   throttle = 0  COAST: T = 0.
+        #   throttle < 0  BRAKE: T = −brake_torque_gain · |throttle|, opposing rotation,
+        #                 faded out below brake_release_omega so it decelerates to a stop
+        #                 and then coasts (never applies a reverse-driving torque).
+        # Wheel slip is left to PhysX: when |T|·(N wheels)/r exceeds μ·m·g the tyres break
+        # traction (matches the real car only slipping under the hardest braking).
+        u           = delayed[:, 0].unsqueeze(-1)                                          # [N,1] throttle
+        wheel_omega = self.robot.data.joint_vel[:, self._all_throttle_ids].clamp(min=0.0)  # [N,4] forward spin
 
-        # Policy output [-1, 1] three-zone mapping (post-friction):
-        #   (offset, 1]      → drive:  proportional forward torque
-        #    offset          → coast:  zero torque (no drive, no brake)
-        #   [-1, offset)     → brake:  braking force scales linearly with magnitude;
-        #                              effective = -1 = full brake_strength
-        throttle_norm   = effective_throttle.clamp(min=0.0)          # drive range  [0, 1]
-        is_braking      = effective_throttle < 0.0                   # any negative effective output
-        brake_magnitude = (-effective_throttle).clamp(0.0, 1.0)      # braking intensity [0, 1]
+        # DRIVE branch (throttle > 0)
+        omega_noload = (u.clamp(min=1e-3) * self.cfg.max_velocity_m_s / WHEEL_RADIUS)       # [N,1]
+        drive_rolloff = (1.0 - wheel_omega / omega_noload).clamp(0.0, 1.0)                  # [N,4]
+        drive_torque = self.cfg.drive_torque * drive_rolloff                               # [N,4]
 
-        # Per-wheel speed — abs for rolloff, signed for braking direction
-        wheel_vel_signed = self.robot.data.joint_vel[:, self._all_throttle_ids]
-        wheel_omega      = wheel_vel_signed.abs()
+        # BRAKE branch (throttle < 0): baseline + graded torque, opposes motion, fades to 0
+        # near standstill so it stops the car and then coasts (never drives in reverse).
+        # |throttle| is remapped through brake_throttle_scale so policy −1 = the slip-ceiling
+        # brake level (no point braking harder once the tyres slip).
+        brake_level = (-u).clamp(min=0.0) * self.cfg.brake_throttle_scale                  # [N,1] >0 when braking
+        brake_fade  = (wheel_omega / self.cfg.brake_release_omega).clamp(0.0, 1.0)         # [N,4] 1 when moving, →0 at rest
+        brake_torque = -(self.cfg.brake_torque_base + self.cfg.brake_torque_gain * brake_level) * brake_fade  # [N,4] ≤ 0
 
-        # Linear torque-speed rolloff: full torque at standstill, zero at no-load speed
-        torque_rolloff = (1.0 - wheel_omega / self._omega_noload).clamp(0.0, 1.0)
-
-        # Drive torque: proportional to throttle, with back-EMF rolloff
-        drive_torque = throttle_norm.unsqueeze(-1) * self._T_stall * torque_rolloff
-
-        # Braking torque: proportional to brake_magnitude (output in [-1, 0]).
-        # Models back-EMF braking: T = -magnitude × brake_strength × T_stall × (ω/ω_noload).
-        # Torque opposes rotation and reaches 0 as ω → 0 (car cannot reverse).
-        brake_torque = (
-            -brake_magnitude.unsqueeze(-1)
-            * self.cfg.brake_strength
-            * self._T_stall
-            * (wheel_vel_signed / self._omega_noload)
+        # throttle > 0 → drive, throttle < 0 → brake, throttle == 0 → coast (zero torque)
+        self._wheel_torque = torch.where(
+            u > 0.0, drive_torque,
+            torch.where(u < 0.0, brake_torque, torch.zeros_like(brake_torque)),
         )
-
-        per_wheel_torque = torch.where(is_braking.unsqueeze(-1), brake_torque, drive_torque)
-        self._wheel_torque_rear  = per_wheel_torque[:, :2]
-        self._wheel_torque_front = per_wheel_torque[:, 2:]
 
         # Steering: direct passthrough, no LPF (matches real hardware — no filter on servo)
         self._filtered_steer = delayed[:, 1]
         steer_ang = self._filtered_steer * self.cfg.max_steer_rad
         self._steer_tan = torch.tan(steer_ang)
 
-        # Shift observation history left and append newest RAW (undelayed) action
-        self._prev_action = self._prev_action.roll(-1, dims=1)
-        self._prev_action[:, -1] = raw
+        # Track the last two RAW (undelayed) steering commands for the steer-rate penalty.
+        self._steer_cmd_prev = self._steer_cmd_curr
+        self._steer_cmd_curr = raw[:, 1]
 
     def _apply_action(self) -> None:
         wall_hit_now = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -1209,12 +1093,9 @@ class ConeTrackEnv(DirectRLEnv):
         self._wall_ever_touched |= (wall_hit_now & ~in_grace)
 
         wall_mask = self._wall_ever_touched
-        torque_rear  = self._wheel_torque_rear.clone()
-        torque_front = self._wheel_torque_front.clone()
-        torque_rear[wall_mask]  = 0.0
-        torque_front[wall_mask] = 0.0
-        self.robot.set_joint_effort_target(torque_rear,  joint_ids=self._rear_throttle_ids)
-        self.robot.set_joint_effort_target(torque_front, joint_ids=self._front_throttle_ids)
+        wheel_torque = self._wheel_torque.clone()
+        wheel_torque[wall_mask] = 0.0              # cut drive torque after a wall hit (car coasts to a stop)
+        self.robot.set_joint_effort_target(wheel_torque, joint_ids=self._all_throttle_ids)
 
         steer_positions = self._steer_tan.unsqueeze(-1).expand(-1, 2).clone()
         steer_positions[wall_mask] = 0.0
@@ -1225,7 +1106,11 @@ class ConeTrackEnv(DirectRLEnv):
     # ------------------------------------------------------------------
 
     def _process_single_depth(self, camera) -> torch.Tensor:
-        """Shared depth pipeline for one TiledCamera → [N, policy_h*policy_w]."""
+        """Shared depth pipeline for one TiledCamera → [N, policy_h*policy_w].
+
+        Noise effects are applied at the camera's full 240×180 resolution before
+        cropping and downsampling, matching the real ArduCam TOF sensor pipeline.
+        """
         import torch.nn.functional as F
         depth_raw = camera.data.output["distance_to_image_plane"]  # [N, H, W, 1]
         depth = depth_raw[..., 0]                                   # [N, H, W]
@@ -1234,37 +1119,29 @@ class ConeTrackEnv(DirectRLEnv):
             depth,
             torch.tensor(self.cfg.depth_max_m, device=depth.device),
         )
-        h = depth.shape[1]
-        top = int(self.cfg.depth_crop_top_fraction    * h)
-        bot = h - int(self.cfg.depth_crop_bottom_fraction * h)
-        depth = depth[:, top:bot, :]                                # [N, H', W]
 
-        # Edge weights computed on the CLEAN signal so that only real depth
-        # discontinuities (not noise spikes) drive the mixed-pixel scatter effect.
+        # Edge weights computed on the FULL-RESOLUTION CLEAN signal so that real
+        # depth discontinuities (not noise spikes) drive the mixed-pixel scatter.
         if self.cfg.depth_edge_scatter_prob > 0.0:
-            _d4  = depth.unsqueeze(1)                                        # [N,1,H',W]
-            _px  = F.pad(_d4, (1, 1, 0, 0), mode="replicate")               # [N,1,H',W+2]
-            _py  = F.pad(_d4, (0, 0, 1, 1), mode="replicate")               # [N,1,H'+2,W]
+            _d4  = depth.unsqueeze(1)                                        # [N,1,H,W]
+            _px  = F.pad(_d4, (1, 1, 0, 0), mode="replicate")               # [N,1,H,W+2]
+            _py  = F.pad(_d4, (0, 0, 1, 1), mode="replicate")               # [N,1,H+2,W]
             _dx  = (_px[:, :, :, 2:] - _px[:, :, :, :-2]) * 0.5            # centred ∂/∂x
             _dy  = (_py[:, :, 2:, :] - _py[:, :, :-2, :]) * 0.5            # centred ∂/∂y
             _edge_w = (
-                (_dx.abs() + _dy.abs()).squeeze(1)                           # L1 grad [N,H',W]
+                (_dx.abs() + _dy.abs()).squeeze(1)                           # L1 grad [N,H,W]
                 / self.cfg.depth_edge_gradient_threshold_m
             ).clamp(0.0, 1.0)
 
-        # ── Noise passes ──────────────────────────────────────────────────────
+        # ── Noise passes at full 240×180 sensor resolution ────────────────────
         if self.cfg.depth_noise_sigma_m > 0.0:
-            # Broadband Gaussian noise (models ±2 cm ToF depth accuracy).
             depth = depth + torch.randn_like(depth) * self.cfg.depth_noise_sigma_m
 
         if self.cfg.depth_invalid_pixel_prob > 0.0:
-            # Black-spec speckle: pixel → depth_max_m (far/safe, matches ArduCam masking).
             invalid = torch.rand_like(depth) < self.cfg.depth_invalid_pixel_prob
             depth = depth.masked_fill(invalid, self.cfg.depth_max_m)
 
         if self.cfg.depth_color_noise_prob > 0.0:
-            # Coloured speckle: pixel → uniform random depth in [0, depth_max_m].
-            # Models stray reflections / multi-path interference.
             color_mask = torch.rand_like(depth) < self.cfg.depth_color_noise_prob
             depth = torch.where(
                 color_mask,
@@ -1273,22 +1150,22 @@ class ConeTrackEnv(DirectRLEnv):
             )
 
         if self.cfg.depth_edge_scatter_prob > 0.0:
-            # Mixed-pixel scatter: each edge pixel independently jumps to either 0 m (near)
-            # or depth_max_m (far) with probability scaled by the local edge weight.
-            # This produces the individual black dots inside objects and coloured dots in the
-            # background seen on real ToF sensors — a binary point scatter, not a smooth blur.
             scatter_mask = torch.rand_like(depth) < (self.cfg.depth_edge_scatter_prob * _edge_w)
             scatter_vals = torch.where(
                 torch.rand_like(depth) > 0.5,
-                torch.full_like(depth, self.cfg.depth_max_m),  # far / black
-                torch.zeros_like(depth),                        # near / red
+                torch.full_like(depth, self.cfg.depth_max_m),
+                torch.zeros_like(depth),
             )
             depth = torch.where(scatter_mask, scatter_vals, depth)
 
         if self.cfg.depth_edge_blur_sigma_m > 0.0 and self.cfg.depth_edge_scatter_prob > 0.0:
-            # Faint smooth halo on top of the scatter — softens the hard geometric edge
-            # slightly, matching the residual blur seen on real ToF frames.
             depth = depth + torch.randn_like(depth) * (self.cfg.depth_edge_blur_sigma_m * _edge_w)
+
+        # ── Crop AFTER noise (removes top/bottom rows at full resolution) ─────
+        h = depth.shape[1]
+        top = int(self.cfg.depth_crop_top_fraction    * h)
+        bot = h - int(self.cfg.depth_crop_bottom_fraction * h)
+        depth = depth[:, top:bot, :]                                # [N, H', W]
 
         depth = depth.clamp(0.01, self.cfg.depth_max_m)
         depth_norm = 1.0 - depth / self.cfg.depth_max_m
@@ -1317,8 +1194,6 @@ class ConeTrackEnv(DirectRLEnv):
         self._update_depth_cache()
 
         parts = [self._camera_left_obs, self._camera_right_obs]
-        if self.cfg.include_prev_action:
-            parts.append(self._prev_action.view(self.num_envs, -1))   # [N, H*2]
         if self.cfg.include_wheel_vel:
             wheel_omega_mean = self.robot.data.joint_vel[:, self._all_throttle_ids].abs().mean(dim=-1)
             wheel_vel_norm = (wheel_omega_mean * WHEEL_RADIUS / self.cfg.max_velocity_m_s).clamp(0.0, 1.0)
@@ -1337,15 +1212,8 @@ class ConeTrackEnv(DirectRLEnv):
         lin_vel_b = self.robot.data.root_lin_vel_b[:, 0]   # m/s forward
         dt = self.cfg.decimation * self.cfg.sim.dt          # ≈ 0.0333 s
 
-        lin_vel_augmented = torch.sign(lin_vel_b.clamp(min=0.0) / self.cfg.max_velocity_m_s) * torch.pow(torch.abs(lin_vel_b.clamp(min=0.0) / self.cfg.max_velocity_m_s), 3/4)
-
         # Distance covered this step
         r_distance = self.cfg.distance_weight * lin_vel_b / self.cfg.max_velocity_m_s * dt
-        # r_distance = self.cfg.distance_weight * lin_vel_augmented * dt
-
-
-        # Per-step speed bonus: reward current forward speed directly each step.
-        r_forward = self.cfg.forward_weight * (lin_vel_b.clamp(min=0.0) / self.cfg.max_velocity_m_s)
 
         # Episode average-speed bonus: rewards sustained pace, not just current speed.
         forward_speed = lin_vel_b.clamp(min=0.0)
@@ -1358,12 +1226,6 @@ class ConeTrackEnv(DirectRLEnv):
 
         pos_xy = self.robot.data.root_pos_w[:, :2]
 
-        # ── Wheel slip (AWD — all 4 wheels) ──────────────────────────────────────
-        wheel_vel     = self.robot.data.joint_vel[:, self._all_throttle_ids].abs().mean(dim=-1) * WHEEL_RADIUS
-        wheel_vel_norm_rew = (wheel_vel / self.cfg.max_velocity_m_s).clamp(0.0, 1.0)
-        slip_speed = torch.abs(wheel_vel - lin_vel_b)
-        r_slip     = -self.cfg.slip_weight * slip_speed / self.cfg.max_velocity_m_s * (~self._on_ramp).float()
-
         # ── Steering deadzone penalty ────────────────────────────────────────────
         steer_norm    = torch.abs(self._filtered_steer).clamp(0.0, 1.0)
         steer_excess  = (steer_norm - self.cfg.steer_deadzone).clamp(min=0.0)
@@ -1372,37 +1234,9 @@ class ConeTrackEnv(DirectRLEnv):
 
         # ── Steering-rate (smoothness) penalty ───────────────────────────────────
         # Penalise the change in commanded steering between the two most recent
-        # policy steps (both stored in the action history) to suppress jerky chatter.
-        steer_rate    = (self._prev_action[:, -1, 1] - self._prev_action[:, -2, 1]).abs()
+        # policy steps to suppress jerky chatter.
+        steer_rate    = (self._steer_cmd_curr - self._steer_cmd_prev).abs()
         r_steer_rate  = -self.cfg.steer_rate_weight * steer_rate
-
-        # ── Ramp reward ──────────────────────────────────────────────────────────
-        r_ramp = (
-            self.cfg.ramp_reward_weight
-            * self._on_ramp.float()
-            * (lin_vel_b / self.cfg.max_velocity_m_s).clamp(0.0, 1.0)
-        )
-
-        # ── Ramp speed penalty ───────────────────────────────────────────────────
-        # Penalise every step the robot is inside the ramp XY bbox OR within
-        # ramp_approach_radius_m of it, and going faster than ramp_speed_threshold_m_s.
-        if self._ramp_xy_min is not None:
-            in_ramp_xy = (
-                (pos_xy[:, 0] >= self._ramp_xy_min[0]) & (pos_xy[:, 0] <= self._ramp_xy_max[0]) &
-                (pos_xy[:, 1] >= self._ramp_xy_min[1]) & (pos_xy[:, 1] <= self._ramp_xy_max[1])
-            )
-            # Distance from robot to nearest point on bbox (0 when inside)
-            nearest_x = pos_xy[:, 0].clamp(self._ramp_xy_min[0], self._ramp_xy_max[0])
-            nearest_y = pos_xy[:, 1].clamp(self._ramp_xy_min[1], self._ramp_xy_max[1])
-            dx = pos_xy[:, 0] - nearest_x
-            dy = pos_xy[:, 1] - nearest_y
-            dist_to_ramp_bbox = torch.sqrt(dx * dx + dy * dy)
-            near_ramp_xy = dist_to_ramp_bbox <= self.cfg.ramp_approach_radius_m
-            in_ramp_xy = in_ramp_xy | near_ramp_xy
-        else:
-            in_ramp_xy = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        ramp_speed_excess = (lin_vel_b - self.cfg.ramp_speed_threshold_m_s).clamp(min=0.0)
-        r_airborne = -self.cfg.ramp_speed_penalty_weight * ramp_speed_excess * in_ramp_xy.float()
 
         r_alive = torch.full((self.num_envs,), self.cfg.alive_weight, device=self.device)
 
@@ -1467,28 +1301,6 @@ class ConeTrackEnv(DirectRLEnv):
             )
         else:
             r_proximity_speed = torch.zeros(self.num_envs, device=self.device)
-
-        # ── Braking reward ────────────────────────────────────────────────────
-        if self.cfg.braking_reward_weight > 0.0:
-            throttle_cmd    = self._action_delay_buf[:, 0, 0]
-            is_braking_now  = throttle_cmd < 0.0
-            brake_magnitude_rew = (-throttle_cmd).clamp(0.0, 1.0)
-            speed = lin_vel_b.clamp(min=0.0)
-            newly_activated = (
-                (~self._braking_session_active)
-                & is_braking_now
-                & (speed >= self.cfg.brake_reward_start_speed_m_s)
-            )
-            self._braking_session_active |= newly_activated
-            self._braking_session_active &= is_braking_now
-            self._braking_session_active &= (speed > self.cfg.brake_reward_stop_speed_m_s)
-            r_braking = (
-                self.cfg.braking_reward_weight
-                * torch.pow(brake_magnitude_rew, 1.0 / 3.0)
-                * self._braking_session_active.float()
-            )
-        else:
-            r_braking = torch.zeros(self.num_envs, device=self.device)
 
         # ── Lap completion reward ─────────────────────────────────────────────
         # State machine: 0 = at-start, 1 = away-from-start, lap closes on 1→0.
@@ -1584,8 +1396,6 @@ class ConeTrackEnv(DirectRLEnv):
             throttle_cmd_v2  = self._action_delay_buf[:, 0, 0]
             brake_input_v2   = (-throttle_cmd_v2).clamp(0.0, 1.0)  # 0 if not braking
             speed_fwd_v2     = lin_vel_b.clamp(min=0.0) / self.cfg.max_velocity_m_s
-            # r_braking_v2 = self.cfg.braking_v2_weight * speed_fwd_v2 * brake_input_v2
-
             r_braking_v2 = (
                 self.cfg.braking_v2_weight
                 * torch.pow(speed_fwd_v2, 2)
@@ -1594,7 +1404,7 @@ class ConeTrackEnv(DirectRLEnv):
         else:
             r_braking_v2 = torch.zeros(self.num_envs, device=self.device)
 
-        total = r_alive + r_distance + r_forward + r_average_speed + r_slip + r_steer_shape + r_steer_rate + r_ramp + r_airborne + r_spawn_escape + r_proximity_speed + r_braking + r_braking_v2 + r_lap
+        total = r_alive + r_distance + r_average_speed + r_steer_shape + r_steer_rate + r_spawn_escape + r_proximity_speed + r_braking_v2 + r_lap
 
         return total
 
@@ -1615,13 +1425,9 @@ class ConeTrackEnv(DirectRLEnv):
                     .any(dim=1)
                 )
 
-        # Ramp: robot is elevated
-        self._on_ramp = self.robot.data.root_pos_w[:, 2] >= 0.001
-
         in_grace = self.episode_length_buf < self.cfg.spawn_grace_steps
         self._wall_ever_touched |= (wall_terminated & ~in_grace)
         wall_terminated = self._wall_ever_touched
-        self._wall_terminated = wall_terminated
 
         # Flip detection (suppressed during grace)
         q    = self.robot.data.root_quat_w
@@ -1693,15 +1499,15 @@ class ConeTrackEnv(DirectRLEnv):
         self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
 
         # Body velocity already seeded above via write_root_velocity_to_sim
-        self._filtered_steer[env_ids] = 0.0
-        self._prev_action[env_ids]    = 0.0         # clears full [H, 2] history
-        self._action_delay_buf[env_ids] = 0.0       # clears latency FIFO
+        self._filtered_steer[env_ids]    = 0.0
+        self._steer_cmd_curr[env_ids]    = 0.0
+        self._steer_cmd_prev[env_ids]    = 0.0
+        self._action_delay_buf[env_ids]  = 0.0       # clears latency FIFO
 
         self._wall_ever_touched[env_ids]     = False
         self._cumulative_forward_vel[env_ids] = 0.0
         self._spawn_pos[env_ids_t]           = spawn_xy
         self._spawn_escaped[env_ids_t]       = False
-        self._braking_session_active[env_ids_t] = False
         self._lap_state[env_ids_t]              = 0
         self._lap_start_step[env_ids_t]         = 0
         self._spawn_heading_cos[env_ids_t]      = torch.cos(base_yaw)

@@ -10,7 +10,7 @@ from isaaclab_rl.rsl_rl import (
 
 @configclass
 class ConeTrackPPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    num_steps_per_env: int = 1550
+    num_steps_per_env: int = 1700
     max_iterations:    int = 3000
     save_interval:     int = 10
     experiment_name:   str = "cone_track"
