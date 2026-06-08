@@ -180,7 +180,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     #   top  → removes ceiling / sky (depth = max / inf)
     #   bottom → removes near-ground clutter and the robot's own body shadow
     depth_crop_top_fraction:    float = 0.375
-    depth_crop_bottom_fraction: float = 0.425
+    depth_crop_bottom_fraction: float = 0.45
 
     # Gaussian depth noise: σ ≈ 0.007 m gives a ±2 cm (3σ) error band,
     # matching the ArduCam TOF spec.  Set to 0.0 to disable.
@@ -742,14 +742,14 @@ class ConeTrackEnv(DirectRLEnv):
     def _setup_scene(self):
         self.robot = Articulation(self.cfg.robot_cfg)
 
-        track_cfg = sim_utils.UsdFileCfg(usd_path=TRACK_USD, scale=(1, 1, 1))
+        track_cfg = sim_utils.UsdFileCfg(usd_path=TRACK_USD, scale=(0.755, 0.755, 0.755))
         track_cfg.func("/World/Track", track_cfg, translation=(0, 0.0, 0.0), orientation=(0.0, 0.0, 0.0, 1.0))
 
-        wall_cfg = sim_utils.UsdFileCfg(usd_path=WALL_USD, scale=(1, 1, 1))
+        wall_cfg = sim_utils.UsdFileCfg(usd_path=WALL_USD, scale=(0.755, 0.755, 0.755))
         wall_cfg.func("/World/Walls", wall_cfg, translation=(0, 0.0, 0.0), orientation=(0.0, 0.0, 0.0, 1.0))
 
         for set_idx, asset_usd in enumerate(ASSET_SET_USDS):
-            asset_cfg = sim_utils.UsdFileCfg(usd_path=asset_usd, scale=(1, 1, 1))
+            asset_cfg = sim_utils.UsdFileCfg(usd_path=asset_usd, scale=(0.755, 0.755, 0.755))
             asset_cfg.func(f"/World/Assets/Set{set_idx}", asset_cfg,
                            translation=(0.0, 0.0, 0.0), orientation=(0.0, 0.0, 0.0, 1.0))
 
