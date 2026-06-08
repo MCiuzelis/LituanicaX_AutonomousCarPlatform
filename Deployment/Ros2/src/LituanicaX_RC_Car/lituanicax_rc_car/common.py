@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-FPS_TARGET = 30
+FPS_TARGET = 300
 POLICY_HZ = 30
 
 CAMERA_LEFT_INDEX = 0

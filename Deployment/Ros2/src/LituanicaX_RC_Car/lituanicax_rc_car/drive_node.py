@@ -151,7 +151,7 @@ class DriveNode(Node):
     def _enabled_cb(self, msg: Bool) -> None:
         self.enabled = bool(msg.data)
         if not self.enabled:
-            self._apply_drive(0.0, 0.0)
+            self._apply_drive(-1.0, 0.0)
 
     def _monitoring_cb(self, msg: Float32MultiArray) -> None:
         if len(msg.data) < 7:
