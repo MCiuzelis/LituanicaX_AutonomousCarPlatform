@@ -7,6 +7,8 @@ from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from std_msgs.msg import Bool, Float32MultiArray
 
+from .common import ENCODER_HZ
+
 
 class AccelerationTestNode(Node):
     # --- configuration (hardcoded, test-only) ---
@@ -16,7 +18,6 @@ class AccelerationTestNode(Node):
     BRAKE_THROTTLE = -0.5
     VELOCITY_EPSILON = 0.1
     MONITORING_TIMEOUT_S = 0.2
-    TICK_HZ = 300
     STARTUP_DELAY_S = 5.0
 
     def __init__(self) -> None:
@@ -38,7 +39,7 @@ class AccelerationTestNode(Node):
             Float32MultiArray, "/monitoring/telemetry", self._monitoring_cb, 1
         )
 
-        self.create_timer(1.0 / self.TICK_HZ, self._tick)
+        self.create_timer(1.0 / ENCODER_HZ, self._tick)
         self._start_timer = self.create_timer(self.STARTUP_DELAY_S, self._begin_test)
 
         self.get_logger().info(

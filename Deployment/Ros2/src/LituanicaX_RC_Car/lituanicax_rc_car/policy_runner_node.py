@@ -69,7 +69,7 @@ class PolicyRunnerNode(Node):
         self.declare_parameter("policy_path", "")
         self.declare_parameter("policy_hz", POLICY_HZ)
         self.declare_parameter("camera_timeout_sec", 0.5)
-        self.declare_parameter("onnx_threads", 4)
+        self.declare_parameter("onnx_threads", 3)
 
         policy_path = discover_policy_path(str(self.get_parameter("policy_path").value))
         if not policy_path.exists():
@@ -78,6 +78,9 @@ class PolicyRunnerNode(Node):
         ort = _load_onnxruntime()
         opts = ort.SessionOptions()
         opts.intra_op_num_threads = int(self.get_parameter("onnx_threads").value)
+        opts.inter_op_num_threads = 2
+        opts.execution_mode = ort.ExecutionMode.ORT_PARALLEL
+        opts.enable_cpu_mem_arena = False
         opts.log_severity_level = 3
         self.session = ort.InferenceSession(
             str(policy_path),

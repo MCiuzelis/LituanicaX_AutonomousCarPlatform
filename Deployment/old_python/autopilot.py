@@ -91,7 +91,7 @@ def depth_to_jpeg(depth_buf: np.ndarray, conf_buf: np.ndarray, depth_range: floa
     color = cv2.applyColorMap(color, cv2.COLORMAP_RAINBOW)
     color[conf_buf < CONF_THRESHOLD] = (0, 0, 0)
     color = cv2.flip(color, -1)
-    _, jpeg = cv2.imencode(".jpg", color, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    _, jpeg = cv2.imencode(".jpg", color, [cv2.IMWRITE_JPEG_QUALITY, 60])
     return jpeg.tobytes()
 
 
@@ -182,7 +182,10 @@ def camera_manager_thread(queues):
 def policy_thread() -> None:
     print("Loading policy...")
     opts = ort.SessionOptions()
-    opts.intra_op_num_threads = 4
+    opts.intra_op_num_threads = 3
+    opts.inter_op_num_threads = 2
+    opts.execution_mode = ort.ExecutionMode.ORT_PARALLEL
+    opts.enable_cpu_mem_arena = False
     sess = ort.InferenceSession(
         POLICY_PATH, sess_options=opts, providers=["CPUExecutionProvider"]
     )

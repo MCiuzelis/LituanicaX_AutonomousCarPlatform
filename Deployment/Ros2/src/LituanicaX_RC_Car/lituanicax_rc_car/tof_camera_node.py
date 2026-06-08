@@ -71,7 +71,7 @@ def depth_to_jpeg(depth_buf: np.ndarray, conf_buf: np.ndarray, depth_range: floa
     color = (depth * (255.0 / depth_range)).astype(np.uint8)
     color = cv2.applyColorMap(color, cv2.COLORMAP_RAINBOW)
     color[conf_buf < CONF_THRESHOLD] = (0, 0, 0)
-    ok, jpeg = cv2.imencode(".jpg", color, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    ok, jpeg = cv2.imencode(".jpg", color, [cv2.IMWRITE_JPEG_QUALITY, 60])
     if not ok:
         return b""
     return jpeg.tobytes()
