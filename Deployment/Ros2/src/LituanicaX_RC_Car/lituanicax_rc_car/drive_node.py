@@ -88,6 +88,7 @@ class DriveNode(Node):
         self.last_command_time = 0.0
         self.last_throttle = 0.0
         self.last_steer = 0.0
+        self.linear_velocity = 0.0
         self._stopped = False
 
         GPIO.setmode(GPIO.BCM)
@@ -150,14 +151,15 @@ class DriveNode(Node):
     def _enabled_cb(self, msg: Bool) -> None:
         self.enabled = bool(msg.data)
         if not self.enabled:
-            self._apply_drive(0.0, 0.0)
+            self._apply_drive(-1.0, 0.0)
 
     def _monitoring_cb(self, msg: Float32MultiArray) -> None:
-        if len(msg.data) < 6:
+        if len(msg.data) < 7:
             return
         self.last_monitoring_time = time.monotonic()
         self.undervoltage = bool(msg.data[4])
         self.overcurrent = bool(msg.data[5])
+        self.linear_velocity = float(msg.data[6])
         if self.undervoltage or self.overcurrent:
             self._apply_drive(0.0, 0.0)
 
@@ -179,6 +181,8 @@ class DriveNode(Node):
         return self.enabled and monitoring_fresh and not self.undervoltage and not self.overcurrent
 
     def _apply_drive(self, throttle: float, steer: float) -> None:
+        if throttle < 0.0 and self.linear_velocity <= 0.01:
+            throttle = 0.0
         self.last_throttle = throttle
         self.last_steer = steer
         self._set_throttle(throttle)

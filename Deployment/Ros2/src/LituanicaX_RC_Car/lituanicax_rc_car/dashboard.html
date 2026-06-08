@@ -91,6 +91,21 @@
     </div>
   </div>
   <div class="gauge-box">
+    <div class="gauge-label">LINEAR VELOCITY</div>
+    <div class="gauge-value" id="gval">0.000 m/s</div>
+    <div class="bar-bg">
+      <div class="bar-center"></div>
+      <div class="bar-fg" id="gbar" style="width:0%;background:#555;margin-left:50%;"></div>
+    </div>
+  </div>
+  <div class="gauge-box">
+    <div class="gauge-label">DISTANCE</div>
+    <div class="gauge-value" id="dval">0.0 m</div>
+    <div class="bar-bg">
+      <div class="bar-fg" id="dbar" style="width:0%;background:#f4a;"></div>
+    </div>
+  </div>
+  <div class="gauge-box">
     <div class="gauge-label">CPU USAGE</div>
     <div class="gauge-value" id="uval">0.0 %</div>
     <div class="bar-bg">
@@ -133,6 +148,10 @@ const bval = document.getElementById('bval');
 const bbar = document.getElementById('bbar');
 const cval = document.getElementById('cval');
 const cbar = document.getElementById('cbar');
+const gval = document.getElementById('gval');
+const gbar = document.getElementById('gbar');
+const dval = document.getElementById('dval');
+const dbar = document.getElementById('dbar');
 const uval = document.getElementById('uval');
 const ubar = document.getElementById('ubar');
 const pval = document.getElementById('pval');
@@ -178,6 +197,22 @@ ws.onmessage = ({ data }) => {
   cval.textContent = cv.toFixed(3) + ' A';
   cbar.style.width = Math.min(100, (cv / 5.0) * 100).toFixed(1) + '%';
   cbar.style.background = msg.overcurrent ? '#f64' : '#fa4';
+
+  const gv = msg.velocity || 0;
+  gval.textContent = (gv >= 0 ? '+' : '') + gv.toFixed(3) + ' m/s';
+  const gp = Math.min(50, (Math.abs(gv) / 3.0) * 50);
+  if (gv >= 0) {
+    gbar.style.marginLeft = '50%';
+    gbar.style.width = gp.toFixed(1) + '%';
+  } else {
+    gbar.style.marginLeft = (50 - gp).toFixed(1) + '%';
+    gbar.style.width = gp.toFixed(1) + '%';
+  }
+  gbar.style.background = Math.abs(gv) > 0.02 ? '#4af' : '#555';
+
+  const dv = msg.distance || 0;
+  dval.textContent = dv >= 100 ? (dv / 1000).toFixed(2) + ' km' : dv.toFixed(1) + ' m';
+  dbar.style.width = Math.min(100, (dv / 100) * 100).toFixed(1) + '%';
 
   const uv = msg.cpu_usage;
   uval.textContent = uv.toFixed(1) + ' %';
