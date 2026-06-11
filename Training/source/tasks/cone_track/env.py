@@ -108,6 +108,8 @@ NUM_ASSET_SETS = len(ASSET_SET_USDS)   # randomisation draws from [0, NUM_ASSET_
 # ---------------------------------------------------------------------------
 WHEEL_RADIUS = 0.037   # m  (82 mm diameter wheels)
 
+TRACK_SCALE = 0.85
+
 # ---------------------------------------------------------------------------
 # ArduCam TOF camera optics  (derived from 70° diagonal FOV, 240×180 sensor)
 #   f (pixels)        = diag_pixels / 2 / tan(diag_half) = 150 / tan(35°) ≈ 214.2 px
@@ -157,7 +159,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
 
     # ── Core env parameters ────────────────────────────────────────────────
     decimation:        int   = 8      # policy at ~30 Hz  (sim 240 Hz / 8)
-    episode_length_s:  float = 60.0  # 180 s × 30 Hz = 5 400 steps
+    episode_length_s:  float = 90.0  # 180 s × 30 Hz = 5 400 steps
     action_space:      int   = 2
     # observation_space is patched in ConeTrackEnv.__init__ after computing
     # the exact cropped depth image size.  The placeholder below keeps
@@ -225,7 +227,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # bilinearly downsampled to this resolution before being flattened into
     # the observation vector.  Smaller = faster MLP convergence.
     # policy_depth_height < 0 → auto-compute from cropped aspect ratio.
-    policy_depth_width:  int = 80
+    policy_depth_width:  int = 120
     policy_depth_height: int = -1
 
     # ════════════════════════════════════════════════════════════════════════
@@ -242,20 +244,20 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     #   spawn_yaw_jitter_rad is applied.
     preset_spawn_points: list = [
         # (x_m, y_m, theta_deg) — raw Blender coordinates
-        # (0.756,  5.0, 20.8),
-        # (3.91,  3.31, -156.0),
-        # (3.62,  1.97, -154.48),
-        (0.0,  0.0, 0.0),
-        # (-5.46,  3.7, 0.0),
-        # (-3.6,  4.7, -217.86),
+        (0.756,  5.0, 20.8),
+        (3.91,  3.31, -156.0),
+        (3.62,  1.97, -154.48),
+        # (0.0,  0.0, 0.0),
+        (-5.46,  3.7, 0.0),
+        (-3.6,  4.7, -217.86),
 
         # (-5.0,  0.0, 180.0),
         # (3.4,  0.0, 0.0),
     ]
     # Coordinate transform applied to every spawn point at runtime.
     # Blender exports X/Y inverted relative to Isaac Sim's frame, so both are -1.
-    spawn_x_scale: float = -1.15
-    spawn_y_scale: float = -1.15
+    spawn_x_scale: float = -1.15 * TRACK_SCALE
+    spawn_y_scale: float = -1.15 * TRACK_SCALE
 
     duplicate_with_flipped_yaw: bool = True  # if True, each (x, y, θ) spawns two episodes: one with +180deg rotation around z
     spawn_yaw_jitter_rad: float = 0.1   # ± heading noise applied in both modes
@@ -267,7 +269,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # Teaches aggressive initial acceleration without rewarding slow drift.
     # Set spawn_escape_reward=0 to disable.
     spawn_escape_radius_m: float = 0.5
-    spawn_escape_reward:   float = 3.0
+    spawn_escape_reward:   float = 0.0
 
     # ════════════════════════════════════════════════════════════════════════
     # SPAWN SPEED — initial robot velocity at each episode reset
@@ -315,7 +317,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # used to require throttle −0.5).  The tyres already slip at this level, so braking harder
     # buys no extra deceleration — capping it here gives the policy a more useful action range.
     # Effective braking level = |throttle| × brake_throttle_scale, fed into base + gain·level.
-    brake_throttle_scale: float = 0.5     # |throttle|=1 → braking level 0.5 (the slip ceiling)
+    brake_throttle_scale: float = 0.4     # |throttle|=1 → braking level 0.4 (the slip ceiling)
     brake_release_omega:  float = 2.0     # wheel speed (rad/s ≈ 0.07 m/s) below which braking fades to coast → no reverse
     # Tyre–ground friction (sets traction / wheel-slip onset).  Combined with the bound wheel-rubber
     # material (μ=1.0, "multiply") these are the effective μ.  Tuned so the car grips up to ≈|0.3|
@@ -338,7 +340,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
 
     # slow_stop_speed_fraction — episode terminates when speed falls below this
     # (catches truly stuck / reversed agents; keep low so normal braking is fine)
-    slow_stop_speed_fraction:    float = 0.01  # terminate if speed < 3 % of vel_cap
+    slow_stop_speed_fraction:    float = 0.03  # terminate if speed < 3 % of vel_cap
 
     # ════════════════════════════════════════════════════════════════════════
     # OBSERVATION EXTRAS
@@ -354,7 +356,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # REWARD WEIGHTS
     # ════════════════════════════════════════════════════════════════════════
     # Constant reward per step the agent stays alive (not crashed / stuck).
-    alive_weight:       float = 0#0.05
+    alive_weight:       float = 0.025
 
     # Distance: rewards physical metres covered each step (v × dt).
     distance_weight:    float = 4.0
@@ -364,13 +366,20 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     average_speed_weight: float = 0.0   # redundant with distance + non-Markovian; off
 
     # Steering deadzone penalty: only penalises steering beyond the deadzone.
-    steer_deadzone_weight: float = 0.006
+    steer_deadzone_weight: float = 0.002
     steer_deadzone:        float = 0.05   # fraction of max_steer_rad that is free
 
     # Steering-rate (smoothness) penalty: penalises the change in steering command
     # between consecutive policy steps, r = -weight × |steer_t − steer_{t-1}|.
     # Directly suppresses the jerky servo chatter; encourages smooth, committed lines.
     steer_rate_weight: float = 0.01
+
+    # Throttle-rate penalty: penalises the change in throttle/brake command
+    # between consecutive policy steps to suppress banging between full throttle and brake.
+    throttle_rate_weight: float = 0.01
+
+    # Wheel slip penalty: penalises the difference between theoretical wheel speed and actual car speed.
+    slip_weight: float = 0.3
 
     # Proximity speed penalty: penalises going fast when a wall is close along the
     # car's current velocity direction.  Each step a 2D ray is cast from the car
@@ -393,7 +402,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     #   r_distance at v = max_velocity   ≈ distance_weight × dt × 1.0
     # With weight = 0.1, v_max = 8 m/s   → r_braking_v2 = 6.4/step at full brake at top speed.
     # At v = 2 m/s the same brake input yields only 0.4/step — 16× weaker than at top speed.
-    braking_v2_weight: float = 0.02
+    braking_v2_weight: float = 0.0
 
     # ── Lap completion reward ────────────────────────────────────────────────
     # Sparse reward fired when the agent crosses the start line (the line through
@@ -406,12 +415,12 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # dense distance reward (~25/sec at top speed → ~750 per 30 s lap).
     # Until the agent can actually finish a lap this reward stays at 0, so it has
     # no effect on early training.
-    lap_reward_weight:    float = 3.0   # rescaled to the new O(10) return scale; pays
+    lap_reward_weight:    float = 15.0   # rescaled to the new O(10) return scale; pays
                                         # more for faster laps (lap_max/lap_time, 20-40 s)
     lap_return_radius_m:  float = 0.3   # start circle: leaving it starts the lap timer; crossing the
                                         # start line while back inside closes the lap
     lap_min_time_s:       float = 20.0   # lower clamp (caps maximum reward per lap)
-    lap_max_time_s:       float = 90.0  # upper clamp & numerator anchor
+    lap_max_time_s:       float = 50.0  # upper clamp & numerator anchor
 
     # How often to advance to the next asset set in the round-robin cycle (in policy steps).
     # Set to num_steps_per_env / (NUM_ASSET_SETS * 2) so every set appears exactly twice
@@ -661,9 +670,11 @@ class ConeTrackEnv(DirectRLEnv):
         # Steering LPF state
         self._filtered_steer = torch.zeros(self.num_envs, device=self.device)
 
-        # Last two raw steering commands (undelayed), kept for the steer-rate penalty.
+        # Last two raw steering/throttle commands (undelayed), kept for rate penalties.
         self._steer_cmd_curr = torch.zeros(self.num_envs, device=self.device)
         self._steer_cmd_prev = torch.zeros(self.num_envs, device=self.device)
+        self._throttle_cmd_curr = torch.zeros(self.num_envs, device=self.device)
+        self._throttle_cmd_prev = torch.zeros(self.num_envs, device=self.device)
 
         # Action delay buffer — holds the last (delay_steps+1) raw actions so that
         # actuators receive the command issued delay_steps policy ticks ago.
@@ -742,14 +753,14 @@ class ConeTrackEnv(DirectRLEnv):
     def _setup_scene(self):
         self.robot = Articulation(self.cfg.robot_cfg)
 
-        track_cfg = sim_utils.UsdFileCfg(usd_path=TRACK_USD, scale=(0.755, 0.755, 0.755))
+        track_cfg = sim_utils.UsdFileCfg(usd_path=TRACK_USD, scale=(TRACK_SCALE, TRACK_SCALE, TRACK_SCALE))
         track_cfg.func("/World/Track", track_cfg, translation=(0, 0.0, 0.0), orientation=(0.0, 0.0, 0.0, 1.0))
 
-        wall_cfg = sim_utils.UsdFileCfg(usd_path=WALL_USD, scale=(0.755, 0.755, 0.755))
+        wall_cfg = sim_utils.UsdFileCfg(usd_path=WALL_USD, scale=(TRACK_SCALE, TRACK_SCALE, TRACK_SCALE))
         wall_cfg.func("/World/Walls", wall_cfg, translation=(0, 0.0, 0.0), orientation=(0.0, 0.0, 0.0, 1.0))
 
         for set_idx, asset_usd in enumerate(ASSET_SET_USDS):
-            asset_cfg = sim_utils.UsdFileCfg(usd_path=asset_usd, scale=(0.755, 0.755, 0.755))
+            asset_cfg = sim_utils.UsdFileCfg(usd_path=asset_usd, scale=(TRACK_SCALE, TRACK_SCALE, TRACK_SCALE))
             asset_cfg.func(f"/World/Assets/Set{set_idx}", asset_cfg,
                            translation=(0.0, 0.0, 0.0), orientation=(0.0, 0.0, 0.0, 1.0))
 
@@ -1074,9 +1085,11 @@ class ConeTrackEnv(DirectRLEnv):
         steer_ang = self._filtered_steer * self.cfg.max_steer_rad
         self._steer_tan = torch.tan(steer_ang)
 
-        # Track the last two RAW (undelayed) steering commands for the steer-rate penalty.
+        # Track the last two RAW (undelayed) steering/throttle commands for rate penalties.
         self._steer_cmd_prev = self._steer_cmd_curr
         self._steer_cmd_curr = raw[:, 1]
+        self._throttle_cmd_prev = self._throttle_cmd_curr
+        self._throttle_cmd_curr = raw[:, 0]
 
     def _apply_action(self) -> None:
         wall_hit_now = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -1237,6 +1250,17 @@ class ConeTrackEnv(DirectRLEnv):
         # policy steps to suppress jerky chatter.
         steer_rate    = (self._steer_cmd_curr - self._steer_cmd_prev).abs()
         r_steer_rate  = -self.cfg.steer_rate_weight * steer_rate
+
+        # ── Throttle-rate (smoothness) penalty ───────────────────────────────────
+        throttle_rate = (self._throttle_cmd_curr - self._throttle_cmd_prev).abs()
+        r_throttle_rate = -self.cfg.throttle_rate_weight * throttle_rate
+
+        # ── Wheel slip penalty ───────────────────────────────────────────────────
+        # Penalty 1.0 means the wheel is spinning at max velocity but car isn't moving (or vice versa)
+        wheel_omega_mean = self.robot.data.joint_vel[:, self._all_throttle_ids].abs().mean(dim=-1)
+        wheel_vel = wheel_omega_mean * WHEEL_RADIUS
+        slip_ratio = (wheel_vel - forward_speed).abs() / self.cfg.max_velocity_m_s
+        r_slip = -self.cfg.slip_weight * slip_ratio.clamp(0.0, 1.0)
 
         r_alive = torch.full((self.num_envs,), self.cfg.alive_weight, device=self.device)
 
@@ -1404,7 +1428,7 @@ class ConeTrackEnv(DirectRLEnv):
         else:
             r_braking_v2 = torch.zeros(self.num_envs, device=self.device)
 
-        total = r_alive + r_distance + r_average_speed + r_steer_shape + r_steer_rate + r_spawn_escape + r_proximity_speed + r_braking_v2 + r_lap
+        total = r_alive + r_distance + r_average_speed + r_steer_shape + r_steer_rate + r_throttle_rate + r_slip + r_spawn_escape + r_proximity_speed + r_braking_v2 + r_lap
 
         return total
 
@@ -1502,6 +1526,8 @@ class ConeTrackEnv(DirectRLEnv):
         self._filtered_steer[env_ids]    = 0.0
         self._steer_cmd_curr[env_ids]    = 0.0
         self._steer_cmd_prev[env_ids]    = 0.0
+        self._throttle_cmd_curr[env_ids] = 0.0
+        self._throttle_cmd_prev[env_ids] = 0.0
         self._action_delay_buf[env_ids]  = 0.0       # clears latency FIFO
 
         self._wall_ever_touched[env_ids]     = False
