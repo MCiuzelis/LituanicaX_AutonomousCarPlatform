@@ -3,18 +3,18 @@
 from isaaclab.utils import configclass
 from isaaclab_rl.rsl_rl import (
     RslRlOnPolicyRunnerCfg,
-    RslRlPpoActorCriticRecurrentCfg,
     RslRlPpoActorCriticCfg,
+    RslRlPpoActorCriticRecurrentCfg,
     RslRlPpoAlgorithmCfg,
 )
 
 
 @configclass
 class ConeTrackPPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    num_steps_per_env: int = 1000
-    max_iterations:    int = 3000
-    save_interval:     int = 10
-    experiment_name:   str = "cone_track"
+    num_steps_per_env: int = 1400
+    max_iterations: int = 1000
+    save_interval: int = 10
+    experiment_name: str = "cone_track"
 
     # Observation group mapping required by RslRlVecEnvWrapper
     obs_groups = {"policy": ["policy"], "critic": ["policy"]}
@@ -23,18 +23,18 @@ class ConeTrackPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         init_noise_std=0.75,
         actor_obs_normalization=True,
         critic_obs_normalization=True,
-        actor_hidden_dims=[512, 256, 128],                                                                                          
+        actor_hidden_dims=[512, 256, 128],
         critic_hidden_dims=[1024, 512, 256],
-        activation="elu",
+        activation="mish",
     )
 
     algorithm: RslRlPpoAlgorithmCfg = RslRlPpoAlgorithmCfg(
-        learning_rate=3e-5,   
-        schedule="adaptive",     
-        num_learning_epochs=6, 
-        num_mini_batches=12,   
+        learning_rate=3e-5,
+        schedule="adaptive",
+        num_learning_epochs=6,
+        num_mini_batches=6,
         clip_param=0.2,
-        entropy_coef=0.005,
+        entropy_coef=0.00525,
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         gamma=0.995,
@@ -47,7 +47,7 @@ class ConeTrackPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     #     init_noise_std=0.5,
     #     actor_obs_normalization=True,
     #     critic_obs_normalization=True,
-    #     actor_hidden_dims=[256, 128],                                                                                          
+    #     actor_hidden_dims=[256, 128],
     #     critic_hidden_dims=[512, 256],
     #     activation="elu",
     #     # Recurrent core: gives the policy temporal memory so it can integrate
@@ -59,8 +59,8 @@ class ConeTrackPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     # )
 
     # algorithm: RslRlPpoAlgorithmCfg = RslRlPpoAlgorithmCfg(
-    #     learning_rate=1e-4,   
-    #     schedule="adaptive",     
+    #     learning_rate=1e-4,
+    #     schedule="adaptive",
     #     num_learning_epochs=4,
     #     # Few minibatches so RSL-RL keeps long trajectory sequences intact for
     #     # BPTT through the LSTM (24 would fragment them and hurt recurrence).
