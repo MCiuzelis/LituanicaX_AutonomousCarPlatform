@@ -12,7 +12,6 @@ from std_msgs.msg import Bool, Float32MultiArray
 
 from .common import (
     COMMAND_TIMEOUT_SEC,
-    FPS_TARGET,
     MAX_THROTTLE,
     MONITORING_TIMEOUT_SEC,
     MOTOR_DIRECTION,
@@ -29,6 +28,7 @@ from .common import (
     SERVO_MIN_US,
     SERVO_OFFSET_US,
     SERVO_PWM_FREQ,
+    TELEMETRY_HZ,
 )
 
 
@@ -77,7 +77,7 @@ class DriveNode(Node):
 
         self.declare_parameter("command_timeout_sec", COMMAND_TIMEOUT_SEC)
         self.declare_parameter("monitoring_timeout_sec", MONITORING_TIMEOUT_SEC)
-        self.declare_parameter("telemetry_hz", FPS_TARGET)
+        self.declare_parameter("telemetry_hz", TELEMETRY_HZ)
 
         self.command_timeout_sec = float(self.get_parameter("command_timeout_sec").value)
         self.monitoring_timeout_sec = float(self.get_parameter("monitoring_timeout_sec").value)

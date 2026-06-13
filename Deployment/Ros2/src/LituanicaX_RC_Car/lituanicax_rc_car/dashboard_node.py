@@ -17,7 +17,7 @@ from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import Bool, Float32MultiArray
 
-from .common import FPS_TARGET
+from .common import DASHBOARD_HZ
 
 
 _HTML_PATH = os.path.join(os.path.dirname(__file__), "dashboard.html")
@@ -39,7 +39,7 @@ class DashboardNode(Node):
 
         self.declare_parameter("host", "0.0.0.0")
         self.declare_parameter("port", 8080)
-        self.declare_parameter("stream_fps", FPS_TARGET)
+        self.declare_parameter("stream_fps", DASHBOARD_HZ)
 
         self.host = str(self.get_parameter("host").value)
         self.port = int(self.get_parameter("port").value)

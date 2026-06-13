@@ -69,7 +69,8 @@ class PolicyRunnerNode(Node):
         self.declare_parameter("policy_path", "")
         self.declare_parameter("policy_hz", POLICY_HZ)
         self.declare_parameter("camera_timeout_sec", 0.5)
-        self.declare_parameter("onnx_threads", 4)
+        # Small MLPs suffer from huge thread spin-wait overhead if > 1
+        self.declare_parameter("onnx_threads", 1)
 
         policy_path = discover_policy_path(str(self.get_parameter("policy_path").value))
         if not policy_path.exists():
@@ -100,7 +101,7 @@ class PolicyRunnerNode(Node):
         self.create_subscription(UInt8MultiArray, "/camera/left/tof_packet", self._left_cb, sensor_qos())
         self.create_subscription(UInt8MultiArray, "/camera/right/tof_packet", self._right_cb, sensor_qos())
         self.create_subscription(Bool, "/autopilot/enabled", self._enabled_cb, 1)
-        self.create_subscription(Float32MultiArray, "/monitoring/telemetry", self._telemetry_cb, 1)
+        self.create_subscription(Float32MultiArray, "/monitoring/encoder", self._encoder_cb, 1)
 
         period = 1.0 / float(self.get_parameter("policy_hz").value)
         self.timer = self.create_timer(period, self._tick)
@@ -126,10 +127,10 @@ class PolicyRunnerNode(Node):
             self.action_history[:] = 0.0
             self.wheel_vel_norm = 0.0
 
-    def _telemetry_cb(self, msg: Float32MultiArray) -> None:
-        if len(msg.data) >= 7:
+    def _encoder_cb(self, msg: Float32MultiArray) -> None:
+        if len(msg.data) >= 2:
             # Normalize wheel velocity (m/s) to [0, 1] exactly like in training (max_velocity_m_s = 6.7)
-            self.wheel_vel_norm = max(0.0, min(1.0, float(msg.data[6]) / 6.7))
+            self.wheel_vel_norm = max(0.0, min(1.0, float(msg.data[0]) / 6.7))
 
     def _tick(self) -> None:
         now = time.monotonic()
