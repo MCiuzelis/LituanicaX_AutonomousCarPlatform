@@ -27,8 +27,8 @@ CONF_THRESHOLD = 30
 
 DEPTH_RAW_H = 180
 DEPTH_RAW_W = 240
-CROP_TOP_FRAC = 0.35
-CROP_BOTTOM_FRAC = 0.3
+CROP_TOP_FRAC = 0.375
+CROP_BOTTOM_FRAC = 0.45
 POLICY_W = 120
 CROP_TOP_ROWS = int(CROP_TOP_FRAC * DEPTH_RAW_H)
 CROP_BOTTOM_ROWS = int(CROP_BOTTOM_FRAC * DEPTH_RAW_H)
@@ -37,7 +37,8 @@ POLICY_H = round(POLICY_W * CROPPED_H / DEPTH_RAW_W)
 
 PER_CAM_DIM = POLICY_W * POLICY_H
 ACTION_HIST = 30
-OBS_DIM = PER_CAM_DIM * 2 + ACTION_HIST
+EXTRA_OBS = 1
+OBS_DIM = PER_CAM_DIM * 2 + EXTRA_OBS  # Temporarily changed from + ACTION_HIST
 
 
 def camera_index_for_side(side: str) -> int:
@@ -56,7 +57,9 @@ def vertical_flip_for_side(side: str) -> bool:
     raise ValueError(f"Unknown camera side: {side}")
 
 
-def orient_camera_frame(depth_buf: np.ndarray, conf_buf: np.ndarray, vertical_flip: bool) -> Tuple[np.ndarray, np.ndarray]:
+def orient_camera_frame(
+    depth_buf: np.ndarray, conf_buf: np.ndarray, vertical_flip: bool
+) -> Tuple[np.ndarray, np.ndarray]:
     depth = np.flip(depth_buf, (0, 1))
     confidence = np.flip(conf_buf, (0, 1))
     if vertical_flip:
@@ -65,7 +68,9 @@ def orient_camera_frame(depth_buf: np.ndarray, conf_buf: np.ndarray, vertical_fl
     return np.ascontiguousarray(depth), np.ascontiguousarray(confidence)
 
 
-def depth_to_jpeg(depth_buf: np.ndarray, conf_buf: np.ndarray, depth_range: float) -> bytes:
+def depth_to_jpeg(
+    depth_buf: np.ndarray, conf_buf: np.ndarray, depth_range: float
+) -> bytes:
     depth = np.nan_to_num(depth_buf)
     depth[conf_buf < CONF_THRESHOLD] = 0
     color = (depth * (255.0 / depth_range)).astype(np.uint8)
@@ -94,10 +99,16 @@ def make_tof_packet(depth_buf: np.ndarray, conf_buf: np.ndarray) -> UInt8MultiAr
 
     msg = UInt8MultiArray()
     msg.layout.dim = [
-        MultiArrayDimension(label="height", size=depth.shape[0], stride=depth.shape[0] * depth.shape[1]),
+        MultiArrayDimension(
+            label="height", size=depth.shape[0], stride=depth.shape[0] * depth.shape[1]
+        ),
         MultiArrayDimension(label="width", size=depth.shape[1], stride=depth.shape[1]),
-        MultiArrayDimension(label="depth_bytes", size=depth.nbytes, stride=depth.nbytes),
-        MultiArrayDimension(label="confidence_bytes", size=confidence.nbytes, stride=confidence.nbytes),
+        MultiArrayDimension(
+            label="depth_bytes", size=depth.nbytes, stride=depth.nbytes
+        ),
+        MultiArrayDimension(
+            label="confidence_bytes", size=confidence.nbytes, stride=confidence.nbytes
+        ),
     ]
     msg.data = array("B", payload)
     return msg
@@ -115,7 +126,9 @@ def unpack_tof_packet(msg: UInt8MultiArray) -> Tuple[np.ndarray, np.ndarray]:
     expected_confidence_bytes = height * width
 
     if depth_bytes != expected_depth_bytes:
-        raise ValueError(f"Depth payload has {depth_bytes} bytes, expected {expected_depth_bytes}")
+        raise ValueError(
+            f"Depth payload has {depth_bytes} bytes, expected {expected_depth_bytes}"
+        )
     if confidence_bytes != expected_confidence_bytes:
         raise ValueError(
             f"Confidence payload has {confidence_bytes} bytes, expected {expected_confidence_bytes}"
@@ -124,10 +137,20 @@ def unpack_tof_packet(msg: UInt8MultiArray) -> Tuple[np.ndarray, np.ndarray]:
     payload = bytes(msg.data)
     expected_total = depth_bytes + confidence_bytes
     if len(payload) != expected_total:
-        raise ValueError(f"ToF packet has {len(payload)} bytes, expected {expected_total}")
+        raise ValueError(
+            f"ToF packet has {len(payload)} bytes, expected {expected_total}"
+        )
 
-    depth = np.frombuffer(payload[:depth_bytes], dtype="<f4").reshape((height, width)).copy()
-    confidence = np.frombuffer(payload[depth_bytes:], dtype=np.uint8).reshape((height, width)).copy()
+    depth = (
+        np.frombuffer(payload[:depth_bytes], dtype="<f4")
+        .reshape((height, width))
+        .copy()
+    )
+    confidence = (
+        np.frombuffer(payload[depth_bytes:], dtype=np.uint8)
+        .reshape((height, width))
+        .copy()
+    )
     return depth, confidence
 
 
@@ -161,16 +184,30 @@ class TofCameraNode(Node):
 
         self.side = str(self.get_parameter("side").value)
         configured_index = int(self.get_parameter("camera_index").value)
-        self.camera_index = configured_index if configured_index >= 0 else camera_index_for_side(self.side)
+        self.camera_index = (
+            configured_index
+            if configured_index >= 0
+            else camera_index_for_side(self.side)
+        )
         self.vertical_flip = vertical_flip_for_side(self.side)
         self.frame_id = str(self.get_parameter("frame_id").value) or f"tof_{self.side}"
         self.max_distance_mm = int(self.get_parameter("max_distance_mm").value)
 
-        packet_topic = str(self.get_parameter("packet_topic").value) or f"/camera/{self.side}/tof_packet"
-        preview_topic = str(self.get_parameter("preview_topic").value) or f"/camera/{self.side}/preview/compressed"
+        packet_topic = (
+            str(self.get_parameter("packet_topic").value)
+            or f"/camera/{self.side}/tof_packet"
+        )
+        preview_topic = (
+            str(self.get_parameter("preview_topic").value)
+            or f"/camera/{self.side}/preview/compressed"
+        )
 
-        self.packet_pub = self.create_publisher(UInt8MultiArray, packet_topic, sensor_qos())
-        self.preview_pub = self.create_publisher(CompressedImage, preview_topic, sensor_qos())
+        self.packet_pub = self.create_publisher(
+            UInt8MultiArray, packet_topic, sensor_qos()
+        )
+        self.preview_pub = self.create_publisher(
+            CompressedImage, preview_topic, sensor_qos()
+        )
 
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._camera_loop, daemon=True)
@@ -188,7 +225,9 @@ class TofCameraNode(Node):
         opened = False
         try:
             if cam.open(ac.Connection.CSI, self.camera_index) != 0:
-                self.get_logger().error(f"Failed to open Arducam CSI index {self.camera_index}")
+                self.get_logger().error(
+                    f"Failed to open Arducam CSI index {self.camera_index}"
+                )
                 return
             opened = True
 
@@ -218,17 +257,25 @@ class TofCameraNode(Node):
                         confidence,
                         self.vertical_flip,
                     )
-                    jpeg = depth_to_jpeg(depth_oriented, confidence_oriented, depth_range)
+                    jpeg = depth_to_jpeg(
+                        depth_oriented, confidence_oriented, depth_range
+                    )
 
                     if not rclpy.ok() or self._stop.is_set():
                         break
                     stamp = self.get_clock().now().to_msg()
-                    self.packet_pub.publish(make_tof_packet(depth_oriented, confidence_oriented))
-                    self.preview_pub.publish(make_compressed_image(jpeg, self.frame_id, stamp))
+                    self.packet_pub.publish(
+                        make_tof_packet(depth_oriented, confidence_oriented)
+                    )
+                    self.preview_pub.publish(
+                        make_compressed_image(jpeg, self.frame_id, stamp)
+                    )
                 except Exception as exc:
                     if not rclpy.ok() or self._stop.is_set():
                         break
-                    self.get_logger().error(f"Camera {self.camera_index} loop error: {exc}")
+                    self.get_logger().error(
+                        f"Camera {self.camera_index} loop error: {exc}"
+                    )
                     time.sleep(1.0)
         finally:
             if opened:
