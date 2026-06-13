@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, SetEnvironmentVariable
+from launch.conditions import IfCondition, UnlessCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -12,6 +13,9 @@ PACKAGE_NAME = "lituanicax_rc_car"
 def generate_launch_description() -> LaunchDescription:
     host = LaunchConfiguration("host")
     port = LaunchConfiguration("port")
+    disable_tof = LaunchConfiguration("disable_tof")
+    disable_policy = LaunchConfiguration("disable_policy")
+    enable_accel_test = LaunchConfiguration("enable_accel_test")
 
     return LaunchDescription(
         [
@@ -19,11 +23,15 @@ def generate_launch_description() -> LaunchDescription:
             SetEnvironmentVariable("RCUTILS_LOGGING_USE_STDOUT", "0"),
             DeclareLaunchArgument("host", default_value="0.0.0.0"),
             DeclareLaunchArgument("port", default_value="8080"),
+            DeclareLaunchArgument("disable_tof", default_value="false"),
+            DeclareLaunchArgument("disable_policy", default_value="false"),
+            DeclareLaunchArgument("enable_accel_test", default_value="false"),
             Node(
                 package=PACKAGE_NAME,
                 executable="tof_camera_node",
                 name="tof_camera_left",
                 output="screen",
+                condition=UnlessCondition(disable_tof),
                 parameters=[
                     {
                         "side": "left",
@@ -36,6 +44,7 @@ def generate_launch_description() -> LaunchDescription:
                 executable="tof_camera_node",
                 name="tof_camera_right",
                 output="screen",
+                condition=UnlessCondition(disable_tof),
                 parameters=[
                     {
                         "side": "right",
@@ -48,6 +57,7 @@ def generate_launch_description() -> LaunchDescription:
                 executable="policy_runner_node",
                 name="policy_runner",
                 output="screen",
+                condition=UnlessCondition(disable_policy),
                 parameters=[
                     {
                         "policy_hz": 30,
@@ -92,6 +102,13 @@ def generate_launch_description() -> LaunchDescription:
                         "stream_fps": 15,
                     }
                 ],
+            ),
+            Node(
+                package=PACKAGE_NAME,
+                executable="acceleration_test_node",
+                name="acceleration_test",
+                output="screen",
+                condition=IfCondition(enable_accel_test),
             ),
         ]
     )

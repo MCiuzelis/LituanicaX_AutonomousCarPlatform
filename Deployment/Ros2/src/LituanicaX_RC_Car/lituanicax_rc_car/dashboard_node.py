@@ -52,6 +52,8 @@ class DashboardNode(Node):
             "steer": 0.0,
             "battery": 0.0,
             "current": 0.0,
+            "velocity": 0.0,
+            "distance": 0.0,
             "active": False,
             "cpu_usage": 0.0,
             "cpu_temp": 0.0,
@@ -100,6 +102,8 @@ class DashboardNode(Node):
                 {
                     "battery": self._filtered_battery,
                     "current": float(msg.data[1]),
+                    "velocity": float(msg.data[6]) if len(msg.data) >= 7 else 0.0,
+                    "distance": float(msg.data[7]) if len(msg.data) >= 8 else 0.0,
                     "cpu_usage": self._filtered_cpu_usage,
                     "cpu_temp": self._filtered_cpu_temp,
                     "undervoltage": bool(msg.data[4]),
