@@ -91,6 +91,7 @@ class PolicyRunnerNode(Node):
         self.right = CameraState()
         self.enabled = False
         self.action_history = np.zeros(ACTION_HIST, dtype=np.float32)
+        self.wheel_vel_norm = 0.0
         self.camera_timeout_sec = float(self.get_parameter("camera_timeout_sec").value)
 
         self.cmd_pub = self.create_publisher(Float32MultiArray, "/cmd_drive", 1)
@@ -99,6 +100,7 @@ class PolicyRunnerNode(Node):
         self.create_subscription(UInt8MultiArray, "/camera/left/tof_packet", self._left_cb, sensor_qos())
         self.create_subscription(UInt8MultiArray, "/camera/right/tof_packet", self._right_cb, sensor_qos())
         self.create_subscription(Bool, "/autopilot/enabled", self._enabled_cb, 1)
+        self.create_subscription(Float32MultiArray, "/monitoring/telemetry", self._telemetry_cb, 1)
 
         period = 1.0 / float(self.get_parameter("policy_hz").value)
         self.timer = self.create_timer(period, self._tick)
@@ -122,6 +124,12 @@ class PolicyRunnerNode(Node):
         self.enabled = bool(msg.data)
         if not self.enabled:
             self.action_history[:] = 0.0
+            self.wheel_vel_norm = 0.0
+
+    def _telemetry_cb(self, msg: Float32MultiArray) -> None:
+        if len(msg.data) >= 7:
+            # Normalize wheel velocity (m/s) to [0, 1] exactly like in training (max_velocity_m_s = 6.7)
+            self.wheel_vel_norm = max(0.0, min(1.0, float(msg.data[6]) / 6.7))
 
     def _tick(self) -> None:
         now = time.monotonic()
@@ -141,7 +149,11 @@ class PolicyRunnerNode(Node):
 
         left_obs = process_for_policy(self.left.depth, self.left.confidence)
         right_obs = process_for_policy(self.right.depth, self.right.confidence)
-        obs = np.concatenate([left_obs, right_obs, self.action_history])[np.newaxis, :]
+        
+        # Temporarily replacing action_history with wheel_vel_norm
+        wheel_vel_arr = np.array([self.wheel_vel_norm], dtype=np.float32)
+        obs = np.concatenate([left_obs, right_obs, wheel_vel_arr])[np.newaxis, :]
+        # obs = np.concatenate([left_obs, right_obs, self.action_history])[np.newaxis, :]
 
         action = self.session.run([self.output_name], {self.input_name: obs})[0].clip(-1.0, 1.0)[0]
         throttle_raw = float(action[0])
