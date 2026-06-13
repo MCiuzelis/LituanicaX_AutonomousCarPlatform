@@ -23,6 +23,11 @@ if "ISAACLAB_LIBSTDCPP_FIXED" not in os.environ:
             os.environ["LD_PRELOAD"] = _libstdcpp
             os.execv(sys.executable, [sys.executable] + sys.argv)
 
+# Reduce PyTorch CUDA allocator fragmentation: returns unused blocks to the
+# system in smaller segments instead of holding giant cached arenas.
+# Must be set before any CUDA context is created (AppLauncher).
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 from isaaclab.app import AppLauncher
 
 # local imports
@@ -159,7 +164,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
 
     env_cfg.spawn_vel_min_m_s = 0.0
-    env_cfg.spawn_vel_max_m_s = 4.0
+    env_cfg.spawn_vel_max_m_s = 0.0
 
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
