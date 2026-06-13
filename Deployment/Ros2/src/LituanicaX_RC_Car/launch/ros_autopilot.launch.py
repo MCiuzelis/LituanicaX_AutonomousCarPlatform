@@ -62,7 +62,7 @@ def generate_launch_description() -> LaunchDescription:
                     {
                         "policy_hz": 30,
                         "camera_timeout_sec": 0.5,
-                        "onnx_threads": 4,
+                        "onnx_threads": 1,
                     }
                 ],
             ),
@@ -75,7 +75,18 @@ def generate_launch_description() -> LaunchDescription:
                     {
                         "command_timeout_sec": 0.25,
                         "monitoring_timeout_sec": 0.5,
-                        "telemetry_hz": 15,
+                        "telemetry_hz": 30,
+                    }
+                ],
+            ),
+            Node(
+                package=PACKAGE_NAME,
+                executable="encoder_node",
+                name="encoder",
+                output="screen",
+                parameters=[
+                    {
+                        "encoder_hz": 300.0,
                     }
                 ],
             ),
@@ -86,7 +97,7 @@ def generate_launch_description() -> LaunchDescription:
                 output="screen",
                 parameters=[
                     {
-                        "telemetry_hz": 15,
+                        "telemetry_hz": 30,
                     }
                 ],
             ),

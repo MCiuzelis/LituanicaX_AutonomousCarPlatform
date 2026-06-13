@@ -26,6 +26,7 @@ setup(
             "tof_camera_node = lituanicax_rc_car.tof_camera_node:main",
             "policy_runner_node = lituanicax_rc_car.policy_runner_node:main",
             "drive_node = lituanicax_rc_car.drive_node:main",
+            "encoder_node = lituanicax_rc_car.encoder_node:main",
             "monitoring_node = lituanicax_rc_car.monitoring_node:main",
             "dashboard_node = lituanicax_rc_car.dashboard_node:main",
             "acceleration_test_node = lituanicax_rc_car.acceleration_test_node:main",

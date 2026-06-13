@@ -20,6 +20,7 @@ from .common import (
     CAMERA_RIGHT_FLIP_VERTICAL,
     CAMERA_RIGHT_INDEX,
     CAMERA_SWAP_LEFT_RIGHT,
+    DASHBOARD_HZ,
 )
 
 MAX_DISTANCE_MM = 2000
@@ -179,6 +180,7 @@ class TofCameraNode(Node):
         self.declare_parameter("camera_index", -1)
         self.declare_parameter("frame_id", "")
         self.declare_parameter("max_distance_mm", MAX_DISTANCE_MM)
+        self.declare_parameter("preview_hz", DASHBOARD_HZ)
         self.declare_parameter("preview_topic", "")
         self.declare_parameter("packet_topic", "")
 
@@ -192,6 +194,8 @@ class TofCameraNode(Node):
         self.vertical_flip = vertical_flip_for_side(self.side)
         self.frame_id = str(self.get_parameter("frame_id").value) or f"tof_{self.side}"
         self.max_distance_mm = int(self.get_parameter("max_distance_mm").value)
+        self.preview_period = 1.0 / float(self.get_parameter("preview_hz").value)
+        self.last_preview_time = 0.0
 
         packet_topic = (
             str(self.get_parameter("packet_topic").value)
@@ -257,19 +261,24 @@ class TofCameraNode(Node):
                         confidence,
                         self.vertical_flip,
                     )
-                    jpeg = depth_to_jpeg(
-                        depth_oriented, confidence_oriented, depth_range
-                    )
 
                     if not rclpy.ok() or self._stop.is_set():
                         break
-                    stamp = self.get_clock().now().to_msg()
+
+                    now = time.monotonic()
                     self.packet_pub.publish(
                         make_tof_packet(depth_oriented, confidence_oriented)
                     )
-                    self.preview_pub.publish(
-                        make_compressed_image(jpeg, self.frame_id, stamp)
-                    )
+
+                    if now - self.last_preview_time >= self.preview_period:
+                        jpeg = depth_to_jpeg(
+                            depth_oriented, confidence_oriented, depth_range
+                        )
+                        stamp = self.get_clock().now().to_msg()
+                        self.preview_pub.publish(
+                            make_compressed_image(jpeg, self.frame_id, stamp)
+                        )
+                        self.last_preview_time = now
                 except Exception as exc:
                     if not rclpy.ok() or self._stop.is_set():
                         break
