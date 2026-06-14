@@ -16,6 +16,7 @@ def generate_launch_description() -> LaunchDescription:
     disable_tof = LaunchConfiguration("disable_tof")
     disable_policy = LaunchConfiguration("disable_policy")
     enable_accel_test = LaunchConfiguration("enable_accel_test")
+    enable_screenshot = LaunchConfiguration("enable_screenshot")
 
     return LaunchDescription(
         [
@@ -26,6 +27,7 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("disable_tof", default_value="false"),
             DeclareLaunchArgument("disable_policy", default_value="false"),
             DeclareLaunchArgument("enable_accel_test", default_value="false"),
+            DeclareLaunchArgument("enable_screenshot", default_value="false"),
             Node(
                 package=PACKAGE_NAME,
                 executable="tof_camera_node",
@@ -113,6 +115,13 @@ def generate_launch_description() -> LaunchDescription:
                         "stream_fps": 15,
                     }
                 ],
+            ),
+            Node(
+                package=PACKAGE_NAME,
+                executable="screenshot_grabber",
+                name="screenshot_grabber",
+                output="screen",
+                condition=IfCondition(enable_screenshot),
             ),
             Node(
                 package=PACKAGE_NAME,

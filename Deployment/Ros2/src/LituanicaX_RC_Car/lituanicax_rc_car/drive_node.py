@@ -27,6 +27,7 @@ from .common import (
     SERVO_MAX_US,
     SERVO_MIN_US,
     SERVO_OFFSET_US,
+    SERVO_PWM_CHANNEL,
     SERVO_PWM_FREQ,
     TELEMETRY_HZ,
 )
@@ -99,10 +100,12 @@ class DriveNode(Node):
         self._pinctrl_set(MOTOR_GPIO, "a0", "pd")
         self.motor_pwm = SysfsHardwarePWM(MOTOR_PWM_CHANNEL, MOTOR_PWM_FREQ, initial_pulse_ns=0)
 
-        # Servo: software PWM via RPi.GPIO (GPIO 13, 50 Hz)
-        GPIO.setup(SERVO_GPIO, GPIO.OUT)
-        self.servo_pwm = GPIO.PWM(SERVO_GPIO, SERVO_PWM_FREQ)
-        self.servo_pwm.start(0)
+        # Servo: sysfs hardware PWM (channel 1, 50 Hz)
+        # CONVERTED from RPi.GPIO software PWM to sysfs hardware PWM to avoid
+        # RP1 PWM block conflicts between RPi.GPIO and sysfs on Pi 5.
+        # Revert: replace with GPIO.setup(SERVO_GPIO, GPIO.OUT) and GPIO.PWM(...)
+        self._pinctrl_set(SERVO_GPIO, "a0", "pd")
+        self.servo_pwm = SysfsHardwarePWM(SERVO_PWM_CHANNEL, SERVO_PWM_FREQ, initial_pulse_ns=SERVO_CENTER_US * 1000)
 
         self.telemetry_pub = self.create_publisher(Float32MultiArray, "/drive/telemetry", 1)
         self.create_subscription(Float32MultiArray, "/cmd_drive", self._cmd_cb, 1)
@@ -131,20 +134,23 @@ class DriveNode(Node):
         GPIO.output(PIN_INB, GPIO.HIGH if value < 0 else GPIO.LOW)
         self.motor_pwm.set_duty_fraction(abs(value))
 
-    # --- servo: software PWM via RPi.GPIO ---
+    # --- servo: sysfs hardware PWM (channel 1, 50 Hz) ---
+    # CONVERTED from RPi.GPIO.ChangeDutyCycle to sysfs set_pulse_ns.
+    # Revert: restore _steering_duty returning percentage and _set_steering
+    # calling self.servo_pwm.ChangeDutyCycle(self._steering_duty(value))
 
     @staticmethod
-    def _steering_duty(value: float) -> float:
+    def _steering_pulse_ns(value: float) -> int:
         value = max(-1.0, min(1.0, value))
         value = value * SERVO_DIRECTION * SERVO_AMPLITUDE
 
         span = (SERVO_MAX_US - SERVO_MIN_US) / 2
-        pulse = SERVO_CENTER_US + SERVO_OFFSET_US + (value * span)
-        pulse = max(SERVO_MIN_US, min(SERVO_MAX_US, pulse))
-        return (pulse / 20000.0) * 100.0
+        pulse_us = SERVO_CENTER_US + SERVO_OFFSET_US + (value * span)
+        pulse_us = max(SERVO_MIN_US, min(SERVO_MAX_US, pulse_us))
+        return int(pulse_us * 1000)
 
     def _set_steering(self, value: float) -> None:
-        self.servo_pwm.ChangeDutyCycle(self._steering_duty(value))
+        self.servo_pwm.set_pulse_ns(self._steering_pulse_ns(value))
 
     # --- callbacks ---
 
@@ -210,16 +216,17 @@ class DriveNode(Node):
                 self.motor_pwm.stop()
                 GPIO.cleanup()
                 self._pinctrl_set(MOTOR_GPIO, "a0", "pd")
+                self._pinctrl_set(SERVO_GPIO, "a0", "pd")
                 self._stopped = True
         finally:
             return super().destroy_node()
 
 
 def main(args=None) -> None:
-    # Raise this process to real-time priority so lgpio's software PWM
-    # kernel timers fire consistently even under CPU load from cameras
-    # and policy inference.  SCHED_RR at priority 1 is the lowest
-    # real-time level — it won't starve the system.
+    # Raise this process to real-time priority so sysfs PWM duty-cycle
+    # writes fire consistently even under CPU load from cameras and
+    # policy inference.  SCHED_RR at priority 1 is the lowest real-time
+    # level — it won't starve the system.
     try:
         param = os.sched_param(1)
         os.sched_setscheduler(0, os.SCHED_RR, param)
