@@ -332,7 +332,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     ground_static_friction: float = 2.0  # static μ (grip before slip); traction ≈ μ·m·g
     ground_dynamic_friction: float = 1.6  # sliding μ (once a wheel breaks traction)
     suspension_stiffness: float = (
-        1e8  # suspension-joint lock stiffness (rigid; stops energy-sapping travel)
+        1e6  # suspension-joint lock stiffness (rigid; stops energy-sapping travel)
     )
     max_steer_rad: float = 0.488  # ≈28° max front-wheel steer angle
 
@@ -365,7 +365,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # REWARD WEIGHTS
     # ════════════════════════════════════════════════════════════════════════
     # Constant reward per step the agent stays alive (not crashed / stuck).
-    alive_weight: float = 0.012
+    alive_weight: float = 0.03  # 0.04
 
     # Distance: rewards physical metres covered each step (v × dt).
     distance_weight: float = 4.0
@@ -388,7 +388,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     throttle_rate_weight: float = 0.007
 
     # Wheel slip penalty: penalises the difference between theoretical wheel speed and actual car speed.
-    slip_weight: float = 0.45
+    slip_weight: float = 2.0
 
     # Proximity speed penalty: penalises going fast when a wall is close along the
     # car's current velocity direction.  Each step a 2D ray is cast from the car
@@ -399,7 +399,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     #     r = -weight × speed_norm × max(0, 1 − dist_m / proximity_lookahead_m)
     # so it is largest when the car is fast AND the wall is close in front of it
     # (corner entry).  Set to 0.0 to disable entirely.
-    proximity_speed_weight: float = 0.0
+    proximity_speed_weight: float = 0.01
     proximity_lookahead_m: float = 2.0  # walls farther than this give zero signal
 
     # Braking reward V2: dense, instantaneous, no session state.
@@ -424,7 +424,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # dense distance reward (~25/sec at top speed → ~750 per 30 s lap).
     # Until the agent can actually finish a lap this reward stays at 0, so it has
     # no effect on early training.
-    lap_reward_weight: float = 12.0  # rescaled to the new O(10) return scale; pays
+    lap_reward_weight: float = 8.0  # rescaled to the new O(10) return scale; pays
     # more for faster laps (lap_max/lap_time, 20-40 s)
     lap_return_radius_m: float = (
         0.3  # start circle: leaving it starts the lap timer; crossing the
@@ -1481,7 +1481,7 @@ class ConeTrackEnv(DirectRLEnv):
             r_proximity_speed = (
                 -self.cfg.proximity_speed_weight
                 * closeness
-                * torch.pow(speed_norm, 2)
+                * speed_norm
                 * moving.float()
             )
         else:
