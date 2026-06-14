@@ -14,7 +14,7 @@ from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Bool, Float32MultiArray, UInt8MultiArray
 
-from .common import POLICY_HZ
+from .common import BRAKE_MAGNITUDE, POLICY_HZ
 from .tof_camera_node import ACTION_HIST, OBS_DIM, process_for_policy, unpack_tof_packet
 
 
@@ -93,6 +93,8 @@ class PolicyRunnerNode(Node):
         self.enabled = False
         self.action_history = np.zeros(ACTION_HIST, dtype=np.float32)
         self.wheel_vel_norm = 0.0
+        self._wheel_vel_filtered = 0.0
+        self._wheel_vel_alpha = 0.1
         self.camera_timeout_sec = float(self.get_parameter("camera_timeout_sec").value)
 
         self.cmd_pub = self.create_publisher(Float32MultiArray, "/cmd_drive", 1)
@@ -126,11 +128,13 @@ class PolicyRunnerNode(Node):
         if not self.enabled:
             self.action_history[:] = 0.0
             self.wheel_vel_norm = 0.0
+            self._wheel_vel_filtered = 0.0
 
     def _encoder_cb(self, msg: Float32MultiArray) -> None:
         if len(msg.data) >= 2:
-            # Normalize wheel velocity (m/s) to [0, 1] exactly like in training (max_velocity_m_s = 6.7)
-            self.wheel_vel_norm = max(0.0, min(1.0, float(msg.data[0]) / 6.7))
+            raw = max(0.0, min(1.0, float(msg.data[0]) / 6.7))
+            self._wheel_vel_filtered = self._wheel_vel_alpha * raw + (1.0 - self._wheel_vel_alpha) * self._wheel_vel_filtered
+            self.wheel_vel_norm = self._wheel_vel_filtered
 
     def _tick(self) -> None:
         now = time.monotonic()
@@ -159,7 +163,7 @@ class PolicyRunnerNode(Node):
         action = self.session.run([self.output_name], {self.input_name: obs})[0].clip(-1.0, 1.0)[0]
         throttle_raw = float(action[0])
         steer = float(action[1])
-        throttle_motor = (throttle_raw + 1.0) / 2.0
+        throttle_motor = throttle_raw if throttle_raw >= 0 else throttle_raw * BRAKE_MAGNITUDE
 
         self.action_history = np.roll(self.action_history, -2)
         self.action_history[-2] = throttle_raw

@@ -30,6 +30,7 @@ setup(
             "monitoring_node = lituanicax_rc_car.monitoring_node:main",
             "dashboard_node = lituanicax_rc_car.dashboard_node:main",
             "acceleration_test_node = lituanicax_rc_car.acceleration_test_node:main",
+            "screenshot_grabber = lituanicax_rc_car.screenshot_grabber:main",
         ],
     },
 )
