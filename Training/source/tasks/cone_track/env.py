@@ -288,7 +288,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
 
     # slow_stop_speed_fraction — episode terminates when speed falls below this
     # (catches truly stuck / reversed agents; keep low so normal braking is fine)
-    slow_stop_speed_fraction: float = 0.01  # terminate if speed < 3 % of vel_cap
+    slow_stop_speed_fraction: float = 0.03  # terminate if speed < 3 % of vel_cap
 
     # ════════════════════════════════════════════════════════════════════════
     # OBSERVATION EXTRAS
@@ -304,7 +304,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # REWARD WEIGHTS
     # ════════════════════════════════════════════════════════════════════════
     # Constant reward per step the agent stays alive (not crashed / stuck).
-    alive_weight: float = 0.0  # 0.04
+    alive_weight: float = 0.015
 
     # Distance: rewards physical metres covered each step (v × dt).
     distance_weight: float = 4.0
@@ -351,11 +351,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # dense distance reward (~25/sec at top speed → ~750 per 30 s lap).
     # Until the agent can actually finish a lap this reward stays at 0, so it has
     # no effect on early training.
-    lap_reward_weight: float = 8.0  # rescaled to the new O(10) return scale; pays
-    # more for faster laps (lap_max/lap_time, 20-40 s)
-    lap_return_radius_m: float = (
-        0.3  # start circle: leaving it starts the lap timer; crossing the
-    )
+    lap_reward_weight: float = 12.0
     # start line while back inside closes the lap
     lap_min_time_s: float = 20.0  # lower clamp (caps maximum reward per lap)
     lap_max_time_s: float = 50.0  # upper clamp & numerator anchor
