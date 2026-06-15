@@ -123,6 +123,11 @@ import tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
+# Register custom CNN-ActorCritic so rsl_rl's eval("ConeTrackActorCritic") resolves
+import rsl_rl.runners.on_policy_runner
+from tasks.cone_track.agents.actor_critic_vision import ConeTrackActorCritic
+rsl_rl.runners.on_policy_runner.ConeTrackActorCritic = ConeTrackActorCritic
+
 # import logger
 logger = logging.getLogger(__name__)
 

@@ -1,19 +1,17 @@
 """MuSHR nano v2 RC car — cone-track navigation environment (DirectRLEnv).
 
 Observation space:
-    [0:N]        flattened depth image from LEFT ArduCam TOF camera (+35° yaw), after crop.
-                 Normalized: 1.0 = object at 0 m (danger), 0.0 = object at depth_max_m (clear).
-    [N:2N]       flattened depth image from RIGHT ArduCam TOF camera (−35° yaw), same pipeline.
-    [2N]         average wheel surface speed ∈ [0, 1], normalized by max_velocity_m_s.
-                 Computed as mean(|joint_vel[all 4 throttle joints]|) × WHEEL_RADIUS / max_velocity_m_s.
-                 Only appended when include_wheel_vel=True.
-                 Matches real hardware: wheel encoders give rotation rate directly.
+    [0:N]        flattened blue-mask image from center RGB camera, after HSV filtering
+                 and downsampling.  1.0 = blue cone pixel, 0.0 = non-blue pixel.
+    [N]          (optional) average wheel surface speed ∈ [0, 1], normalized by
+                 max_velocity_m_s.  Only appended when include_wheel_vel=True.
 
-Camera profile (ArduCam TOF sensor for Raspberry Pi):
-    - Sensor: Time-of-Flight depth, 240×180 pixels at 30 fps
-    - Diagonal FOV: 70°  →  HFOV ≈ 58.5°, VFOV ≈ 45.6°  (4:3 aspect, pinhole)
-    - Depth accuracy: ±2 cm (simulated via Gaussian noise σ ≈ 0.007 m)
-    - Policy runs at 30 Hz, synced with camera (sim 240 Hz, decimation=8)
+Camera profile (center RGB camera):
+    - Sensor: RGB, 848×480 at 120 fps
+    - FOV: 120°(H) × 66.7°(V) pinhole
+    - Blue-only HSV mask: only blue pixels pass; everything else is crushed to black.
+      Shadows are suppressed by the mask, producing a clean high-contrast binary image.
+    - Policy runs at 120 Hz (sim 480 Hz, decimation=4)
 
 Action space (2):
     [0]  throttle command in [-1, 1] — forward-only (the car never reverses):
@@ -33,12 +31,12 @@ Actuation (Ackermann / AWD, effort-controlled DC motor):
     - Front wheel steer receives position target (rad) = tan(steering_angle)
       (tan-convention matches the joint representation in mushr_nano_v2.usd)
 
-Why depth camera vs RGB cone mask:
-    The depth camera gives the policy direct metric information about wall and obstacle
-    proximity.  A shallow corner looks identical in RGB (just more cone pixels) but
-    in depth the wall is visibly close.  This makes braking-before-corners learnable:
-    the agent can correlate "high depth values filling the frame → wall approaching →
-    reduce throttle" without needing to understand color or stripe classification.
+Why blue-mask RGB:
+    A single center RGB camera with HSV blue filtering gives the policy a high-contrast
+    binary image where only the blue track stripes / cones are visible.  Shadows and
+    background are suppressed by the mask, providing a clean signal for RL training —
+    the agent learns to follow blue features without being distracted by lighting or
+    texture variation.
 
 Termination conditions:
     - Wall contact: any horizontal normal force on robot links above wall_contact_force_thresh_n
@@ -48,7 +46,6 @@ Termination conditions:
 TUNING NOTES (first run):
     - All adjustable parameters are in ConeTrackEnvCfg in one place below.
     - Spawn position: set preset_spawn_points in cfg.
-    - Camera crop: depth_crop_top_fraction, depth_crop_bottom_fraction.
     - Drivetrain: drive_torque (acceleration), brake_torque_gain (braking strength),
       max_velocity_m_s (no-load top speed), brake_release_omega, suspension_stiffness.
 """
@@ -76,6 +73,15 @@ from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.math import quat_from_euler_xyz
 
+from .parameters import (
+    CAM_H,
+    CAM_W,
+    DOWNSAMPLING_AMOUNT,
+    INCLUDE_WHEEL_VEL,
+    VISION_CROP_BOTTOM_FRACTION,
+    VISION_CROP_TOP_FRACTION,
+)
+
 # ---------------------------------------------------------------------------
 # Asset USD paths  (relative to this file → project root → assets/)
 # ---------------------------------------------------------------------------
@@ -86,21 +92,8 @@ _REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "../../../
 _EXPORT_DIR = os.path.join(_REPO_ROOT, "CAD", "Track", "Export")
 
 MUSHR_USD = os.path.join(_ASSETS_DIR, "mushr_nano_v2.usd")
-TRACK_USD = os.path.join(_EXPORT_DIR, "Track.usdc")
+TRACK_USD = os.path.join(_EXPORT_DIR, "Lines.usdc")
 WALL_USD = os.path.join(_EXPORT_DIR, "Walls.usdc")
-
-# Decorative asset sets — purely visual objects the depth cameras see.
-# Index NUM_ASSET_SETS means "no decorations" (all sets hidden).
-ASSET_SET_USDS = [
-    os.path.join(_EXPORT_DIR, "Assets1.usdc"),
-    os.path.join(_EXPORT_DIR, "Assets2.usdc"),
-    os.path.join(_EXPORT_DIR, "Assets3.usdc"),
-    os.path.join(_EXPORT_DIR, "Assets4.usdc"),
-    os.path.join(_EXPORT_DIR, "Assets5.usdc"),
-]
-NUM_ASSET_SETS = len(
-    ASSET_SET_USDS
-)  # randomisation draws from [0, NUM_ASSET_SETS] inclusive
 
 # ---------------------------------------------------------------------------
 # Physical constants — MuSHR nano v2 (fixed by the USD / hardware)
@@ -109,25 +102,16 @@ NUM_ASSET_SETS = len(
 # ---------------------------------------------------------------------------
 WHEEL_RADIUS = 0.037  # m  (82 mm diameter wheels)
 
-TRACK_SCALE = 0.85
+TRACK_SCALE = 0.8
 
 # ---------------------------------------------------------------------------
-# ArduCam TOF camera optics  (derived from 70° diagonal FOV, 240×180 sensor)
-#   f (pixels)        = diag_pixels / 2 / tan(diag_half) = 150 / tan(35°) ≈ 214.2 px
-#   HFOV              = 2 * arctan(120 / 214.2) ≈ 58.52°
-#   VFOV              = 2 * arctan(90  / 214.2) ≈ 45.57°
-#
-# For Isaac PinholeCameraCfg we pick an arbitrary focal_length_mm and derive
-# the aperture so the ratio h_aperture / focal_length = 2 * tan(HFOV/2).
+# Center RGB camera optics (IMX708, f=2.87mm, FOV 120°×66.7°)
+# Focal length matches spec sheet; aperture ratio is what sets the FOV.
+# For Isaac PinholeCameraCfg: aperture / focal_length = 2 * tan(FOV/2).
 # ---------------------------------------------------------------------------
-_TOF_DIAG_FOV_DEG = 70.0
-_TOF_DIAG_PIXELS = math.sqrt(240**2 + 180**2)  # 300 px
-_TOF_FOCAL_PX = _TOF_DIAG_PIXELS / 2.0 / math.tan(math.radians(_TOF_DIAG_FOV_DEG / 2.0))
-_TOF_HFOV_DEG = 2.0 * math.degrees(math.atan2(120.0, _TOF_FOCAL_PX))  # ≈ 58.52°
-_TOF_VFOV_DEG = 2.0 * math.degrees(math.atan2(90.0, _TOF_FOCAL_PX))  # ≈ 45.57°
-_TOF_FOCAL_MM = 4.0  # reference focal length (mm); aperture ratio is what matters
-_TOF_H_APERTURE_MM = 2.0 * _TOF_FOCAL_MM * math.tan(math.radians(_TOF_HFOV_DEG / 2.0))
-_TOF_V_APERTURE_MM = 2.0 * _TOF_FOCAL_MM * math.tan(math.radians(_TOF_VFOV_DEG / 2.0))
+_RGB_FOCAL_MM = 2.87
+_RGB_H_APERTURE_MM = 2.0 * _RGB_FOCAL_MM * math.tan(math.radians(120.0 / 2.0))
+_RGB_V_APERTURE_MM = 2.0 * _RGB_FOCAL_MM * math.tan(math.radians(66.7 / 2.0))
 
 # Robot links monitored for wall contact.
 WALL_CONTACT_LINKS = (
@@ -150,7 +134,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
 
     Sections
     --------
-    CAMERA          — sensor resolution, FOV, depth range, crop, noise
+    CAMERA          — center RGB, 848×480, 120 fps, blue-mask pipeline
     SPAWN           — starting position, heading, and speed
     SPAWN SPEED     — initial episode velocity range
     DYNAMICS        — physics-based motor model, steering limit
@@ -160,16 +144,18 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     """
 
     # ── Core env parameters ────────────────────────────────────────────────
-    decimation: int = 8  # policy at ~30 Hz  (sim 240 Hz / 8)
-    episode_length_s: float = 90.0  # 180 s × 30 Hz = 5 400 steps
+    policy_hz: int = 60  # policy running frequency (Hz)
+    decimation: int = 4  # sim steps per policy step
+    episode_length_s: float = 90.0  # episode duration in seconds
     action_space: int = 2
     # observation_space is patched in ConeTrackEnv.__init__ after computing
-    # the exact cropped depth image size.  The placeholder below keeps
+    # the exact cropped vision mask size.  The placeholder below keeps
     # @configclass happy; the real value is written before super().__init__().
     observation_space: int = 1  # patched in __init__
     state_space: int = 0
 
-    sim: SimulationCfg = SimulationCfg(dt=1.0 / 240.0, render_interval=8)
+    # sim.dt and sim.render_interval are set in __post_init__ from policy_hz & decimation
+    sim: SimulationCfg = SimulationCfg()
 
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
         num_envs=26,
@@ -178,68 +164,30 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     )
 
     # ════════════════════════════════════════════════════════════════════════
-    # CAMERA — ArduCam TOF (240×180, 30 fps, 70° diagonal FOV)
+    # CAMERA — center RGB (848×480, 120 fps, 120°×66.7° FOV)
     # ════════════════════════════════════════════════════════════════════════
-    # Crop fractions (fraction of raw pixel rows discarded before the policy):
-    #   top  → removes ceiling / sky (depth = max / inf)
-    #   bottom → removes near-ground clutter and the robot's own body shadow
-    depth_crop_top_fraction: float = 0.375
-    depth_crop_bottom_fraction: float = 0.45
+    # The raw RGB frame is HSV-filtered for blue pixels → binary mask (white =
+    # blue detected, black = everything else).  Shadows are suppressed by the
+    # value-channel lower bound.  The binary mask is then cropped (top/bottom
+    # fractions) and downsampled to (W/downsampling_amount) × (H/downsampling_amount).
 
-    # Gaussian depth noise: σ ≈ 0.007 m gives a ±2 cm (3σ) error band,
-    # matching the ArduCam TOF spec.  Set to 0.0 to disable.
-    depth_noise_sigma_m: float = 0.007
-
-    # Random invalid-pixel dropout: each pixel is independently zeroed with this
-    # probability, replicating the black-spec speckle noise visible in real ArduCam
-    # TOF output.  Affected pixels are set to depth_max_m (treated as far/safe by the
-    # policy, matching the real camera's low-confidence masking behaviour).
-    # Visible as black dots in both windows of visualize.py.  Set to 0.0 to disable.
-    depth_invalid_pixel_prob: float = 0.008
-
-    # Random-depth (coloured) speckle: each pixel is set to a uniform random depth in
-    # [0, depth_max_m] with this probability.  Models stray reflections and multi-path
-    # interference that appear as bright or mid-range dots (unlike depth_invalid_pixel_prob
-    # which always sets the pixel to the far/black depth_max_m value).
-    # Set to 0.0 to disable.
-    depth_color_noise_prob: float = 0.006
-
-    # Edge blur noise — simulates the mixed-pixel / depth-bleeding artefact common in
-    # real ToF sensors: pixels whose sensing area straddles a depth discontinuity report
-    # a value somewhere between the two depths rather than either clean value.
-    # Implementation: L1 gradient |∇depth| is computed on the CLEAN cropped depth frame
-    # (before any other noise), then Gaussian noise with
-    #   std = depth_edge_noise_sigma_m × clamp(|∇depth| / depth_edge_gradient_threshold_m, 0, 1)
-    # is added.  Only pixels at depth edges receive meaningful extra noise.
-    # Set depth_edge_noise_sigma_m = 0.0 to disable entirely.
-    depth_edge_gradient_threshold_m: float = (
-        0.15  # gradient (m/px) that gives edge_weight = 1
-    )
-    # Mixed-pixel scatter: edge pixels randomly jump to 0 m or depth_max_m (binary wrong-side
-    # values — models the individual black/red dots seen on real ToF sensors at boundaries).
-    depth_edge_scatter_prob: float = 0.25
-    # Small continuous Gaussian blur layered on top of the scatter, adds the faint soft halo
-    # visible around object edges on the real camera alongside the point scatter.
-    depth_edge_blur_sigma_m: float = 0.085
-
-    # Depth range for normalization.  Readings > depth_max_m are clamped.
-    # Must match autopilot.py MAX_DISTANCE / 1000.  ArduCam supports 2000 mm or 4000 mm only.
-    depth_max_m: float = 2.0
+    # Crop fractions: fraction of raw pixel rows discarded before downsampling.
+    #   top    → removes sky / distant background
+    #   bottom → removes near-ground clutter and the robot's own body
+    vision_crop_top_fraction: float = VISION_CROP_TOP_FRACTION
+    vision_crop_bottom_fraction: float = VISION_CROP_BOTTOM_FRACTION
 
     # ── Policy image downsampling ──────────────────────────────────────────
-    # After cropping the raw depth frame (240×≈40 at defaults) the image is
-    # bilinearly downsampled to this resolution before being flattened into
-    # the observation vector.  Smaller = faster MLP convergence.
-    # policy_depth_height < 0 → auto-compute from cropped aspect ratio.
-    policy_depth_width: int = 120
-    policy_depth_height: int = -1
+    # After HSV filtering and cropping, the binary mask is downsampled by this
+    # factor in both dimensions before being flattened into the observation vector.
+    downsampling_amount: int = DOWNSAMPLING_AMOUNT
 
     # ════════════════════════════════════════════════════════════════════════
     # SPAWN — initial robot position, heading, and speed
     # ════════════════════════════════════════════════════════════════════════
     # Grace period after each reset: wall / flip / stuck terminations are suppressed
     # for this many policy steps so that PhysX contact forces can settle.
-    # 10 steps ≈ 333 ms at 30 Hz — enough for any spawn-physics transient.
+    # 10 steps ≈ 83 ms at 120 Hz — enough for any spawn-physics transient.
     spawn_grace_steps: int = 10
 
     # ── Spawn mode ────────────────────────────────────────────────────────────
@@ -273,15 +221,6 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # Set spawn_escape_reward=0 to disable.
     spawn_escape_radius_m: float = 0.5
     spawn_escape_reward: float = 0.0
-
-    # ════════════════════════════════════════════════════════════════════════
-    # SPAWN SPEED — initial robot velocity at each episode reset
-    # ════════════════════════════════════════════════════════════════════════
-    spawn_vel_min_m_s: float = 0.0  # minimum spawn speed (m/s)
-    # Curriculum: spawn across a velocity range so the policy practises control at
-    # speed instead of over-sampling the slow start regime (which reinforces the
-    # cautious / slow-acceleration local optimum).  play.py forces this to 0.
-    spawn_vel_max_m_s: float = 0.0  # maximum spawn speed (m/s)
 
     # ════════════════════════════════════════════════════════════════════════
     # DYNAMICS — effort-controlled DC-motor drivetrain (AWD), tuned to real car
@@ -337,9 +276,9 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     max_steer_rad: float = 0.488  # ≈28° max front-wheel steer angle
 
     # Action latency simulation — all actuator commands are delayed by this many
-    # milliseconds before reaching the wheels/steering.  At 30 Hz each step ≈ 33 ms,
+    # milliseconds before reaching the wheels/steering.  At 120 Hz each step ≈ 8.33 ms,
     # so 100 ms ≈ 3 policy steps.  Set to 0.0 to disable.
-    action_delay_ms: float = 33.0
+    action_delay_ms: float = 17.0
 
     # ════════════════════════════════════════════════════════════════════════
     # TERMINATION THRESHOLDS
@@ -349,7 +288,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
 
     # slow_stop_speed_fraction — episode terminates when speed falls below this
     # (catches truly stuck / reversed agents; keep low so normal braking is fine)
-    slow_stop_speed_fraction: float = 0.03  # terminate if speed < 3 % of vel_cap
+    slow_stop_speed_fraction: float = 0.01  # terminate if speed < 3 % of vel_cap
 
     # ════════════════════════════════════════════════════════════════════════
     # OBSERVATION EXTRAS
@@ -359,13 +298,13 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # This is the primary speed signal — essential for braking-before-corners.
     # On real hardware: read wheel encoder RPM, average all 4, multiply by WHEEL_RADIUS,
     # divide by max_velocity_m_s, clamp to [0, 1].
-    include_wheel_vel: bool = True
+    include_wheel_vel: bool = INCLUDE_WHEEL_VEL
 
     # ════════════════════════════════════════════════════════════════════════
     # REWARD WEIGHTS
     # ════════════════════════════════════════════════════════════════════════
     # Constant reward per step the agent stays alive (not crashed / stuck).
-    alive_weight: float = 0.03  # 0.04
+    alive_weight: float = 0.0  # 0.04
 
     # Distance: rewards physical metres covered each step (v × dt).
     distance_weight: float = 4.0
@@ -388,19 +327,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     throttle_rate_weight: float = 0.007
 
     # Wheel slip penalty: penalises the difference between theoretical wheel speed and actual car speed.
-    slip_weight: float = 2.0
-
-    # Proximity speed penalty: penalises going fast when a wall is close along the
-    # car's current velocity direction.  Each step a 2D ray is cast from the car
-    # along its world-frame linear velocity vector against /World/Walls (the same
-    # invisible mesh used for termination — visibility, collision, and termination
-    # behaviour are untouched, only the cached 2D footprint is read once at startup).
-    # The closest intersection along the ray gives `dist_m`; the penalty is then
-    #     r = -weight × speed_norm × max(0, 1 − dist_m / proximity_lookahead_m)
-    # so it is largest when the car is fast AND the wall is close in front of it
-    # (corner entry).  Set to 0.0 to disable entirely.
-    proximity_speed_weight: float = 0.01
-    proximity_lookahead_m: float = 2.0  # walls farther than this give zero signal
+    slip_weight: float = 0.5
 
     # Braking reward V2: dense, instantaneous, no session state.
     #   r_braking_v2 = weight × forward_speed² × |brake_input|       (only when throttle < 0)
@@ -432,11 +359,6 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # start line while back inside closes the lap
     lap_min_time_s: float = 20.0  # lower clamp (caps maximum reward per lap)
     lap_max_time_s: float = 50.0  # upper clamp & numerator anchor
-
-    # How often to advance to the next asset set in the round-robin cycle (in policy steps).
-    # Set to num_steps_per_env / (NUM_ASSET_SETS * 2) so every set appears exactly twice
-    # per PPO iteration.  At num_steps_per_env=2000: 2000 / (5*2) = 200.
-    asset_randomize_every_n_steps: int = 200
 
     # ════════════════════════════════════════════════════════════════════════
     # HARDWARE CONFIG  (robot articulation + camera sensor)
@@ -501,8 +423,12 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     )
 
     def __post_init__(self):
-        """Build the drivetrain actuators from the tunable scalar fields so that a
-        single edit in this cfg propagates to every script that uses the env."""
+        """Derive timing and drivetrain actuators from the scalar config fields."""
+        # ── Timing: sim dt and camera update from policy_hz & decimation ──────
+        self.sim.dt = 1.0 / (self.decimation * self.policy_hz)
+        self.sim.render_interval = self.decimation
+        self.camera_center_cfg.update_period = 1.0 / self.policy_hz
+
         # Throttle wheels: pure effort (torque) control.  Zero stiffness/damping so the
         # per-wheel torque computed in _pre_physics_step (DC drive curve + graded brake)
         # is applied verbatim via set_joint_effort_target.  effort_limit_sim is set well
@@ -528,72 +454,28 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
             velocity_limit_sim=1e9,
         )
 
-    # Two ArduCam TOF depth cameras:
-    #   Position: 122 mm forward of base_link, ±50 mm left/right, 70 mm above base_link.
-    #   Orientation: ±27° yaw outward only — no pitch.
-    #
-    # Yaw is 27° (< HFOV/2 ≈ 29.26°) so the two camera frusta OVERLAP by ~4.5°
-    # dead-ahead, eliminating the forward blind cone that ±30° left between them.
-    # The car can now see straight ahead — needed to sense the wall at the end of
-    # a straight and to accelerate confidently out of the spawn.
-    # NOTE: this is a physical mounting angle — the real cameras must be remounted
-    # to ±27° for sim-to-real transfer to hold (autopilot.py uses the same pipeline).
-    #
-    # Rotation derivation (all quaternions in (w, x, y, z) ROS convention):
-    #   Start: q_forward = (-0.5, 0.5, -0.5, 0.5)  (camera level, pointing fwd in ROS)
-    #   Yaw  : q_yaw_z(±27°) * q_forward
-    #             left  (+27°): (-0.6029, 0.6029, -0.3695, 0.3695)
-    #             right (-27°): (-0.3695, 0.3695, -0.6029, 0.6029)
-    #   Result forward vectors in base_link frame:
-    #             left : (cos27°, sin27°, 0) = (0.891, 0.454, 0.000)
-    #             right: (cos27°, -sin27°, 0) = (0.891, -0.454, 0.000)
-    camera_left_cfg: TiledCameraCfg = TiledCameraCfg(
-        prim_path="/World/envs/env_.*/Robot/mushr_nano/base_link/camera_left",
-        update_period=8.0
-        / 240.0,  # render only at policy steps (decimation=8, sim=240Hz)
-        # Render at the sensor's native 240x180 to match the real ArduCam TOF.
-        # All noise effects are applied at this full resolution before cropping
-        # and downsampling, mirroring how the real camera produces noisy depth.
-        height=180,
-        width=240,
-        data_types=["distance_to_image_plane"],
+    # Center RGB camera (replaces the two depth cameras):
+    #   Position: 185 mm forward of base_link, centered (0 mm lateral), 20 mm above base_link.
+    #   Orientation: forward, no rotation.
+    camera_center_cfg: TiledCameraCfg = TiledCameraCfg(
+        prim_path="/World/envs/env_.*/Robot/mushr_nano/base_link/camera_center",
+        # update_period is set in __post_init__ from policy_hz
+        height=480,
+        width=848,
+        data_types=["rgb"],
         spawn=sim_utils.PinholeCameraCfg(
-            focal_length=_TOF_FOCAL_MM,
-            horizontal_aperture=_TOF_H_APERTURE_MM,
-            vertical_aperture=_TOF_V_APERTURE_MM,
-            clipping_range=(0.01, 5.0),
+            focal_length=_RGB_FOCAL_MM,
+            horizontal_aperture=_RGB_H_APERTURE_MM,
+            vertical_aperture=_RGB_V_APERTURE_MM,
+            clipping_range=(0.01, 100.0),
         ),
         offset=TiledCameraCfg.OffsetCfg(
             pos=(
-                0.185,
-                0.04,
-                -0.008,
-            ),  # 122 mm fwd, 50 mm left, 70 mm up from base_link
-            rot=(-0.6029, 0.6029, -0.3695, 0.3695),  # 27° yaw left, no pitch
-            convention="ros",
-        ),
-        debug_vis=False,
-    )
-    camera_right_cfg: TiledCameraCfg = TiledCameraCfg(
-        prim_path="/World/envs/env_.*/Robot/mushr_nano/base_link/camera_right",
-        update_period=8.0
-        / 240.0,  # render only at policy steps (decimation=8, sim=240Hz)
-        height=180,
-        width=240,
-        data_types=["distance_to_image_plane"],
-        spawn=sim_utils.PinholeCameraCfg(
-            focal_length=_TOF_FOCAL_MM,
-            horizontal_aperture=_TOF_H_APERTURE_MM,
-            vertical_aperture=_TOF_V_APERTURE_MM,
-            clipping_range=(0.01, 5.0),
-        ),
-        offset=TiledCameraCfg.OffsetCfg(
-            pos=(
-                0.185,
-                -0.04,
-                -0.008,
-            ),  # 122 mm fwd, 50 mm right, 70 mm up from base_link
-            rot=(-0.3695, 0.3695, -0.6029, 0.6029),  # 27° yaw right, no pitch
+                0.155,
+                0.0,
+                0.055,
+            ),
+            rot=(-0.5, 0.5, -0.5, 0.5),  # No rotation, looking forward
             convention="ros",
         ),
         debug_vis=False,
@@ -603,12 +485,6 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     show_camera_debug: bool = False
     camera_debug_env_id: int = 0
     camera_debug_interval: int = 2
-
-    # Spawn a pair of visible cones in the sim to verify camera placement.
-    # Tip at each camera sensor origin; base (wide end) pointing along the camera's
-    # look direction.  Left camera = cyan, right camera = magenta.
-    # Set to True for one training run, inspect in the viewport, then set back to False.
-    show_camera_cones: bool = False
 
 
 # ===========================================================================
@@ -623,37 +499,35 @@ class ConeTrackEnv(DirectRLEnv):
         # ContactSensor dict must exist before super().__init__() calls _setup_scene().
         self._wall_contact_sensors: dict[str, ContactSensor] = {}
 
-        # Compute exact depth observation size (same for both cameras).
-        # 1. Crop: remove top/bottom rows from the raw 240×180 frame.
-        # 2. Downsample: bilinear resize to policy_depth_width × policy_depth_height.
-        cam_h = cfg.camera_left_cfg.height  # 180
-        cam_w = cfg.camera_left_cfg.width  # 240
+        # Compute exact vision observation size.
+        # 1. Crop: remove top/bottom rows from the raw frame.
+        # 2. Downsample: bilinear resize by downsampling_amount in both axes.
+        cam_h = cfg.camera_center_cfg.height
+        cam_w = cfg.camera_center_cfg.width
         remaining = max(
-            0.0, 1.0 - cfg.depth_crop_top_fraction - cfg.depth_crop_bottom_fraction
+            0.0, 1.0 - cfg.vision_crop_top_fraction - cfg.vision_crop_bottom_fraction
         )
         cropped_h = max(1, int(cam_h * remaining))
         cropped_w = cam_w
 
-        self._policy_depth_w = cfg.policy_depth_width
-        if cfg.policy_depth_height < 0:
-            self._policy_depth_h = max(
-                1, round(cfg.policy_depth_width * cropped_h / cropped_w)
-            )
-        else:
-            self._policy_depth_h = cfg.policy_depth_height
+        ds = cfg.downsampling_amount
+        self._policy_depth_w = max(1, cropped_w // ds)
+        self._policy_depth_h = max(1, cropped_h // ds)
 
-        depth_obs_size = self._policy_depth_h * self._policy_depth_w
+        vision_obs_size = self._policy_depth_h * self._policy_depth_w
 
         extra_obs = 0
         if cfg.include_wheel_vel:
-            extra_obs += 1  # scalar: avg wheel surface speed normalized to [0, 1]
-        cfg.observation_space = depth_obs_size * 2 + extra_obs  # left + right cameras
+            extra_obs += 1
+
+        cfg.observation_space = vision_obs_size + extra_obs  # 1 camera
 
         print(
-            f"[ConeTrackEnv] Depth obs per camera: raw {cam_w}×{cam_h} "
+            f"[ConeTrackEnv] Vision obs: raw {cam_w}×{cam_h} "
             f"→ crop {cropped_w}×{cropped_h} "
             f"→ policy {self._policy_depth_w}×{self._policy_depth_h} "
-            f"= {depth_obs_size} px  |  2 cameras  |  "
+            f"= {vision_obs_size} px  |  "
+            f"+ veloc={cfg.include_wheel_vel}  |  "
             f"total obs = {cfg.observation_space}"
         )
 
@@ -724,7 +598,7 @@ class ConeTrackEnv(DirectRLEnv):
         # actuators receive the command issued delay_steps policy ticks ago.
         # The observation history still stores the undelayed policy output so the
         # network can reason about what it recently commanded vs what the car has done.
-        policy_dt = cfg.decimation * cfg.sim.dt  # ≈ 1/30 s
+        policy_dt = cfg.decimation * cfg.sim.dt  # ≈ 1/policy_hz s
         self._delay_steps = max(0, round(cfg.action_delay_ms * 1e-3 / policy_dt))
         buf_len = max(1, self._delay_steps + 1)
         self._action_delay_buf = torch.zeros(
@@ -775,45 +649,12 @@ class ConeTrackEnv(DirectRLEnv):
         self._spawn_escaped = torch.zeros(
             self.num_envs, dtype=torch.bool, device=self.device
         )
-        # Index of the currently active decorative asset set (-1 = none selected yet).
-        self._current_asset_set: int = -1
-        self._asset_step_counter: int = 0
-        self._asset_round_robin_idx: int = (
-            0  # advances each switch; modulo NUM_ASSET_SETS gives current set
-        )
-        # All asset sets are left visible during scene init so RTX builds their BVH
-        # structures at startup (cheap time slot). On the first physics step we hide
-        # all but one selected set. This flag tracks whether that warmup hide has run.
-        self._assets_warmup_done: bool = False
-
-        # Depth observation caches (policy resolution after crop + downsample)
+        # Vision observation caches (policy resolution after color filtering + downsample)
         _cam_flat = self._policy_depth_h * self._policy_depth_w
-        self._camera_left_obs = torch.zeros(
-            self.num_envs, _cam_flat, device=self.device
-        )
-        self._camera_right_obs = torch.zeros(
+        self._camera_center_obs = torch.zeros(
             self.num_envs, _cam_flat, device=self.device
         )
         self._last_camera_update_step = -1
-
-        # Wall geometry for the proximity_speed reward — ray-cast against the same
-        # /World/Walls mesh used for termination (visibility / collision untouched).
-        # Extracted once here and cached on-device for fast batched intersection.
-        _wall_segs = self._extract_wall_segments_xy()
-        if _wall_segs:
-            import numpy as _np
-
-            _seg_arr = torch.from_numpy(_np.asarray(_wall_segs, dtype=_np.float32)).to(
-                self.device
-            )
-            self._wall_seg_a = _seg_arr[:, 0, :].contiguous()  # [M, 2]
-            self._wall_seg_b = _seg_arr[:, 1, :].contiguous()  # [M, 2]
-            print(
-                f"[ConeTrackEnv] Proximity ray-cast: cached {_seg_arr.shape[0]} wall segments"
-            )
-        else:
-            self._wall_seg_a = None
-            self._wall_seg_b = None
 
     # ------------------------------------------------------------------
     # Scene setup
@@ -841,17 +682,6 @@ class ConeTrackEnv(DirectRLEnv):
             translation=(0, 0.0, 0.0),
             orientation=(0.0, 0.0, 0.0, 1.0),
         )
-
-        for set_idx, asset_usd in enumerate(ASSET_SET_USDS):
-            asset_cfg = sim_utils.UsdFileCfg(
-                usd_path=asset_usd, scale=(TRACK_SCALE, TRACK_SCALE, TRACK_SCALE)
-            )
-            asset_cfg.func(
-                f"/World/Assets/Set{set_idx}",
-                asset_cfg,
-                translation=(0.0, 0.0, 0.0),
-                orientation=(0.0, 0.0, 0.0, 1.0),
-            )
 
         import omni.usd
         from pxr import Usd, UsdGeom, UsdPhysics, UsdShade
@@ -920,8 +750,7 @@ class ConeTrackEnv(DirectRLEnv):
         )
         ground_cfg.func("/World/GroundPlane", ground_cfg)
 
-        self.camera_left = TiledCamera(self.cfg.camera_left_cfg)
-        self.camera_right = TiledCamera(self.cfg.camera_right_cfg)
+        self.camera_center = TiledCamera(self.cfg.camera_center_cfg)
         for link_name in WALL_CONTACT_LINKS:
             sensor_cfg = ContactSensorCfg(
                 prim_path=f"/World/envs/env_.*/Robot/mushr_nano/{link_name}",
@@ -940,64 +769,6 @@ class ConeTrackEnv(DirectRLEnv):
         phys_rubber.CreateStaticFrictionAttr().Set(1.0)
         phys_rubber.CreateDynamicFrictionAttr().Set(1.0)
         phys_rubber.CreateRestitutionAttr().Set(0.05)
-
-        # ── Debug camera-direction cones (disabled by default) ───────────────────
-        # Cone tip at camera sensor origin; base (wide end) along camera look direction.
-        # Cloned to all envs automatically.  Toggle: cfg.show_camera_cones = True.
-        if self.cfg.show_camera_cones:
-            import math as _math
-
-            from pxr import Gf
-
-            base_link_p = "/World/envs/env_0/Robot/mushr_nano/base_link"
-            cone_h, cone_r = 0.15, 0.025  # height (m), base radius (m)
-            for cam_name, cam_cfg, colour in (
-                ("camera_left", self.cfg.camera_left_cfg, (0.0, 1.0, 1.0)),  # cyan
-                ("camera_right", self.cfg.camera_right_cfg, (1.0, 0.0, 1.0)),  # magenta
-            ):
-                # Camera forward direction in base_link frame = R(q) · (0,0,1).
-                # Camera quaternion is (w, x, y, z) in ROS convention.
-                qw, qx, qy, qz = cam_cfg.offset.rot
-                fwd_x = 2.0 * (qx * qz + qw * qy)
-                fwd_y = 2.0 * (qy * qz - qw * qx)
-                fwd_z = 1.0 - 2.0 * (qx * qx + qy * qy)
-
-                # Cone centre = camera_pos + (h/2) * fwd  → tip lands at camera origin.
-                px, py, pz = cam_cfg.offset.pos
-                ccx = px + 0.5 * cone_h * fwd_x
-                ccy = py + 0.5 * cone_h * fwd_y
-                ccz = pz + 0.5 * cone_h * fwd_z
-
-                # Quaternion rotating cone's +Y onto fwd.
-                # cross((0,1,0), fwd) = (fwd_z, 0, -fwd_x); dot = fwd_y.
-                dot = fwd_y
-                cross_len = _math.sqrt(fwd_z**2 + fwd_x**2)
-                if cross_len < 1e-6:
-                    orient = (
-                        Gf.Quatf(1.0, 0.0, 0.0, 0.0)
-                        if dot > 0
-                        else Gf.Quatf(0.0, 1.0, 0.0, 0.0)
-                    )
-                else:
-                    w_q = _math.sqrt(max(0.0, 0.5 * (1.0 + dot)))
-                    k = _math.sqrt(max(0.0, 0.5 * (1.0 - dot))) / cross_len
-                    orient = Gf.Quatf(w_q, k * fwd_z, 0.0, k * (-fwd_x))
-
-                cone_prim = UsdGeom.Cone.Define(
-                    stage, f"{base_link_p}/{cam_name}_debug_cone"
-                )
-                cone_prim.CreateHeightAttr(cone_h)
-                cone_prim.CreateRadiusAttr(cone_r)
-                cone_prim.CreateAxisAttr("Y")
-                cone_prim.CreateDisplayColorAttr([Gf.Vec3f(*colour)])
-                xf = UsdGeom.Xformable(cone_prim.GetPrim())
-                xf.ClearXformOpOrder()
-                xf.AddTranslateOp().Set(Gf.Vec3d(ccx, ccy, ccz))
-                xf.AddOrientOp().Set(orient)
-                print(
-                    f"[CamCone] {cam_name}: tip=({px:.4f}, {py:.4f}, {pz:.4f})  "
-                    f"fwd=({fwd_x:.3f}, {fwd_y:.3f}, {fwd_z:.3f})"
-                )
 
         self.scene.clone_environments(copy_from_source=False)
 
@@ -1020,109 +791,12 @@ class ConeTrackEnv(DirectRLEnv):
                 )
 
         self.scene.articulations["robot"] = self.robot
-        self.scene.sensors["camera_left"] = self.camera_left
-        self.scene.sensors["camera_right"] = self.camera_right
+        self.scene.sensors["camera_center"] = self.camera_center
         for link_name, sensor in self._wall_contact_sensors.items():
             self.scene.sensors[f"wall_contact_{link_name}"] = sensor
 
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
-
-    # ------------------------------------------------------------------
-    # Wall geometry helper
-    # ------------------------------------------------------------------
-
-    def _extract_wall_segments_xy(self):
-        """Extract 2D line segments from /World/Walls for proximity ray-cast.
-
-        Read-only pass over the same wall mesh used for termination.  Each triangle
-        edge is projected to the XY plane; we keep only edges whose endpoints have
-        nearly equal Z so vertical wall edges (which collapse to a single point in
-        XY) are discarded and the wall's footprint is what remains.
-
-        Visibility, collision, and termination logic on /World/Walls are not modified.
-        Returns a list of [[ax, ay], [bx, by]] entries (world frame), or [] on failure.
-        """
-        try:
-            import omni.usd
-            from pxr import Gf, Usd, UsdGeom
-
-            stage = omni.usd.get_context().get_stage()
-            wall_root = stage.GetPrimAtPath("/World/Walls")
-            if not wall_root.IsValid():
-                print(
-                    "[ConeTrackEnv] /World/Walls not found — proximity ray-cast disabled"
-                )
-                return []
-
-            xf_cache = UsdGeom.XformCache()
-            segments: list = []
-
-            for prim in Usd.PrimRange(wall_root):
-                if not prim.IsA(UsdGeom.Mesh):
-                    continue
-                mesh = UsdGeom.Mesh(prim)
-                points_attr = mesh.GetPointsAttr().Get()
-                if points_attr is None:
-                    continue
-                counts_attr = mesh.GetFaceVertexCountsAttr().Get()
-                indices_attr = mesh.GetFaceVertexIndicesAttr().Get()
-                if counts_attr is None or indices_attr is None:
-                    continue
-
-                world_xf = xf_cache.GetLocalToWorldTransform(prim)
-                world_pts = [
-                    world_xf.Transform(Gf.Vec3d(float(p[0]), float(p[1]), float(p[2])))
-                    for p in points_attr
-                ]
-
-                idx_ptr = 0
-                for fc in counts_attr:
-                    face = [int(indices_attr[idx_ptr + i]) for i in range(fc)]
-                    idx_ptr += fc
-                    # Fan-triangulate, walk each triangle's 3 edges.
-                    for k in range(1, fc - 1):
-                        tri = (face[0], face[k], face[k + 1])
-                        pts3 = (world_pts[tri[0]], world_pts[tri[1]], world_pts[tri[2]])
-                        for e in range(3):
-                            a3 = pts3[e]
-                            b3 = pts3[(e + 1) % 3]
-                            # Drop vertical edges — they project to a point in XY.
-                            if abs(a3[2] - b3[2]) > 0.05:
-                                continue
-                            dx = b3[0] - a3[0]
-                            dy = b3[1] - a3[1]
-                            if dx * dx + dy * dy < 1e-4:
-                                continue
-                            segments.append(
-                                [
-                                    [float(a3[0]), float(a3[1])],
-                                    [float(b3[0]), float(b3[1])],
-                                ]
-                            )
-            return segments
-        except Exception as e:
-            print(f"[ConeTrackEnv] Wall segment extraction failed: {e}")
-            return []
-
-    def _set_active_assets(self, set_idx: int) -> None:
-        """Show asset set set_idx; hide all others."""
-        try:
-            import omni.usd
-            from pxr import UsdGeom
-
-            stage = omni.usd.get_context().get_stage()
-            for i in range(NUM_ASSET_SETS):
-                root = stage.GetPrimAtPath(f"/World/Assets/Set{i}")
-                if not root.IsValid():
-                    continue
-                if i == set_idx:
-                    UsdGeom.Imageable(root).MakeVisible()
-                else:
-                    UsdGeom.Imageable(root).MakeInvisible()
-            self._current_asset_set = set_idx
-        except Exception as e:
-            print(f"[Assets] Visibility toggle failed for set {set_idx}: {e}")
 
     # ------------------------------------------------------------------
     # Step hooks
@@ -1137,20 +811,6 @@ class ConeTrackEnv(DirectRLEnv):
         Latency model: raw actions are pushed into _action_delay_buf; actuators
         receive the command from delay_steps ticks ago.
         """
-        # On the very first physics step all asset sets are still visible (RTX has
-        # already built every BVH during sim init). Now hide all but set 0.
-        if not self._assets_warmup_done:
-            self._set_active_assets(0)
-            self._assets_warmup_done = True
-
-        # Round-robin asset cycling — each set appears exactly twice per PPO iteration.
-        # Sequence: 0,1,2,3,4,0,1,2,3,4,... advancing every asset_randomize_every_n_steps.
-        self._asset_step_counter += 1
-        if self._asset_step_counter >= self.cfg.asset_randomize_every_n_steps:
-            self._asset_step_counter = 0
-            self._asset_round_robin_idx += 1
-            self._set_active_assets(self._asset_round_robin_idx % NUM_ASSET_SETS)
-
         raw = actions[:, :2].clamp(-1.0, 1.0)  # [N, 2]  — undelayed policy output
 
         # Push into delay FIFO and read the oldest (delayed) entry
@@ -1242,106 +902,68 @@ class ConeTrackEnv(DirectRLEnv):
         self.robot.set_joint_position_target(steer_positions, joint_ids=self._steer_ids)
 
     # ------------------------------------------------------------------
-    # Depth camera cache  (called once per step, shared by obs + rewards)
+    # Vision cache  (called once per step, shared by obs + rewards)
     # ------------------------------------------------------------------
 
-    def _process_single_depth(self, camera) -> torch.Tensor:
-        """Shared depth pipeline for one TiledCamera → [N, policy_h*policy_w].
+    def _process_single_rgb(self, camera) -> torch.Tensor:
+        """Shared vision pipeline for RGB camera → [N, policy_h*policy_w] high-contrast binary mask.
 
-        Noise effects are applied at the camera's full 240×180 resolution before
-        cropping and downsampling, matching the real ArduCam TOF sensor pipeline.
+        Pipeline: raw RGB → blue HSV mask → crop (top/bottom rows) → downsample → hard threshold.
         """
+        import cv2
+        import numpy as np
         import torch.nn.functional as F
 
-        depth_raw = camera.data.output["distance_to_image_plane"]  # [N, H, W, 1]
-        depth = depth_raw[..., 0]  # [N, H, W]
-        depth = torch.where(
-            torch.isfinite(depth),
-            depth,
-            torch.tensor(self.cfg.depth_max_m, device=depth.device),
-        )
+        rgb_tensor = camera.data.output["rgb"][..., :3]
+        N, H, W, _ = rgb_tensor.shape
 
-        # Edge weights computed on the FULL-RESOLUTION CLEAN signal so that real
-        # depth discontinuities (not noise spikes) drive the mixed-pixel scatter.
-        if self.cfg.depth_edge_scatter_prob > 0.0:
-            _d4 = depth.unsqueeze(1)  # [N,1,H,W]
-            _px = F.pad(_d4, (1, 1, 0, 0), mode="replicate")  # [N,1,H,W+2]
-            _py = F.pad(_d4, (0, 0, 1, 1), mode="replicate")  # [N,1,H+2,W]
-            _dx = (_px[:, :, :, 2:] - _px[:, :, :, :-2]) * 0.5  # centred ∂/∂x
-            _dy = (_py[:, :, 2:, :] - _py[:, :, :-2, :]) * 0.5  # centred ∂/∂y
-            _edge_w = (
-                (_dx.abs() + _dy.abs()).squeeze(1)  # L1 grad [N,H,W]
-                / self.cfg.depth_edge_gradient_threshold_m
-            ).clamp(0.0, 1.0)
+        rgb_np = rgb_tensor.cpu().numpy().astype(np.uint8)
+        binary_masks = np.zeros((N, H, W), dtype=np.float32)
 
-        # ── Noise passes at full 240×180 sensor resolution ────────────────────
-        if self.cfg.depth_noise_sigma_m > 0.0:
-            depth = depth + torch.randn_like(depth) * self.cfg.depth_noise_sigma_m
+        # Broader blue range to handle lighting variation; value range crushes shadows
+        lower_blue = np.array([90, 30, 50])
+        upper_blue = np.array([150, 255, 255])
 
-        if self.cfg.depth_invalid_pixel_prob > 0.0:
-            invalid = torch.rand_like(depth) < self.cfg.depth_invalid_pixel_prob
-            depth = depth.masked_fill(invalid, self.cfg.depth_max_m)
+        for i in range(N):
+            img_rgb = rgb_np[i]
+            img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+            img_hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
 
-        if self.cfg.depth_color_noise_prob > 0.0:
-            color_mask = torch.rand_like(depth) < self.cfg.depth_color_noise_prob
-            depth = torch.where(
-                color_mask,
-                torch.rand_like(depth) * self.cfg.depth_max_m,
-                depth,
-            )
+            mask = cv2.inRange(img_hsv, lower_blue, upper_blue)
+            binary_masks[i] = mask.astype(np.float32) / 255.0
 
-        if self.cfg.depth_edge_scatter_prob > 0.0:
-            scatter_mask = torch.rand_like(depth) < (
-                self.cfg.depth_edge_scatter_prob * _edge_w
-            )
-            scatter_vals = torch.where(
-                torch.rand_like(depth) > 0.5,
-                torch.full_like(depth, self.cfg.depth_max_m),
-                torch.zeros_like(depth),
-            )
-            depth = torch.where(scatter_mask, scatter_vals, depth)
+        mask_tensor = torch.from_numpy(binary_masks).to(camera.device)
 
-        if (
-            self.cfg.depth_edge_blur_sigma_m > 0.0
-            and self.cfg.depth_edge_scatter_prob > 0.0
-        ):
-            depth = depth + torch.randn_like(depth) * (
-                self.cfg.depth_edge_blur_sigma_m * _edge_w
-            )
+        # Crop top/bottom rows to remove sky and near-ground clutter
+        top = int(self.cfg.vision_crop_top_fraction * H)
+        bot = H - int(self.cfg.vision_crop_bottom_fraction * H)
+        mask_tensor = mask_tensor[:, top:bot, :]  # [N, H', W]
 
-        # ── Crop AFTER noise (removes top/bottom rows at full resolution) ─────
-        h = depth.shape[1]
-        top = int(self.cfg.depth_crop_top_fraction * h)
-        bot = h - int(self.cfg.depth_crop_bottom_fraction * h)
-        depth = depth[:, top:bot, :]  # [N, H', W]
-
-        depth = depth.clamp(0.01, self.cfg.depth_max_m)
-        depth_norm = 1.0 - depth / self.cfg.depth_max_m
-        depth_4d = F.interpolate(
-            depth_norm.unsqueeze(1),
+        mask_4d = F.interpolate(
+            mask_tensor.unsqueeze(1),
             size=(self._policy_depth_h, self._policy_depth_w),
             mode="bilinear",
             align_corners=False,
         )
-        return depth_4d.squeeze(1).reshape(self.num_envs, -1)
+        # Hard threshold for maximally contrasty black/white — no soft edges
+        return (mask_4d > 0.5).float().squeeze(1).reshape(self.num_envs, -1)
 
-    def _update_depth_cache(self) -> None:
-        """Process both depth cameras and write self._camera_left_obs / _camera_right_obs."""
+    def _update_vision_cache(self) -> None:
+        """Process center camera and write self._camera_center_obs."""
         current_step = int(self.episode_length_buf.max().item())
         if self._last_camera_update_step == current_step:
             return
         self._last_camera_update_step = current_step
-        self._camera_left_obs = self._process_single_depth(self.camera_left)
-        self._camera_right_obs = self._process_single_depth(self.camera_right)
+        self._camera_center_obs = self._process_single_rgb(self.camera_center)
 
     # ------------------------------------------------------------------
     # Observations
     # ------------------------------------------------------------------
 
     def _get_observations(self) -> dict:
-        self._update_depth_cache()
+        self._update_vision_cache()
 
-        parts = [self._camera_left_obs, self._camera_right_obs]
+        parts = [self._camera_center_obs]
         if self.cfg.include_wheel_vel:
             wheel_omega_mean = (
                 self.robot.data.joint_vel[:, self._all_throttle_ids].abs().mean(dim=-1)
@@ -1359,10 +981,10 @@ class ConeTrackEnv(DirectRLEnv):
     # ------------------------------------------------------------------
 
     def _get_rewards(self) -> torch.Tensor:
-        self._update_depth_cache()
+        self._update_vision_cache()
 
         lin_vel_b = self.robot.data.root_lin_vel_b[:, 0]  # m/s forward
-        dt = self.cfg.decimation * self.cfg.sim.dt  # ≈ 0.0333 s
+        dt = self.cfg.decimation * self.cfg.sim.dt  # ≈ 1/policy_hz s
 
         # Distance covered this step
         r_distance = (
@@ -1425,68 +1047,6 @@ class ConeTrackEnv(DirectRLEnv):
         )
 
         # ── Proximity speed penalty (ray-cast against /World/Walls) ──────────────
-        # Cast a virtual ray from the car's XY position along its world-frame
-        # linear-velocity vector and find the closest hit on the (invisible) wall
-        # geometry.  Walls remain hidden / termination-only — this only reads the
-        # cached 2D footprint built once at startup.
-        #
-        # Closeness = 1 − dist / proximity_lookahead_m, clamped to [0, 1].  Walls
-        # beyond the lookahead give zero signal; walls right ahead give 1.0.
-        # Penalty = -weight × speed_norm × closeness.  Strongest exactly when the
-        # car is fast AND a wall is close along the heading of motion (corner entry).
-        if self.cfg.proximity_speed_weight > 0.0 and self._wall_seg_a is not None:
-            vel_w = self.robot.data.root_lin_vel_w[:, :2]  # [N, 2]
-            speed_w = torch.linalg.vector_norm(vel_w, dim=-1)  # [N]
-            moving = speed_w > 0.5
-            dir_w = vel_w / speed_w.clamp(min=1e-3).unsqueeze(-1)  # [N, 2]
-
-            # Vectorised 2D ray-vs-segment intersection across [N envs, M segs].
-            # Ray:     P(t) = origin + t · dir_w,        t ≥ 0
-            # Segment: Q(u) = a + u · (b − a),           0 ≤ u ≤ 1
-            # With s = b − a:
-            #     t = ((a − origin) × s)   / (dir × s)
-            #     u = ((a − origin) × dir) / (dir × s)
-            # where × is the 2D pseudo-cross (a × b = a_x*b_y − a_y*b_x).
-            a = self._wall_seg_a.unsqueeze(0)  # [1, M, 2]
-            b = self._wall_seg_b.unsqueeze(0)  # [1, M, 2]
-            s = b - a  # [1, M, 2]
-            r = dir_w.unsqueeze(1)  # [N, 1, 2]
-            ap = a - pos_xy.unsqueeze(1)  # [N, M, 2]
-
-            cross_rs = r[..., 0] * s[..., 1] - r[..., 1] * s[..., 0]  # [N, M]
-            cross_ap_s = ap[..., 0] * s[..., 1] - ap[..., 1] * s[..., 0]
-            cross_ap_r = ap[..., 0] * r[..., 1] - ap[..., 1] * r[..., 0]
-
-            denom = torch.where(
-                cross_rs.abs() > 1e-8,
-                cross_rs,
-                torch.full_like(cross_rs, 1e-8),
-            )
-            t_hit = cross_ap_s / denom
-            u_hit = cross_ap_r / denom
-
-            hit = (
-                (cross_rs.abs() > 1e-8)
-                & (t_hit > 0.0)
-                & (u_hit >= 0.0)
-                & (u_hit <= 1.0)
-            )
-            t_masked = torch.where(hit, t_hit, torch.full_like(t_hit, float("inf")))
-            nearest_dist = t_masked.min(dim=1).values  # [N]
-
-            closeness = 1.0 - (nearest_dist / self.cfg.proximity_lookahead_m).clamp(
-                0.0, 1.0
-            )
-            speed_norm = (speed_w / self.cfg.max_velocity_m_s).clamp(0.0, 1.0)
-            r_proximity_speed = (
-                -self.cfg.proximity_speed_weight
-                * closeness
-                * speed_norm
-                * moving.float()
-            )
-        else:
-            r_proximity_speed = torch.zeros(self.num_envs, device=self.device)
-
         # ── Lap completion reward ─────────────────────────────────────────────
         # State machine: 0 = at-start, 1 = away-from-start, lap closes on 1→0.
         # The 1→0 transition requires *crossing the start line* — the line through
@@ -1609,7 +1169,6 @@ class ConeTrackEnv(DirectRLEnv):
             + r_throttle_rate
             + r_slip
             + r_spawn_escape
-            + r_proximity_speed
             + r_braking_v2
             + r_lap
         )
@@ -1668,11 +1227,6 @@ class ConeTrackEnv(DirectRLEnv):
         default_root_state = self.robot.data.default_root_state[env_ids].clone()
         default_root_state[:, :3] += self.scene.env_origins[env_ids]
 
-        speed_vec = (
-            torch.rand(n, device=self.device)
-            * (self.cfg.spawn_vel_max_m_s - self.cfg.spawn_vel_min_m_s)
-            + self.cfg.spawn_vel_min_m_s
-        )
         sz = 0.002  # just above ground — constant for all spawn modes
         env_ids_t = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
 
@@ -1714,8 +1268,6 @@ class ConeTrackEnv(DirectRLEnv):
         default_root_state[:, 3:7] = dq
 
         default_root_state[:, 7:] = 0.0
-        default_root_state[:, 7] = speed_vec * torch.cos(yaw)
-        default_root_state[:, 8] = speed_vec * torch.sin(yaw)
 
         self.robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)

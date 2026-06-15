@@ -110,12 +110,10 @@ import cv2, time, signal
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 OUT_DIR = "/tmp/mushr_debug"
 FILES = [
-    (os.path.join(OUT_DIR, "raw_left.png"),    "Left Raw Depth"),
-    (os.path.join(OUT_DIR, "policy_left.png"), "Left Policy Depth"),
-    (os.path.join(OUT_DIR, "raw_right.png"),   "Right Raw Depth"),
-    (os.path.join(OUT_DIR, "policy_right.png"),"Right Policy Depth"),
+    (os.path.join(OUT_DIR, "raw_center.png"),    "Center Raw RGB"),
+    (os.path.join(OUT_DIR, "policy_center.png"), "Center Policy Mask"),
 ]
-while not os.path.exists(os.path.join(OUT_DIR, "raw_left.png")):
+while not os.path.exists(os.path.join(OUT_DIR, "raw_center.png")):
     time.sleep(0.05)
 while True:
     for fpath, name in FILES:
@@ -149,6 +147,11 @@ import tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
+# Register custom CNN-ActorCritic so rsl_rl's eval("ConeTrackActorCritic") resolves
+import rsl_rl.runners.on_policy_runner
+from tasks.cone_track.agents.actor_critic_vision import ConeTrackActorCritic
+rsl_rl.runners.on_policy_runner.ConeTrackActorCritic = ConeTrackActorCritic
+
 # PLACEHOLDER: Extension template (do not remove this comment)
 
 
@@ -162,9 +165,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # override configurations with non-hydra CLI arguments
     agent_cfg: RslRlBaseRunnerCfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
-
-    env_cfg.spawn_vel_min_m_s = 0.0
-    env_cfg.spawn_vel_max_m_s = 0.0
 
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
@@ -288,8 +288,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
         if args_cli.video:
             import time as _time
-            _cam_h = _mushr_env.cfg.camera_left_cfg.height
-            _cam_w = _mushr_env.cfg.camera_left_cfg.width
+            _cam_h = _mushr_env.cfg.camera_center_cfg.height
+            _cam_w = _mushr_env.cfg.camera_center_cfg.width
             _fps   = round(1.0 / (env.unwrapped.cfg.decimation * env.unwrapped.cfg.sim.dt))
             os.makedirs(os.path.join(log_dir, "videos", "play"), exist_ok=True)
             _video_path = os.path.join(
@@ -310,42 +310,26 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         cv2.imwrite(tmp, img)
         os.replace(tmp, path)
 
-    def _depth_to_bgr_pair(camera, suffix: str) -> None:
+    def _vision_to_bgr(camera, suffix: str) -> None:
         """Process one camera → write raw_{suffix}.png and policy_{suffix}.png."""
-        depth_tensor = camera.data.output["distance_to_image_plane"]  # [1,H,W,1]
-        depth_np = depth_tensor[0, :, :, 0].cpu().numpy()
-        depth_max = _mushr_env.cfg.depth_max_m
-        depth_np = np.where(np.isfinite(depth_np), depth_np, depth_max)
-        raw_norm = 1.0 - np.clip(depth_np / depth_max, 0.0, 1.0)
-        raw_bgr  = cv2.applyColorMap(
-            np.clip(raw_norm * 255, 0, 255).astype(np.uint8), cv2.COLORMAP_JET
-        )
+        rgb_tensor = camera.data.output["rgb"][0, :, :, :3].cpu().numpy().astype(np.uint8)
+        raw_bgr = cv2.cvtColor(rgb_tensor, cv2.COLOR_RGB2BGR)
         _write_atomic(os.path.join(_fpv_out_dir, f"raw_{suffix}.png"), raw_bgr)
 
-        # Policy window: exact same pipeline as training (_process_single_depth).
-        pol_flat = _mushr_env._process_single_depth(camera)   # [1, ph*pw], values [0,1]
+        # Policy window
+        pol_flat = _mushr_env._process_single_rgb(camera)
         pol_2d   = pol_flat[0].reshape(
             _mushr_env._policy_depth_h, _mushr_env._policy_depth_w,
         ).cpu().numpy()
-        pol_bgr  = cv2.applyColorMap(
-            np.clip(pol_2d * 255, 0, 255).astype(np.uint8), cv2.COLORMAP_JET
-        )
+        pol_bgr  = cv2.cvtColor((pol_2d * 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
         _write_atomic(os.path.join(_fpv_out_dir, f"policy_{suffix}.png"), pol_bgr)
 
     def _fpv_step() -> None:
-        """Grab depth frames from both cameras, false-colour them, write PNGs."""
-        _depth_to_bgr_pair(_mushr_env.camera_left,  "left")
-        _depth_to_bgr_pair(_mushr_env.camera_right, "right")
+        """Grab vision frame from center camera, write PNGs."""
+        _vision_to_bgr(_mushr_env.camera_center, "center")
         if _fpv_writer is not None:
-            # Write left raw frame to video for recording
-            depth_tensor = _mushr_env.camera_left.data.output["distance_to_image_plane"]
-            depth_np = depth_tensor[0, :, :, 0].cpu().numpy()
-            depth_max = _mushr_env.cfg.depth_max_m
-            depth_np = np.where(np.isfinite(depth_np), depth_np, depth_max)
-            raw_norm = 1.0 - np.clip(depth_np / depth_max, 0.0, 1.0)
-            raw_bgr  = cv2.applyColorMap(
-                np.clip(raw_norm * 255, 0, 255).astype(np.uint8), cv2.COLORMAP_JET
-            )
+            rgb_tensor = _mushr_env.camera_center.data.output["rgb"][0, :, :, :3].cpu().numpy().astype(np.uint8)
+            raw_bgr = cv2.cvtColor(rgb_tensor, cv2.COLOR_RGB2BGR)
             _fpv_writer.write(raw_bgr)
     # ──────────────────────────────────────────────────────────────────────────
 
