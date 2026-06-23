@@ -171,17 +171,6 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
             gpu_temp_buffer_capacity=2**21,            # 2 MB (default 16M)
             gpu_max_num_partitions=4,                  # 4 partitions (default 8)
         ),
-        render=sim_utils.RenderCfg(
-            enable_translucency=False,
-            enable_reflections=False,
-            enable_global_illumination=False,
-            enable_dl_denoiser=False,
-            enable_direct_lighting=True,
-            enable_shadows=False,
-            enable_ambient_occlusion=False,
-            samples_per_pixel=1,
-            rendering_mode="performance",
-        ),
     )
 
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
@@ -675,7 +664,7 @@ class ConeTrackEnv(DirectRLEnv):
         # Vision observation caches (policy resolution after color filtering + downsample)
         _cam_flat = self._policy_depth_h * self._policy_depth_w
         self._camera_center_obs = torch.zeros(
-            self.num_envs, _cam_flat, device=self.device, dtype=torch.float16
+            self.num_envs, _cam_flat, device=self.device, dtype=torch.float32
         )
         self._last_camera_update_step = -1
 
@@ -1004,7 +993,7 @@ class ConeTrackEnv(DirectRLEnv):
             mode="bilinear",
             align_corners=False,
         )
-        return mask_4d.squeeze(1).reshape(self.num_envs, -1).to(torch.float16)
+        return mask_4d.squeeze(1).reshape(self.num_envs, -1).to(torch.float32)
 
     def _update_vision_cache(self) -> None:
         """Process center camera and write self._camera_center_obs."""
@@ -1028,7 +1017,7 @@ class ConeTrackEnv(DirectRLEnv):
             )
             wheel_vel_norm = (
                 wheel_omega_mean * WHEEL_RADIUS / self.cfg.max_velocity_m_s
-            ).clamp(0.0, 1.0).to(torch.float16)
+            ).clamp(0.0, 1.0).to(torch.float32)
             parts.append(wheel_vel_norm.unsqueeze(-1))  # [N, 1]
 
         obs = torch.cat(parts, dim=-1)

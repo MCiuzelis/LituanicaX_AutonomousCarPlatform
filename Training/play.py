@@ -74,9 +74,8 @@ cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli, hydra_args = parser.parse_known_args()
-# always enable cameras to record video or for FPV mode
-if args_cli.video or args_cli.fpv:
-    args_cli.enable_cameras = True
+# always enable cameras — required for TiledCamera in the environment
+args_cli.enable_cameras = True
 if args_cli.fpv:
     args_cli.num_envs = 1
 
