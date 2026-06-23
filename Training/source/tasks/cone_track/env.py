@@ -160,7 +160,29 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     state_space: int = 0
 
     # sim.dt and sim.render_interval are set in __post_init__ from policy_hz & decimation
-    sim: SimulationCfg = SimulationCfg()
+    sim: SimulationCfg = SimulationCfg(
+        physx=sim_utils.PhysxCfg(
+            gpu_heap_capacity=2**23,                  # 8 MB (default 67 MB)
+            gpu_collision_stack_size=2**23,            # 8 MB (default 67 MB)
+            gpu_found_lost_pairs_capacity=2**19,       # 0.5 MB (default 2M)
+            gpu_found_lost_aggregate_pairs_capacity=2**20,  # 1 MB (default 34 MB)
+            gpu_total_aggregate_pairs_capacity=2**19,  # 0.5 MB (default 2M)
+            gpu_max_rigid_contact_count=2**20,         # 1M (default 8M)
+            gpu_temp_buffer_capacity=2**21,            # 2 MB (default 16M)
+            gpu_max_num_partitions=4,                  # 4 partitions (default 8)
+        ),
+        render=sim_utils.RenderCfg(
+            enable_translucency=False,
+            enable_reflections=False,
+            enable_global_illumination=False,
+            enable_dl_denoiser=False,
+            enable_direct_lighting=True,
+            enable_shadows=False,
+            enable_ambient_occlusion=False,
+            samples_per_pixel=1,
+            rendering_mode="performance",
+        ),
+    )
 
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
         num_envs=26,
@@ -293,7 +315,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
 
     # slow_stop_speed_fraction — episode terminates when speed falls below this
     # (catches truly stuck / reversed agents; keep low so normal braking is fine)
-    slow_stop_speed_fraction: float = 0.03  # terminate if speed < 3 % of vel_cap
+    slow_stop_speed_fraction: float = 0.04  # terminate if speed < 4 % of vel_cap
 
     # ════════════════════════════════════════════════════════════════════════
     # OBSERVATION EXTRAS
@@ -356,7 +378,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # dense distance reward (~25/sec at top speed → ~750 per 30 s lap).
     # Until the agent can actually finish a lap this reward stays at 0, so it has
     # no effect on early training.
-    lap_reward_weight: float = 12.0
+    lap_reward_weight: float = 2.0
     lap_return_radius_m: float = 0.3  # start line while back inside closes the lap
     lap_min_time_s: float = 20.0  # lower clamp (caps maximum reward per lap)
     lap_max_time_s: float = 50.0  # upper clamp & numerator anchor
@@ -653,7 +675,7 @@ class ConeTrackEnv(DirectRLEnv):
         # Vision observation caches (policy resolution after color filtering + downsample)
         _cam_flat = self._policy_depth_h * self._policy_depth_w
         self._camera_center_obs = torch.zeros(
-            self.num_envs, _cam_flat, device=self.device
+            self.num_envs, _cam_flat, device=self.device, dtype=torch.float16
         )
         self._last_camera_update_step = -1
 
@@ -756,7 +778,7 @@ class ConeTrackEnv(DirectRLEnv):
             sensor_cfg = ContactSensorCfg(
                 prim_path=f"/World/envs/env_.*/Robot/mushr_nano/{link_name}",
                 filter_prim_paths_expr=["/World/Walls"],
-                history_length=self.cfg.decimation,
+                history_length=1,
                 update_period=0.0,
                 track_pose=False,
                 debug_vis=False,
@@ -907,59 +929,82 @@ class ConeTrackEnv(DirectRLEnv):
     # ------------------------------------------------------------------
 
     def _process_single_rgb(self, camera) -> torch.Tensor:
-        """Shared vision pipeline for RGB camera → [N, policy_h*policy_w] high-contrast binary mask.
+        """GPU vision pipeline for RGB camera → [N, policy_h*policy_w] binary mask.
 
-        Pipeline: raw RGB → blue HSV mask → crop (top/bottom rows) → downsample → hard threshold.
+        Pipeline: raw RGB → blue HSV mask → morphological noise removal → downsample.
+        Entirely GPU-based: no CPU copies or per-env Python loops.
         """
-        import cv2
-        import numpy as np
         import torch.nn.functional as F
 
-        rgb_tensor = camera.data.output["rgb"][..., :3]
-        N, H, W, _ = rgb_tensor.shape
+        rgb = camera.data.output["rgb"][..., :3]  # [N, H, W, 3]
+        N, H, W, _ = rgb.shape
 
-        rgb_np = rgb_tensor.cpu().numpy().astype(np.uint8)
-        binary_masks = np.zeros((N, H, W), dtype=np.float32)
+        # Normalise to [0, 1]; handle both uint8 and float inputs
+        if rgb.dtype == torch.uint8:
+            rgb = rgb.float() / 255.0
+        else:
+            rgb = rgb.float().clamp(0.0, 1.0)
 
-        # Original broader blue range to ensure track edges are fully visible
-        lower_blue = np.array([90, 30, 50])
-        upper_blue = np.array([150, 255, 255])
+        # ── RGB → HSV on GPU (standard formula, H in [0, 360], SV in [0, 1]) ──
+        r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
 
-        for i in range(N):
-            img_rgb = rgb_np[i]
-            img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-            img_hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+        cmax, _ = rgb.max(dim=-1)
+        cmin, _ = rgb.min(dim=-1)
+        delta = cmax - cmin
 
-            mask = cv2.inRange(img_hsv, lower_blue, upper_blue)
+        # Hue
+        h = torch.zeros_like(cmax)
+        valid = delta > 1e-8
 
-            # Filter out small disconnected patches (noise) but keep thin continuous lines
-            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
-                mask, connectivity=8
-            )
-            min_area = 60  # Minimum number of pixels to keep a blob
+        # Cmax == R
+        mask_r = (cmax == r) & valid
+        h[mask_r] = ((g[mask_r] - b[mask_r]) / delta[mask_r]) % 6.0 * 60.0
 
-            # Find labels of components smaller than min_area (excluding background label 0)
-            small_labels = np.where(stats[:, cv2.CC_STAT_AREA] < min_area)[0]
-            small_labels = small_labels[small_labels > 0]
+        # Cmax == G
+        mask_g = (cmax == g) & valid & ~mask_r
+        h[mask_g] = ((b[mask_g] - r[mask_g]) / delta[mask_g] + 2.0) * 60.0
 
-            if len(small_labels) > 0:
-                mask[np.isin(labels, small_labels)] = 0
+        # Cmax == B
+        mask_b = valid & ~mask_r & ~mask_g
+        h[mask_b] = ((r[mask_b] - g[mask_b]) / delta[mask_b] + 4.0) * 60.0
 
-            binary_masks[i] = mask.astype(np.float32) / 255.0
+        h = h % 360.0
 
-        mask_tensor = torch.from_numpy(binary_masks).to(camera.device)
+        # Saturation
+        s = torch.where(cmax > 0, delta / cmax, torch.zeros_like(cmax))
 
-        # The camera image is already cropped by Isaac Sim
-        # mask_tensor = mask_tensor[:, top:bot, :]  # [N, H', W]
+        # Value
+        v = cmax
 
+        # ── Blue inRange mask (OpenCV-compatible thresholds) ────────────────
+        # Original OpenCV thresholds: lower=[90,30,50], upper=[150,255,255] in
+        # OpenCV HSV (H/2, S*255, V*255).  Converted to standard HSV ranges:
+        in_h_low, in_h_high = 180.0, 300.0
+        in_s_low = 30.0 / 255.0
+        in_v_low = 50.0 / 255.0
+
+        mask = (
+            (h >= in_h_low) & (h <= in_h_high)
+            & (s >= in_s_low)
+            & (v >= in_v_low)
+        ).float()
+
+        # ── Morphological opening: remove noise (replaces CPU connected-component filter) ──
+        k = 3
+        p = k // 2
+        # Erosion →  dilation
+        mask = -F.max_pool2d(-mask.unsqueeze(1), k, stride=1, padding=p)
+        mask = F.max_pool2d(mask, k, stride=1, padding=p)
+        mask = mask.squeeze(1)
+
+        # ── Downsample to policy resolution ──────────────────────────────────
         mask_4d = F.interpolate(
-            mask_tensor.unsqueeze(1),
+            mask.unsqueeze(1),
             size=(self._policy_depth_h, self._policy_depth_w),
             mode="bilinear",
             align_corners=False,
         )
-        # Return continuous float values [0, 1] to preserve soft edges from downsampling
-        return mask_4d.squeeze(1).reshape(self.num_envs, -1)
+        return mask_4d.squeeze(1).reshape(self.num_envs, -1).to(torch.float16)
 
     def _update_vision_cache(self) -> None:
         """Process center camera and write self._camera_center_obs."""
@@ -983,7 +1028,7 @@ class ConeTrackEnv(DirectRLEnv):
             )
             wheel_vel_norm = (
                 wheel_omega_mean * WHEEL_RADIUS / self.cfg.max_velocity_m_s
-            ).clamp(0.0, 1.0)
+            ).clamp(0.0, 1.0).to(torch.float16)
             parts.append(wheel_vel_norm.unsqueeze(-1))  # [N, 1]
 
         obs = torch.cat(parts, dim=-1)

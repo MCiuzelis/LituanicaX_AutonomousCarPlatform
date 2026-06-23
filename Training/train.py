@@ -223,8 +223,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # set the log directory for the environment (works for all environment types)
     env_cfg.log_dir = log_dir
 
+    # Limit PyTorch's VRAM so Isaac Sim's renderer/PhysX aren't starved.
+    # Profile shows Isaac Sim uses ~4 GB on this system → 0.92 leaves headroom.
+    torch.cuda.set_per_process_memory_fraction(0.92)
+
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    torch.cuda.empty_cache()
+
+    # ── VRAM profile after env creation ────────────────────────────────────
+    allocated = torch.cuda.memory_allocated() / 1024**3
+    reserved = torch.cuda.memory_reserved() / 1024**3
+    total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    print(f"\n{'='*60}")
+    print(f"[VRAM] After env creation:  allocated={allocated:.2f} GB, reserved={reserved:.2f} GB, total={total:.2f} GB")
+    print(f"{'='*60}\n")
 
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
@@ -251,6 +264,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
+    # ── VRAM profile after wrapper ─────────────────────────────────────────
+    allocated = torch.cuda.memory_allocated() / 1024**3
+    reserved = torch.cuda.memory_reserved() / 1024**3
+    print(f"[VRAM] After RslRlVecEnvWrapper:  allocated={allocated:.2f} GB, reserved={reserved:.2f} GB")
+
     # create runner from rsl-rl
     if agent_cfg.class_name == "OnPolicyRunner":
         runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
@@ -266,9 +284,32 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # load previously trained model
         runner.load(resume_path)
 
+    # Log effective PPO config values for debugging
+    alg_cfg = agent_cfg.algorithm
+    print(f"[CFG] num_steps_per_env={agent_cfg.num_steps_per_env}  "
+          f"num_mini_batches={alg_cfg.num_mini_batches}  "
+          f"num_learning_epochs={alg_cfg.num_learning_epochs}  "
+          f"batch_size={agent_cfg.num_steps_per_env * env_cfg.scene.num_envs}  "
+          f"mini_batch={agent_cfg.num_steps_per_env * env_cfg.scene.num_envs // alg_cfg.num_mini_batches}")
+
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
+
+    # ── VRAM profile before training ───────────────────────────────────────
+    allocated = torch.cuda.memory_allocated() / 1024**3
+    reserved = torch.cuda.memory_reserved() / 1024**3
+    print(f"[VRAM] Before learn():  allocated={allocated:.2f} GB, reserved={reserved:.2f} GB")
+    # Print top-5 largest allocations by class
+    import subprocess
+    result = subprocess.run(
+        ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"],
+        capture_output=True, text=True, timeout=5
+    )
+    if result.returncode == 0:
+        used, total = result.stdout.strip().split(", ")
+        print(f"[nvidia-smi] VRAM:  {used} / {total} MiB")
+    print(f"{'='*60}\n")
 
     # run training
     runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)

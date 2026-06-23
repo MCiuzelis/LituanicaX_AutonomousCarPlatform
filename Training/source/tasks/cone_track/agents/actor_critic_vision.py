@@ -3,6 +3,7 @@
 import torch
 import torch.nn as nn
 from torch.distributions import Normal
+from torch.utils.checkpoint import checkpoint
 
 from rsl_rl.networks import MLP, EmpiricalNormalization
 
@@ -121,7 +122,15 @@ class ConeTrackActorCritic(nn.Module):
         vision = x[:, : self._vision_size]
         scalar = x[:, self._vision_size :]
         img = vision.reshape(-1, 1, self._img_h, self._img_w)
-        feats = self.cnn_encoder(img)
+        # Cast to CNN weight dtype (FP32) since observation is FP16 (Change 4)
+        weight_dtype = self.cnn_encoder[0].weight.dtype
+        img = img.to(dtype=weight_dtype)
+        # Only checkpoint when gradients are actually required (training mini-batch,
+        # not normalization update) to avoid full-batch forward peak memory.
+        if torch.is_grad_enabled() and self.training:
+            feats = checkpoint(self.cnn_encoder, img, use_reentrant=False)
+        else:
+            feats = self.cnn_encoder(img)
         feats = feats.reshape(feats.size(0), -1)
         return torch.cat([feats, scalar], dim=-1)
 
@@ -188,6 +197,7 @@ class ConeTrackActorCritic(nn.Module):
     def get_actions_log_prob(self, actions):
         return self.distribution.log_prob(actions).sum(dim=-1)
 
+    @torch.inference_mode()
     def update_normalization(self, obs):
         if self.actor_obs_normalization:
             self.actor_obs_normalizer.update(self.get_actor_obs(obs))

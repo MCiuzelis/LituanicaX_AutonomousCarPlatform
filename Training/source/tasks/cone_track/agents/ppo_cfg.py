@@ -11,7 +11,7 @@ from isaaclab_rl.rsl_rl import (
 
 @configclass
 class ConeTrackPPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    num_steps_per_env: int = 1400
+    num_steps_per_env: int = 2000
     max_iterations: int = 1000
     save_interval: int = 10
     experiment_name: str = "cone_track"
@@ -21,7 +21,7 @@ class ConeTrackPPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
     policy: RslRlPpoActorCriticCfg = RslRlPpoActorCriticCfg(
         class_name="ConeTrackActorCritic",
-        init_noise_std=0.6,
+        init_noise_std=0.65,
         actor_obs_normalization=True,
         critic_obs_normalization=True,
         # CNN encoder + small MLP (vision 120×424 → 2048 CNN features + 1 scalar)
@@ -33,13 +33,13 @@ class ConeTrackPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     algorithm: RslRlPpoAlgorithmCfg = RslRlPpoAlgorithmCfg(
         learning_rate=3e-5,
         schedule="adaptive",
-        num_learning_epochs=7,
-        num_mini_batches=1,
+        num_learning_epochs=4,
+        num_mini_batches=8,
         clip_param=0.2,
-        entropy_coef=0.003,
+        entropy_coef=0.0025,
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
-        gamma=0.995,
+        gamma=0.9935,
         lam=0.95,
         desired_kl=0.01,
         max_grad_norm=0.75,
