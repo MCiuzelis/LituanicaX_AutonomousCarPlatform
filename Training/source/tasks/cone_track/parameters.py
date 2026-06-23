@@ -34,4 +34,4 @@ VISION_OBS_SIZE: int = POLICY_DEPTH_H * POLICY_DEPTH_W
 CNN_CHANNELS: tuple = (32, 64, 128)
 CNN_KERNEL_SIZES: tuple = (5, 5, 3)
 CNN_STRIDES: tuple = (2, 2, 2)
-CNN_POOL_SIZE: tuple = (4, 4)
+CNN_POOL_SIZE: tuple = (3, 3)

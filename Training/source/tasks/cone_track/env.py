@@ -102,7 +102,7 @@ WALL_USD = os.path.join(_EXPORT_DIR, "Walls.usdc")
 # ---------------------------------------------------------------------------
 WHEEL_RADIUS = 0.037  # m  (82 mm diameter wheels)
 
-TRACK_SCALE = 0.8
+TRACK_SCALE = 1.0
 
 # ---------------------------------------------------------------------------
 # Center RGB camera optics (IMX708, f=2.87mm, FOV 120°×66.7°)
@@ -112,6 +112,11 @@ TRACK_SCALE = 0.8
 _RGB_FOCAL_MM = 2.87
 _RGB_H_APERTURE_MM = 2.0 * _RGB_FOCAL_MM * math.tan(math.radians(120.0 / 2.0))
 _RGB_V_APERTURE_MM = 2.0 * _RGB_FOCAL_MM * math.tan(math.radians(66.7 / 2.0))
+
+_REMAINING_FRACTION = max(0.0, 1.0 - VISION_CROP_TOP_FRACTION - VISION_CROP_BOTTOM_FRACTION)
+_CROPPED_CAM_H = max(1, int(CAM_H * _REMAINING_FRACTION))
+_NEW_V_APERTURE = _RGB_V_APERTURE_MM * _REMAINING_FRACTION
+_V_APERTURE_OFFSET = _RGB_V_APERTURE_MM * (VISION_CROP_BOTTOM_FRACTION - VISION_CROP_TOP_FRACTION) / 2.0
 
 # Robot links monitored for wall contact.
 WALL_CONTACT_LINKS = (
@@ -352,7 +357,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # Until the agent can actually finish a lap this reward stays at 0, so it has
     # no effect on early training.
     lap_reward_weight: float = 12.0
-    # start line while back inside closes the lap
+    lap_return_radius_m: float = 0.3  # start line while back inside closes the lap
     lap_min_time_s: float = 20.0  # lower clamp (caps maximum reward per lap)
     lap_max_time_s: float = 50.0  # upper clamp & numerator anchor
 
@@ -456,13 +461,14 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     camera_center_cfg: TiledCameraCfg = TiledCameraCfg(
         prim_path="/World/envs/env_.*/Robot/mushr_nano/base_link/camera_center",
         # update_period is set in __post_init__ from policy_hz
-        height=480,
-        width=848,
+        height=_CROPPED_CAM_H,
+        width=CAM_W,
         data_types=["rgb"],
         spawn=sim_utils.PinholeCameraCfg(
             focal_length=_RGB_FOCAL_MM,
             horizontal_aperture=_RGB_H_APERTURE_MM,
-            vertical_aperture=_RGB_V_APERTURE_MM,
+            vertical_aperture=_NEW_V_APERTURE,
+            vertical_aperture_offset=_V_APERTURE_OFFSET,
             clipping_range=(0.01, 100.0),
         ),
         offset=TiledCameraCfg.OffsetCfg(
@@ -500,10 +506,9 @@ class ConeTrackEnv(DirectRLEnv):
         # 2. Downsample: bilinear resize by downsampling_amount in both axes.
         cam_h = cfg.camera_center_cfg.height
         cam_w = cfg.camera_center_cfg.width
-        remaining = max(
-            0.0, 1.0 - cfg.vision_crop_top_fraction - cfg.vision_crop_bottom_fraction
-        )
-        cropped_h = max(1, int(cam_h * remaining))
+        
+        # The camera image is already cropped by Isaac Sim
+        cropped_h = cam_h
         cropped_w = cam_w
 
         ds = cfg.downsampling_amount
@@ -916,7 +921,7 @@ class ConeTrackEnv(DirectRLEnv):
         rgb_np = rgb_tensor.cpu().numpy().astype(np.uint8)
         binary_masks = np.zeros((N, H, W), dtype=np.float32)
 
-        # Broader blue range to handle lighting variation; value range crushes shadows
+        # Original broader blue range to ensure track edges are fully visible
         lower_blue = np.array([90, 30, 50])
         upper_blue = np.array([150, 255, 255])
 
@@ -926,14 +931,26 @@ class ConeTrackEnv(DirectRLEnv):
             img_hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
 
             mask = cv2.inRange(img_hsv, lower_blue, upper_blue)
+
+            # Filter out small disconnected patches (noise) but keep thin continuous lines
+            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+                mask, connectivity=8
+            )
+            min_area = 60  # Minimum number of pixels to keep a blob
+
+            # Find labels of components smaller than min_area (excluding background label 0)
+            small_labels = np.where(stats[:, cv2.CC_STAT_AREA] < min_area)[0]
+            small_labels = small_labels[small_labels > 0]
+
+            if len(small_labels) > 0:
+                mask[np.isin(labels, small_labels)] = 0
+
             binary_masks[i] = mask.astype(np.float32) / 255.0
 
         mask_tensor = torch.from_numpy(binary_masks).to(camera.device)
 
-        # Crop top/bottom rows to remove sky and near-ground clutter
-        top = int(self.cfg.vision_crop_top_fraction * H)
-        bot = H - int(self.cfg.vision_crop_bottom_fraction * H)
-        mask_tensor = mask_tensor[:, top:bot, :]  # [N, H', W]
+        # The camera image is already cropped by Isaac Sim
+        # mask_tensor = mask_tensor[:, top:bot, :]  # [N, H', W]
 
         mask_4d = F.interpolate(
             mask_tensor.unsqueeze(1),
@@ -941,8 +958,8 @@ class ConeTrackEnv(DirectRLEnv):
             mode="bilinear",
             align_corners=False,
         )
-        # Hard threshold for maximally contrasty black/white — no soft edges
-        return (mask_4d > 0.5).float().squeeze(1).reshape(self.num_envs, -1)
+        # Return continuous float values [0, 1] to preserve soft edges from downsampling
+        return mask_4d.squeeze(1).reshape(self.num_envs, -1)
 
     def _update_vision_cache(self) -> None:
         """Process center camera and write self._camera_center_obs."""
