@@ -21,7 +21,7 @@ class ConeTrackPPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
     policy: RslRlPpoActorCriticCfg = RslRlPpoActorCriticCfg(
         class_name="ConeTrackActorCritic",
-        init_noise_std=0.65,
+        init_noise_std=1.0,
         actor_obs_normalization=True,
         critic_obs_normalization=True,
         # Small MLP — input is just 19 compact lane parameters (no CNN)
@@ -36,7 +36,7 @@ class ConeTrackPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         num_learning_epochs=4,
         num_mini_batches=8,
         clip_param=0.2,
-        entropy_coef=0.0025,
+        entropy_coef=0.007,
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         gamma=0.9935,

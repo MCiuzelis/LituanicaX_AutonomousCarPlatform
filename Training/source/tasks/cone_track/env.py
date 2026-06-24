@@ -539,6 +539,10 @@ class ConeTrackEnv(DirectRLEnv):
 
         cfg.observation_space = lane_obs_size + extra_obs
 
+        # Vision mask resolution (used by image_saver.py / visualize.py / play.py)
+        self._policy_depth_h = cfg.camera_center_cfg.height
+        self._policy_depth_w = cfg.camera_center_cfg.width
+
         print(
             f"[ConeTrackEnv] Lane features: {lane_obs_size} params  |  "
             f"+ veloc={cfg.include_wheel_vel}  |  "
