@@ -12,18 +12,7 @@ Usage:
 
 import argparse
 import os
-import sys
 import time
-
-# ── libstdc++ fix (identical to train.py / play.py) ───────────────────────────
-if "ISAACLAB_LIBSTDCPP_FIXED" not in os.environ:
-    _conda_prefix = os.environ.get("CONDA_PREFIX")
-    if _conda_prefix:
-        _libstdcpp = os.path.join(_conda_prefix, "lib", "libstdc++.so.6")
-        if os.path.exists(_libstdcpp):
-            os.environ["ISAACLAB_LIBSTDCPP_FIXED"] = "1"
-            os.environ["LD_PRELOAD"] = _libstdcpp
-            os.execv(sys.executable, [sys.executable] + sys.argv)
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 

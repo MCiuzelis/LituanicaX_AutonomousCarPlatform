@@ -11,20 +11,6 @@ import argparse
 import os
 import sys
 
-# LD_PRELOAD must be set before any shared libraries load, which means before Python
-# itself initialises its C extensions. Setting os.environ inside an already-running
-# interpreter is too late for the current process. Re-exec with the flag in place so
-# the dynamic linker picks up conda's libstdc++ (which has CXXABI_1.3.15) on the
-# very first dlopen call. The sentinel variable prevents infinite recursion.
-if "ISAACLAB_LIBSTDCPP_FIXED" not in os.environ:
-    _conda_prefix = os.environ.get("CONDA_PREFIX")
-    if _conda_prefix:
-        _libstdcpp = os.path.join(_conda_prefix, "lib", "libstdc++.so.6")
-        if os.path.exists(_libstdcpp):
-            os.environ["ISAACLAB_LIBSTDCPP_FIXED"] = "1"
-            os.environ["LD_PRELOAD"] = _libstdcpp
-            os.execv(sys.executable, [sys.executable] + sys.argv)
-
 # Reduce PyTorch CUDA allocator fragmentation: returns unused blocks to the
 # system in smaller segments instead of holding giant cached arenas.
 # Must be set before any CUDA context is created (AppLauncher).

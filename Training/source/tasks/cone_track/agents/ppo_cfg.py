@@ -24,9 +24,9 @@ class ConeTrackPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         init_noise_std=0.65,
         actor_obs_normalization=True,
         critic_obs_normalization=True,
-        # CNN encoder + small MLP (vision 120×424 → 2048 CNN features + 1 scalar)
-        actor_hidden_dims=[512, 256],
-        critic_hidden_dims=[512, 256],
+        # Small MLP — input is just 19 compact lane parameters (no CNN)
+        actor_hidden_dims=[128, 64],
+        critic_hidden_dims=[128, 64],
         activation="mish",
     )
 

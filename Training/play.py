@@ -12,17 +12,6 @@ import os
 import subprocess
 import sys
 
-# Re-exec with conda's libstdc++ in LD_PRELOAD so the dynamic linker picks up
-# CXXABI_1.3.15 before any C extensions load.  See train.py for rationale.
-if "ISAACLAB_LIBSTDCPP_FIXED" not in os.environ:
-    _conda_prefix = os.environ.get("CONDA_PREFIX")
-    if _conda_prefix:
-        _libstdcpp = os.path.join(_conda_prefix, "lib", "libstdc++.so.6")
-        if os.path.exists(_libstdcpp):
-            os.environ["ISAACLAB_LIBSTDCPP_FIXED"] = "1"
-            os.environ["LD_PRELOAD"] = _libstdcpp
-            os.execv(sys.executable, [sys.executable] + sys.argv)
-
 # Reduce PyTorch CUDA allocator fragmentation: returns unused blocks to the
 # system in smaller segments instead of holding giant cached arenas.
 # Must be set before any CUDA context is created (AppLauncher).
@@ -91,18 +80,9 @@ simulation_app = app_launcher.app
 import time
 
 # ── FPV display subprocess ────────────────────────────────────────────────────
-# Identical approach to visualize.py: a separate Python process with the
-# GUI-capable opencv-python loaded from the conda site-packages polls two PNG
-# files written atomically by the main process and shows them via cv2.imshow.
-_conda_prefix = os.environ.get("CONDA_PREFIX", "")
-_CONDA_SP = (
-    os.path.join(_conda_prefix, "lib", f"python{sys.version_info.major}.{sys.version_info.minor}", "site-packages")
-    if _conda_prefix else ""
-)
-_FPV_DISPLAY_SCRIPT = rf"""
+_FPV_DISPLAY_SCRIPT = r"""
 import sys, os
 sys.path = [
-    "{_CONDA_SP}",
     *[p for p in sys.path if "pip_prebundle" not in p and "omni" not in p],
 ]
 import cv2, time, signal

@@ -1,20 +1,10 @@
-"""CNN-encoder ActorCritic for cone-track: conv stack + adaptive pool + MLP."""
+"""Lane-feature ActorCritic: compact lane params + MLP (no CNN)."""
 
 import torch
 import torch.nn as nn
 from torch.distributions import Normal
-from torch.utils.checkpoint import checkpoint
 
 from rsl_rl.networks import MLP, EmpiricalNormalization
-
-from ..parameters import (
-    CNN_CHANNELS,
-    CNN_KERNEL_SIZES,
-    CNN_POOL_SIZE,
-    CNN_STRIDES,
-    POLICY_DEPTH_H,
-    POLICY_DEPTH_W,
-)
 
 
 class ConeTrackActorCritic(nn.Module):
@@ -25,12 +15,6 @@ class ConeTrackActorCritic(nn.Module):
         obs,
         obs_groups,
         num_actions,
-        cnn_img_h=POLICY_DEPTH_H,
-        cnn_img_w=POLICY_DEPTH_W,
-        cnn_channels=CNN_CHANNELS,
-        cnn_kernel_sizes=CNN_KERNEL_SIZES,
-        cnn_strides=CNN_STRIDES,
-        cnn_pool_size=CNN_POOL_SIZE,
         **kwargs,
     ):
         super().__init__()
@@ -45,36 +29,11 @@ class ConeTrackActorCritic(nn.Module):
             assert len(obs[g].shape) == 2, "only 1D observations supported"
             num_critic_obs += obs[g].shape[-1]
 
-        # Flat obs layout: [vision_mask, wheel_vel_scalar]
-        self._vision_size = num_actor_obs - 1
-        self._scalar_size = 1
-        self._img_h = cnn_img_h
-        self._img_w = cnn_img_w
+        encoded_dim = num_actor_obs  # no CNN encoder — pass through directly
 
-        exp_vis = cnn_img_h * cnn_img_w
-        assert self._vision_size == exp_vis, (
-            f"vision size {self._vision_size} != {cnn_img_h}*{cnn_img_w} = {exp_vis}"
-        )
-
-        # ── CNN encoder ──────────────────────────────────────────────────
-        convs = []
-        in_ch = 1
-        for out_ch, k, s in zip(cnn_channels, cnn_kernel_sizes, cnn_strides):
-            convs.append(nn.Conv2d(in_ch, out_ch, k, stride=s, padding=k // 2))
-            convs.append(nn.Mish())
-            in_ch = out_ch
-        convs.append(nn.AdaptiveAvgPool2d(cnn_pool_size))
-        self.cnn_encoder = nn.Sequential(*convs)
-
-        with torch.no_grad():
-            dummy = torch.zeros(1, 1, cnn_img_h, cnn_img_w)
-            cnn_out = self.cnn_encoder(dummy)
-            cnn_flat = cnn_out.reshape(1, -1).size(-1)
-        encoded_dim = cnn_flat + self._scalar_size
-
-        # ── MLP heads ────────────────────────────────────────────────────
-        actor_hidden = kwargs.get("actor_hidden_dims", [256, 256, 256])
-        critic_hidden = kwargs.get("critic_hidden_dims", [256, 256, 256])
+        # ── MLP heads (small — input is compact lane params) ─────────────
+        actor_hidden = kwargs.get("actor_hidden_dims", [64, 32])
+        critic_hidden = kwargs.get("critic_hidden_dims", [64, 32])
         activation = kwargs.get("activation", "elu")
         init_noise_std = kwargs.get("init_noise_std", 1.0)
         act_norm = kwargs.get("actor_obs_normalization", False)
@@ -111,28 +70,14 @@ class ConeTrackActorCritic(nn.Module):
         self.distribution = None
         Normal.set_default_validate_args(False)
 
-        print(f"[ConeTrackActorCritic] CNN: {self.cnn_encoder}")
-        print(f"[ConeTrackActorCritic] Encoded dim: {encoded_dim}")
+        print(f"[ConeTrackActorCritic] Encoded dim: {encoded_dim} (lane params)")
         print(f"[ConeTrackActorCritic] Actor MLP: {self.actor}")
         print(f"[ConeTrackActorCritic] Critic MLP: {self.critic}")
 
     # ── helpers ──────────────────────────────────────────────────────────
 
     def _encode(self, x):
-        vision = x[:, : self._vision_size]
-        scalar = x[:, self._vision_size :]
-        img = vision.reshape(-1, 1, self._img_h, self._img_w)
-        # Cast to CNN weight dtype (FP32) since observation is FP16 (Change 4)
-        weight_dtype = self.cnn_encoder[0].weight.dtype
-        img = img.to(dtype=weight_dtype)
-        # Only checkpoint when gradients are actually required (training mini-batch,
-        # not normalization update) to avoid full-batch forward peak memory.
-        if torch.is_grad_enabled() and self.training:
-            feats = checkpoint(self.cnn_encoder, img, use_reentrant=False)
-        else:
-            feats = self.cnn_encoder(img)
-        feats = feats.reshape(feats.size(0), -1)
-        return torch.cat([feats, scalar], dim=-1)
+        return x  # No CNN — the observation IS the encoded representation
 
     # ── overrides ────────────────────────────────────────────────────────
 

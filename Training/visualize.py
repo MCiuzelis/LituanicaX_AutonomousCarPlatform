@@ -22,16 +22,6 @@ import subprocess
 import sys
 import threading
 
-# Re-exec with conda's libstdc++ in LD_PRELOAD
-if "ISAACLAB_LIBSTDCPP_FIXED" not in os.environ:
-    _conda_prefix = os.environ.get("CONDA_PREFIX")
-    if _conda_prefix:
-        _libstdcpp = os.path.join(_conda_prefix, "lib", "libstdc++.so.6")
-        if os.path.exists(_libstdcpp):
-            os.environ["ISAACLAB_LIBSTDCPP_FIXED"] = "1"
-            os.environ["LD_PRELOAD"] = _libstdcpp
-            os.execv(sys.executable, [sys.executable] + sys.argv)
-
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 from isaaclab.app import AppLauncher
@@ -46,22 +36,9 @@ args_cli = parser.parse_args()
 args_cli.enable_cameras = True
 
 # ── display subprocess ─────────────────────────────────────────────────────────
-_conda_prefix = os.environ.get("CONDA_PREFIX", "")
-_CONDA_SP = (
-    os.path.join(
-        _conda_prefix,
-        "lib",
-        f"python{sys.version_info.major}.{sys.version_info.minor}",
-        "site-packages",
-    )
-    if _conda_prefix
-    else ""
-)
-
-_DISPLAY_SCRIPT = rf"""
+_DISPLAY_SCRIPT = r"""
 import sys, os
 sys.path = [
-    "{_CONDA_SP}",
     *[p for p in sys.path if "pip_prebundle" not in p and "omni" not in p],
 ]
 import cv2, time, signal

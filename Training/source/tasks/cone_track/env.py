@@ -1,17 +1,30 @@
 """MuSHR nano v2 RC car — cone-track navigation environment (DirectRLEnv).
 
-Observation space:
-    [0:N]        flattened blue-mask image from center RGB camera, after HSV filtering
-                 and downsampling.  1.0 = blue cone pixel, 0.0 = non-blue pixel.
-    [N]          (optional) average wheel surface speed ∈ [0, 1], normalized by
-                 max_velocity_m_s.  Only appended when include_wheel_vel=True.
+Observation space (19 scalars, no CNN needed):
+    Lane geometry features extracted from the binary blue mask (see lane_features.py):
 
-Camera profile (center RGB camera):
+    [0:4]    left  polynomial coeffs     [a0, a1, a2, a3]   x = a0 + a1·y + a2·y² + a3·y³
+    [4:8]    right polynomial coeffs     [a0, a1, a2, a3]
+    [8]      left  lane x at bottom      normalised by W    ∈ [0, 1]
+    [9]      right lane x at bottom      normalised by W    ∈ [0, 1]
+    [10]     lane width at bottom        right_x − left_x   ∈ [0, 1]
+    [11]     centre offset               (l+r)/2 − 0.5      ∈ [-0.5, 0.5]
+    [12]     left  curvature at bottom   2·a2 + 6·a3
+    [13]     right curvature at bottom   2·a2 + 6·a3
+    [14]     left  detected flag         {0, 1}
+    [15]     right detected flag         {0, 1}
+    [16]     left  confidence            blue fraction in left  image half  ∈ [0, 1]
+    [17]     right confidence            blue fraction in right image half  ∈ [0, 1]
+    [18]     (optional) wheel speed      normalised by max_velocity_m_s     ∈ [0, 1]
+
+    When include_wheel_vel=False the observation has 18 scalars; when True,
+    it has 19.  ~10 000× smaller than the old flattened-mask pipeline (203 521).
+
+Vision pipeline (center RGB camera):
     - Sensor: RGB, 848×480 at 120 fps
     - FOV: 120°(H) × 66.7°(V) pinhole
-    - Blue-only HSV mask: only blue pixels pass; everything else is crushed to black.
-      Shadows are suppressed by the mask, producing a clean high-contrast binary image.
-    - Policy runs at 120 Hz (sim 480 Hz, decimation=4)
+    - Blue-only HSV mask → morphological opening → lane curve fitting
+      (all on GPU).  18 lane parameters fed directly to a small MLP.
 
 Action space (2):
     [0]  throttle command in [-1, 1] — forward-only (the car never reverses):
@@ -58,6 +71,7 @@ from collections.abc import Sequence
 
 import isaaclab.sim as sim_utils
 import torch
+import torch.nn.functional as F
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import Articulation, ArticulationCfg
 from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
@@ -73,14 +87,21 @@ from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.math import quat_from_euler_xyz
 
-from .parameters import (
-    CAM_H,
-    CAM_W,
-    DOWNSAMPLING_AMOUNT,
-    INCLUDE_WHEEL_VEL,
-    VISION_CROP_BOTTOM_FRACTION,
-    VISION_CROP_TOP_FRACTION,
-)
+from .lane_features import extract_lane_features
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Vision pipeline constants
+# ═══════════════════════════════════════════════════════════════════════════
+CAM_H: int = 480  # 480p vertical resolution (matches raw sensor)
+CAM_W: int = 848  # preserves original 848/480 ≈ 1.767 aspect ratio
+LANE_FEATURE_SIZE: int = 18
+
+# Crop fractions applied to the raw camera frame (before lane extraction).
+VISION_CROP_TOP_FRACTION: float = 0.5
+VISION_CROP_BOTTOM_FRACTION: float = 0.0
+
+# Append normalised wheel speed to the observation?
+INCLUDE_WHEEL_VEL: bool = True
 
 # ---------------------------------------------------------------------------
 # Asset USD paths  (relative to this file → project root → assets/)
@@ -113,10 +134,14 @@ _RGB_FOCAL_MM = 2.87
 _RGB_H_APERTURE_MM = 2.0 * _RGB_FOCAL_MM * math.tan(math.radians(120.0 / 2.0))
 _RGB_V_APERTURE_MM = 2.0 * _RGB_FOCAL_MM * math.tan(math.radians(66.7 / 2.0))
 
-_REMAINING_FRACTION = max(0.0, 1.0 - VISION_CROP_TOP_FRACTION - VISION_CROP_BOTTOM_FRACTION)
+_REMAINING_FRACTION = max(
+    0.0, 1.0 - VISION_CROP_TOP_FRACTION - VISION_CROP_BOTTOM_FRACTION
+)
 _CROPPED_CAM_H = max(1, int(CAM_H * _REMAINING_FRACTION))
 _NEW_V_APERTURE = _RGB_V_APERTURE_MM * _REMAINING_FRACTION
-_V_APERTURE_OFFSET = _RGB_V_APERTURE_MM * (VISION_CROP_BOTTOM_FRACTION - VISION_CROP_TOP_FRACTION) / 2.0
+_V_APERTURE_OFFSET = (
+    _RGB_V_APERTURE_MM * (VISION_CROP_BOTTOM_FRACTION - VISION_CROP_TOP_FRACTION) / 2.0
+)
 
 # Robot links monitored for wall contact.
 WALL_CONTACT_LINKS = (
@@ -153,23 +178,22 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     decimation: int = 4  # sim steps per policy step
     episode_length_s: float = 90.0  # episode duration in seconds
     action_space: int = 2
-    # observation_space is patched in ConeTrackEnv.__init__ after computing
-    # the exact cropped vision mask size.  The placeholder below keeps
-    # @configclass happy; the real value is written before super().__init__().
+    # observation_space is patched in ConeTrackEnv.__init__ (18 lane features
+    # + optional speed).  The placeholder below keeps @configclass happy.
     observation_space: int = 1  # patched in __init__
     state_space: int = 0
 
     # sim.dt and sim.render_interval are set in __post_init__ from policy_hz & decimation
     sim: SimulationCfg = SimulationCfg(
         physx=sim_utils.PhysxCfg(
-            gpu_heap_capacity=2**23,                  # 8 MB (default 67 MB)
-            gpu_collision_stack_size=2**23,            # 8 MB (default 67 MB)
-            gpu_found_lost_pairs_capacity=2**19,       # 0.5 MB (default 2M)
+            gpu_heap_capacity=2**23,  # 8 MB (default 67 MB)
+            gpu_collision_stack_size=2**23,  # 8 MB (default 67 MB)
+            gpu_found_lost_pairs_capacity=2**19,  # 0.5 MB (default 2M)
             gpu_found_lost_aggregate_pairs_capacity=2**20,  # 1 MB (default 34 MB)
             gpu_total_aggregate_pairs_capacity=2**19,  # 0.5 MB (default 2M)
-            gpu_max_rigid_contact_count=2**20,         # 1M (default 8M)
-            gpu_temp_buffer_capacity=2**21,            # 2 MB (default 16M)
-            gpu_max_num_partitions=4,                  # 4 partitions (default 8)
+            gpu_max_rigid_contact_count=2**20,  # 1M (default 8M)
+            gpu_temp_buffer_capacity=2**21,  # 2 MB (default 16M)
+            gpu_max_num_partitions=4,  # 4 partitions (default 8)
         ),
     )
 
@@ -182,21 +206,15 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # ════════════════════════════════════════════════════════════════════════
     # CAMERA — center RGB (848×480, 120 fps, 120°×66.7° FOV)
     # ════════════════════════════════════════════════════════════════════════
-    # The raw RGB frame is HSV-filtered for blue pixels → binary mask (white =
-    # blue detected, black = everything else).  Shadows are suppressed by the
-    # value-channel lower bound.  The binary mask is then cropped (top/bottom
-    # fractions) and downsampled to (W/downsampling_amount) × (H/downsampling_amount).
+    # The raw RGB frame is HSV-filtered for blue pixels → binary mask.
+    # The mask is cropped (top/bottom fractions) and fed directly into the
+    # lane-curve feature extractor (no downsampling, no CNN).
 
-    # Crop fractions: fraction of raw pixel rows discarded before downsampling.
+    # Crop fractions: fraction of raw pixel rows discarded before extraction.
     #   top    → removes sky / distant background
     #   bottom → removes near-ground clutter and the robot's own body
-    vision_crop_top_fraction: float = VISION_CROP_TOP_FRACTION
-    vision_crop_bottom_fraction: float = VISION_CROP_BOTTOM_FRACTION
-
-    # ── Policy image downsampling ──────────────────────────────────────────
-    # After HSV filtering and cropping, the binary mask is downsampled by this
-    # factor in both dimensions before being flattened into the observation vector.
-    downsampling_amount: int = DOWNSAMPLING_AMOUNT
+    vision_crop_top_fraction: float = 0.5
+    vision_crop_bottom_fraction: float = 0.0
 
     # ════════════════════════════════════════════════════════════════════════
     # SPAWN — initial robot position, heading, and speed
@@ -287,7 +305,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     ground_static_friction: float = 2.0  # static μ (grip before slip); traction ≈ μ·m·g
     ground_dynamic_friction: float = 1.6  # sliding μ (once a wheel breaks traction)
     suspension_stiffness: float = (
-        1e6  # suspension-joint lock stiffness (rigid; stops energy-sapping travel)
+        1e7  # suspension-joint lock stiffness (rigid; stops energy-sapping travel)
     )
     max_steer_rad: float = 0.488  # ≈28° max front-wheel steer angle
 
@@ -314,7 +332,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # This is the primary speed signal — essential for braking-before-corners.
     # On real hardware: read wheel encoder RPM, average all 4, multiply by WHEEL_RADIUS,
     # divide by max_velocity_m_s, clamp to [0, 1].
-    include_wheel_vel: bool = INCLUDE_WHEEL_VEL
+    include_wheel_vel: bool = True
 
     # ════════════════════════════════════════════════════════════════════════
     # REWARD WEIGHTS
@@ -512,33 +530,17 @@ class ConeTrackEnv(DirectRLEnv):
         # ContactSensor dict must exist before super().__init__() calls _setup_scene().
         self._wall_contact_sensors: dict[str, ContactSensor] = {}
 
-        # Compute exact vision observation size.
-        # 1. Crop: remove top/bottom rows from the raw frame.
-        # 2. Downsample: bilinear resize by downsampling_amount in both axes.
-        cam_h = cfg.camera_center_cfg.height
-        cam_w = cfg.camera_center_cfg.width
-        
-        # The camera image is already cropped by Isaac Sim
-        cropped_h = cam_h
-        cropped_w = cam_w
-
-        ds = cfg.downsampling_amount
-        self._policy_depth_w = max(1, cropped_w // ds)
-        self._policy_depth_h = max(1, cropped_h // ds)
-
-        vision_obs_size = self._policy_depth_h * self._policy_depth_w
+        # Lane-feature observation size (no downsampling, no CNN).
+        lane_obs_size = LANE_FEATURE_SIZE
 
         extra_obs = 0
         if cfg.include_wheel_vel:
             extra_obs += 1
 
-        cfg.observation_space = vision_obs_size + extra_obs  # 1 camera
+        cfg.observation_space = lane_obs_size + extra_obs
 
         print(
-            f"[ConeTrackEnv] Vision obs: raw {cam_w}×{cam_h} "
-            f"→ crop {cropped_w}×{cropped_h} "
-            f"→ policy {self._policy_depth_w}×{self._policy_depth_h} "
-            f"= {vision_obs_size} px  |  "
+            f"[ConeTrackEnv] Lane features: {lane_obs_size} params  |  "
             f"+ veloc={cfg.include_wheel_vel}  |  "
             f"total obs = {cfg.observation_space}"
         )
@@ -661,12 +663,12 @@ class ConeTrackEnv(DirectRLEnv):
         self._spawn_escaped = torch.zeros(
             self.num_envs, dtype=torch.bool, device=self.device
         )
-        # Vision observation caches (policy resolution after color filtering + downsample)
-        _cam_flat = self._policy_depth_h * self._policy_depth_w
-        self._camera_center_obs = torch.zeros(
-            self.num_envs, _cam_flat, device=self.device, dtype=torch.float32
+        # Lane-feature cache (replaces old flat-mask observation)
+        self._lane_features = torch.zeros(
+            self.num_envs, LANE_FEATURE_SIZE, device=self.device, dtype=torch.float32
         )
-        self._last_camera_update_step = -1
+        self._lane_mask_cache = None  # [N, H, W] binary mask, held for debug use
+        self._vision_cache_valid = False
 
     # ------------------------------------------------------------------
     # Scene setup
@@ -823,6 +825,8 @@ class ConeTrackEnv(DirectRLEnv):
         Latency model: raw actions are pushed into _action_delay_buf; actuators
         receive the command from delay_steps ticks ago.
         """
+        self._vision_cache_valid = False
+
         raw = actions[:, :2].clamp(-1.0, 1.0)  # [N, 2]  — undelayed policy output
 
         # Push into delay FIFO and read the oldest (delayed) entry
@@ -918,90 +922,63 @@ class ConeTrackEnv(DirectRLEnv):
     # ------------------------------------------------------------------
 
     def _process_single_rgb(self, camera) -> torch.Tensor:
-        """GPU vision pipeline for RGB camera → [N, policy_h*policy_w] binary mask.
+        """GPU vision pipeline for RGB camera → [N, H, W] binary blue mask.
 
-        Pipeline: raw RGB → blue HSV mask → morphological noise removal → downsample.
+        Pipeline: raw RGB → HSV → blue threshold → morphological noise removal.
         Entirely GPU-based: no CPU copies or per-env Python loops.
+        Returns the mask at the camera's native resolution (already cropped
+        by Isaac Sim) — no downsampling.
         """
-        import torch.nn.functional as F
+        rgb = camera.data.output["rgb"][..., :3].float()  # [N, H, W, 3]
+        rgb.div_(255.0)
 
-        rgb = camera.data.output["rgb"][..., :3]  # [N, H, W, 3]
-        N, H, W, _ = rgb.shape
-
-        # Normalise to [0, 1]; handle both uint8 and float inputs
-        if rgb.dtype == torch.uint8:
-            rgb = rgb.float() / 255.0
-        else:
-            rgb = rgb.float().clamp(0.0, 1.0)
-
-        # ── RGB → HSV on GPU (standard formula, H in [0, 360], SV in [0, 1]) ──
+        # ── RGB → HSV (vectorized, no branching) ───────────────────────────
         r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
-
         cmax, _ = rgb.max(dim=-1)
         cmin, _ = rgb.min(dim=-1)
         delta = cmax - cmin
-
-        # Hue
-        h = torch.zeros_like(cmax)
         valid = delta > 1e-8
+        delta_safe = delta.clamp(min=1e-8)
 
-        # Cmax == R
-        mask_r = (cmax == r) & valid
-        h[mask_r] = ((g[mask_r] - b[mask_r]) / delta[mask_r]) % 6.0 * 60.0
+        h = torch.where(
+            cmax == r, ((g - b) / delta_safe) % 6.0,
+            torch.where(cmax == g, (b - r) / delta_safe + 2.0,
+                        (r - g) / delta_safe + 4.0)
+        )
+        h = h * 60.0 % 360.0
+        h[~valid] = 0.0
 
-        # Cmax == G
-        mask_g = (cmax == g) & valid & ~mask_r
-        h[mask_g] = ((b[mask_g] - r[mask_g]) / delta[mask_g] + 2.0) * 60.0
-
-        # Cmax == B
-        mask_b = valid & ~mask_r & ~mask_g
-        h[mask_b] = ((r[mask_b] - g[mask_b]) / delta[mask_b] + 4.0) * 60.0
-
-        h = h % 360.0
-
-        # Saturation
         s = torch.where(cmax > 0, delta / cmax, torch.zeros_like(cmax))
-
-        # Value
         v = cmax
 
-        # ── Blue inRange mask (OpenCV-compatible thresholds) ────────────────
-        # Original OpenCV thresholds: lower=[90,30,50], upper=[150,255,255] in
-        # OpenCV HSV (H/2, S*255, V*255).  Converted to standard HSV ranges:
-        in_h_low, in_h_high = 180.0, 300.0
-        in_s_low = 30.0 / 255.0
-        in_v_low = 50.0 / 255.0
-
+        # ── Blue inRange mask ──────────────────────────────────────────────
         mask = (
-            (h >= in_h_low) & (h <= in_h_high)
-            & (s >= in_s_low)
-            & (v >= in_v_low)
+            (h >= 180.0) & (h <= 300.0)
+            & (s >= 30.0 / 255.0)
+            & (v >= 50.0 / 255.0)
         ).float()
 
-        # ── Morphological opening: remove noise (replaces CPU connected-component filter) ──
-        k = 3
-        p = k // 2
-        # Erosion →  dilation
-        mask = -F.max_pool2d(-mask.unsqueeze(1), k, stride=1, padding=p)
-        mask = F.max_pool2d(mask, k, stride=1, padding=p)
-        mask = mask.squeeze(1)
+        # ── Morphological opening: remove noise ──
+        mask = mask.unsqueeze_(1)
+        mask = -F.max_pool2d(-mask, 3, stride=1, padding=1)
+        mask = F.max_pool2d(mask, 3, stride=1, padding=1)
 
-        # ── Downsample to policy resolution ──────────────────────────────────
-        mask_4d = F.interpolate(
-            mask.unsqueeze(1),
-            size=(self._policy_depth_h, self._policy_depth_w),
-            mode="bilinear",
-            align_corners=False,
-        )
-        return mask_4d.squeeze(1).reshape(self.num_envs, -1).to(torch.float32)
+        return mask.squeeze_(1)  # [N, H, W]
 
     def _update_vision_cache(self) -> None:
-        """Process center camera and write self._camera_center_obs."""
-        current_step = int(self.episode_length_buf.max().item())
-        if self._last_camera_update_step == current_step:
+        """Process center camera → binary mask → lane features."""
+        if self._vision_cache_valid:
             return
-        self._last_camera_update_step = current_step
-        self._camera_center_obs = self._process_single_rgb(self.camera_center)
+        self._vision_cache_valid = True
+
+        # Step 1: raw RGB → binary blue mask  [N, H, W]
+        mask = self._process_single_rgb(self.camera_center)
+
+        # Cache mask for optional debug visualisation
+        self._lane_mask_cache = mask
+
+        # Step 2: binary mask → lane geometry parameters  [N, LANE_FEATURE_SIZE]
+        self._lane_features = extract_lane_features(mask)
 
     # ------------------------------------------------------------------
     # Observations
@@ -1010,14 +987,16 @@ class ConeTrackEnv(DirectRLEnv):
     def _get_observations(self) -> dict:
         self._update_vision_cache()
 
-        parts = [self._camera_center_obs]
+        parts = [self._lane_features]
         if self.cfg.include_wheel_vel:
             wheel_omega_mean = (
                 self.robot.data.joint_vel[:, self._all_throttle_ids].abs().mean(dim=-1)
             )
             wheel_vel_norm = (
-                wheel_omega_mean * WHEEL_RADIUS / self.cfg.max_velocity_m_s
-            ).clamp(0.0, 1.0).to(torch.float32)
+                (wheel_omega_mean * WHEEL_RADIUS / self.cfg.max_velocity_m_s)
+                .clamp(0.0, 1.0)
+                .to(torch.float32)
+            )
             parts.append(wheel_vel_norm.unsqueeze(-1))  # [N, 1]
 
         obs = torch.cat(parts, dim=-1)
