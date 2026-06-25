@@ -226,12 +226,11 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # Must match autopilot.py MAX_DISTANCE / 1000.  ArduCam supports 2000 mm or 4000 mm only.
     depth_max_m: float = 2.0
 
-    # ── Policy image downsampling ──────────────────────────────────────────
-    # After cropping the raw depth frame (240×≈40 at defaults) the image is
-    # bilinearly downsampled to this resolution before being flattened into
-    # the observation vector.  Smaller = faster MLP convergence.
+    # ── Policy image resolution ────────────────────────────────────────────
+    # The policy now contains a lightweight CNN, so keep more spatial structure
+    # than the old MLP path while avoiding excessive rollout/activation memory.
     # policy_depth_height < 0 → auto-compute from cropped aspect ratio.
-    policy_depth_width: int = 120
+    policy_depth_width: int = 160
     policy_depth_height: int = -1
 
     # ════════════════════════════════════════════════════════════════════════
@@ -365,7 +364,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # REWARD WEIGHTS
     # ════════════════════════════════════════════════════════════════════════
     # Constant reward per step the agent stays alive (not crashed / stuck).
-    alive_weight: float = 0.03  # 0.04
+    alive_weight: float = 0.06  # 0.04
 
     # Distance: rewards physical metres covered each step (v × dt).
     distance_weight: float = 4.0
@@ -553,7 +552,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
         / 240.0,  # render only at policy steps (decimation=8, sim=240Hz)
         # Render at the sensor's native 240x180 to match the real ArduCam TOF.
         # All noise effects are applied at this full resolution before cropping
-        # and downsampling, mirroring how the real camera produces noisy depth.
+        # and policy-side resizing, mirroring how the real camera produces noisy depth.
         height=180,
         width=240,
         data_types=["distance_to_image_plane"],
@@ -625,7 +624,7 @@ class ConeTrackEnv(DirectRLEnv):
 
         # Compute exact depth observation size (same for both cameras).
         # 1. Crop: remove top/bottom rows from the raw 240×180 frame.
-        # 2. Downsample: bilinear resize to policy_depth_width × policy_depth_height.
+        # 2. Resize: bilinear resize to policy_depth_width × policy_depth_height.
         cam_h = cfg.camera_left_cfg.height  # 180
         cam_w = cfg.camera_left_cfg.width  # 240
         remaining = max(
@@ -786,7 +785,7 @@ class ConeTrackEnv(DirectRLEnv):
         # all but one selected set. This flag tracks whether that warmup hide has run.
         self._assets_warmup_done: bool = False
 
-        # Depth observation caches (policy resolution after crop + downsample)
+        # Depth observation caches (policy resolution after crop + resize)
         _cam_flat = self._policy_depth_h * self._policy_depth_w
         self._camera_left_obs = torch.zeros(
             self.num_envs, _cam_flat, device=self.device
@@ -1249,7 +1248,7 @@ class ConeTrackEnv(DirectRLEnv):
         """Shared depth pipeline for one TiledCamera → [N, policy_h*policy_w].
 
         Noise effects are applied at the camera's full 240×180 resolution before
-        cropping and downsampling, matching the real ArduCam TOF sensor pipeline.
+        cropping and policy-side resizing, matching the real ArduCam TOF sensor pipeline.
         """
         import torch.nn.functional as F
 
