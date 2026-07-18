@@ -1,30 +1,20 @@
 """MuSHR nano v2 RC car — cone-track navigation environment (DirectRLEnv).
 
-Observation space (19 scalars, no CNN needed):
-    Lane geometry features extracted from the binary blue mask (see lane_features.py):
+Observation space (4×N + 1, no CNN needed):
+    Raw bounding boxes from Replicator's GPU-accelerated bbox annotator
+    (simulates YOLO output).
 
-    [0:4]    left  polynomial coeffs     [a0, a1, a2, a3]   x = a0 + a1·y + a2·y² + a3·y³
-    [4:8]    right polynomial coeffs     [a0, a1, a2, a3]
-    [8]      left  lane x at bottom      normalised by W    ∈ [0, 1]
-    [9]      right lane x at bottom      normalised by W    ∈ [0, 1]
-    [10]     lane width at bottom        right_x − left_x   ∈ [0, 1]
-    [11]     centre offset               (l+r)/2 − 0.5      ∈ [-0.5, 0.5]
-    [12]     left  curvature at bottom   2·a2 + 6·a3
-    [13]     right curvature at bottom   2·a2 + 6·a3
-    [14]     left  detected flag         {0, 1}
-    [15]     right detected flag         {0, 1}
-    [16]     left  confidence            blue fraction in left  image half  ∈ [0, 1]
-    [17]     right confidence            blue fraction in right image half  ∈ [0, 1]
-    [18]     (optional) wheel speed      normalised by max_velocity_m_s     ∈ [0, 1]
+    [0:4*N]  bounding boxes (x_min, y_min, x_max, y_max) for up to N cones,
+             sorted left-to-right by x_min.  Padded with zeros when fewer
+             than N cones are visible.  Coordinates are in pixel space of the
+             (cropped) camera image [0, W) × [0, H).
 
-    When include_wheel_vel=False the observation has 18 scalars; when True,
-    it has 19.  ~10 000× smaller than the old flattened-mask pipeline (203 521).
+    [4*N]    wheel speed normalised by max_velocity_m_s  ∈ [0, 1]
 
-Vision pipeline (center RGB camera):
-    - Sensor: RGB, 848×480 at 120 fps
-    - FOV: 120°(H) × 66.7°(V) pinhole
-    - Blue-only HSV mask → morphological opening → lane curve fitting
-      (all on GPU).  18 lane parameters fed directly to a small MLP.
+    Bounding boxes are produced by the Replicator bounding_box_2d_tight_fast
+    annotator attached to each environment's camera render product.  This
+    matches the YOLO detection pipeline on the real car — the policy never
+    sees raw pixels.
 
 Action space (2):
     [0]  throttle command in [-1, 1] — forward-only (the car never reverses):
@@ -44,12 +34,12 @@ Actuation (Ackermann / AWD, effort-controlled DC motor):
     - Front wheel steer receives position target (rad) = tan(steering_angle)
       (tan-convention matches the joint representation in mushr_nano_v2.usd)
 
-Why blue-mask RGB:
-    A single center RGB camera with HSV blue filtering gives the policy a high-contrast
-    binary image where only the blue track stripes / cones are visible.  Shadows and
-    background are suppressed by the mask, providing a clean signal for RL training —
-    the agent learns to follow blue features without being distracted by lighting or
-    texture variation.
+Observation pipeline (Replicator bbox annotator):
+    Cone prims with semantic label "cone" are placed at track boundary
+    positions during scene setup.  The Replicator bounding_box_2d_tight_fast
+    annotator returns GPU-resident bounding boxes for each env's camera at
+    every policy step.  Boxes are sorted left-right, padded/truncated to
+    MAX_BBOXES, and concatenated with scalar wheel speed.
 
 Termination conditions:
     - Wall contact: any horizontal normal force on robot links above wall_contact_force_thresh_n
@@ -70,8 +60,8 @@ import os
 from collections.abc import Sequence
 
 import isaaclab.sim as sim_utils
+import numpy as np
 import torch
-import torch.nn.functional as F
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import Articulation, ArticulationCfg
 from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
@@ -87,21 +77,15 @@ from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.math import quat_from_euler_xyz
 
-from .lane_features import extract_lane_features
-
 # ═══════════════════════════════════════════════════════════════════════════
-# Vision pipeline constants
+# Camera & bbox observation constants
 # ═══════════════════════════════════════════════════════════════════════════
 CAM_H: int = 480  # 480p vertical resolution (matches raw sensor)
 CAM_W: int = 848  # preserves original 848/480 ≈ 1.767 aspect ratio
-LANE_FEATURE_SIZE: int = 18
 
-# Crop fractions applied to the raw camera frame (before lane extraction).
-VISION_CROP_TOP_FRACTION: float = 0.5
-VISION_CROP_BOTTOM_FRACTION: float = 0.0
-
-# Append normalised wheel speed to the observation?
-INCLUDE_WHEEL_VEL: bool = True
+# Number of bounding boxes in the observation (configurable via
+# ConeTrackEnvCfg.max_bboxes at the task level).
+MAX_BBOXES: int = 20
 
 # ---------------------------------------------------------------------------
 # Asset USD paths  (relative to this file → project root → assets/)
@@ -113,7 +97,7 @@ _REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "../../../
 _EXPORT_DIR = os.path.join(_REPO_ROOT, "CAD", "Track", "Export")
 
 MUSHR_USD = os.path.join(_ASSETS_DIR, "mushr_nano_v2.usd")
-TRACK_USD = os.path.join(_EXPORT_DIR, "Lines.usdc")
+TRACK_USD = os.path.join(_EXPORT_DIR, "Track_2.usdc")
 WALL_USD = os.path.join(_EXPORT_DIR, "Walls.usdc")
 
 # ---------------------------------------------------------------------------
@@ -126,22 +110,21 @@ WHEEL_RADIUS = 0.037  # m  (82 mm diameter wheels)
 TRACK_SCALE = 1.0
 
 # ---------------------------------------------------------------------------
-# Center RGB camera optics (IMX708, f=2.87mm, FOV 120°×66.7°)
+# Centre RGB camera optics (IMX708, f=2.87mm, FOV 120°×66.7°)
 # Focal length matches spec sheet; aperture ratio is what sets the FOV.
 # For Isaac PinholeCameraCfg: aperture / focal_length = 2 * tan(FOV/2).
+# Full sensor readout — no crop (848×480 at 60 Hz policy rate).
 # ---------------------------------------------------------------------------
 _RGB_FOCAL_MM = 2.87
 _RGB_H_APERTURE_MM = 2.0 * _RGB_FOCAL_MM * math.tan(math.radians(120.0 / 2.0))
 _RGB_V_APERTURE_MM = 2.0 * _RGB_FOCAL_MM * math.tan(math.radians(66.7 / 2.0))
 
-_REMAINING_FRACTION = max(
-    0.0, 1.0 - VISION_CROP_TOP_FRACTION - VISION_CROP_BOTTOM_FRACTION
-)
+_CROP_TOP_FRAC: float = 0.0
+_CROP_BOTTOM_FRAC: float = 0.0
+_REMAINING_FRACTION = max(0.0, 1.0 - _CROP_TOP_FRAC - _CROP_BOTTOM_FRAC)
 _CROPPED_CAM_H = max(1, int(CAM_H * _REMAINING_FRACTION))
 _NEW_V_APERTURE = _RGB_V_APERTURE_MM * _REMAINING_FRACTION
-_V_APERTURE_OFFSET = (
-    _RGB_V_APERTURE_MM * (VISION_CROP_BOTTOM_FRACTION - VISION_CROP_TOP_FRACTION) / 2.0
-)
+_V_APERTURE_OFFSET = _RGB_V_APERTURE_MM * (_CROP_BOTTOM_FRAC - _CROP_TOP_FRAC) / 2.0
 
 # Robot links monitored for wall contact.
 WALL_CONTACT_LINKS = (
@@ -164,7 +147,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
 
     Sections
     --------
-    CAMERA          — center RGB, 848×480, 120 fps, blue-mask pipeline
+    CAMERA          — center RGB, 848×480, 120 fps, Replicator bbox annotator
     SPAWN           — starting position, heading, and speed
     SPAWN SPEED     — initial episode velocity range
     DYNAMICS        — physics-based motor model, steering limit
@@ -178,24 +161,32 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     decimation: int = 4  # sim steps per policy step
     episode_length_s: float = 90.0  # episode duration in seconds
     action_space: int = 2
-    # observation_space is patched in ConeTrackEnv.__init__ (18 lane features
-    # + optional speed).  The placeholder below keeps @configclass happy.
+    # observation_space is patched in ConeTrackEnv.__init__ (4×max_bboxes
+    # bbox coords + optional wheel speed).  The placeholder below keeps
+    # @configclass happy.
     observation_space: int = 1  # patched in __init__
     state_space: int = 0
+    # Number of bounding boxes in the observation (padded/truncated).
+    max_bboxes: int = 30
+    # Downscale camera resolution by this factor to save VRAM.
+    # Effective resolution = (CAM_W // downscale_factor, CAM_H // downscale_factor)
+    downscale_factor: int = 2
+
+    # ════════════════════════════════════════════════════════════════════════
+    # BBOX FILTERING  — YOLO-like realism applied in _update_bbox_cache and
+    #                   consumed by visualize / play / train identically.
+    # ════════════════════════════════════════════════════════════════════════
+    # Max distance (meters).  Cones farther away are discarded.
+    max_bbox_distance: float = 4.0
+    # Minimum bbox area (px²).  Smaller detections are discarded.
+    min_bbox_area: int = 150
+    # Minimum bbox side length (px).  Detections narrower or shorter are discarded.
+    min_bbox_side: int = 5
+    # Tolerance (px) for the occlusion containment check.
+    bbox_occlusion_tol: int = 2
 
     # sim.dt and sim.render_interval are set in __post_init__ from policy_hz & decimation
-    sim: SimulationCfg = SimulationCfg(
-        physx=sim_utils.PhysxCfg(
-            gpu_heap_capacity=2**23,  # 8 MB (default 67 MB)
-            gpu_collision_stack_size=2**23,  # 8 MB (default 67 MB)
-            gpu_found_lost_pairs_capacity=2**19,  # 0.5 MB (default 2M)
-            gpu_found_lost_aggregate_pairs_capacity=2**20,  # 1 MB (default 34 MB)
-            gpu_total_aggregate_pairs_capacity=2**19,  # 0.5 MB (default 2M)
-            gpu_max_rigid_contact_count=2**20,  # 1M (default 8M)
-            gpu_temp_buffer_capacity=2**21,  # 2 MB (default 16M)
-            gpu_max_num_partitions=4,  # 4 partitions (default 8)
-        ),
-    )
+    sim: SimulationCfg = SimulationCfg()
 
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
         num_envs=26,
@@ -204,17 +195,11 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     )
 
     # ════════════════════════════════════════════════════════════════════════
-    # CAMERA — center RGB (848×480, 120 fps, 120°×66.7° FOV)
+    # CAMERA — centre RGB (848×480, 60 fps policy, 120°×66.7° FOV, 2.87 mm)
     # ════════════════════════════════════════════════════════════════════════
-    # The raw RGB frame is HSV-filtered for blue pixels → binary mask.
-    # The mask is cropped (top/bottom fractions) and fed directly into the
-    # lane-curve feature extractor (no downsampling, no CNN).
-
-    # Crop fractions: fraction of raw pixel rows discarded before extraction.
-    #   top    → removes sky / distant background
-    #   bottom → removes near-ground clutter and the robot's own body
-    vision_crop_top_fraction: float = 0.5
-    vision_crop_bottom_fraction: float = 0.0
+    # The camera renders at full 848×480 (no crop).  Replicator's
+    # bounding_box_2d_tight_fast annotator runs on this camera output to
+    # produce per-env bounding boxes — no pixel-level filtering.
 
     # ════════════════════════════════════════════════════════════════════════
     # SPAWN — initial robot position, heading, and speed
@@ -246,15 +231,6 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
 
     duplicate_with_flipped_yaw: bool = True  # if True, each (x, y, θ) spawns two episodes: one with +180deg rotation around z
     spawn_yaw_jitter_rad: float = 0.1  # ± heading noise applied in both modes
-
-    # One-time bonus the first time the car moves farther than spawn_escape_radius_m
-    # from its spawn position, scaled by how fast the car is moving at that moment:
-    #   reward = spawn_escape_reward × (current_speed / max_velocity_m_s)
-    # At max speed this gives the full bonus; at crawl speed it gives nearly nothing.
-    # Teaches aggressive initial acceleration without rewarding slow drift.
-    # Set spawn_escape_reward=0 to disable.
-    spawn_escape_radius_m: float = 0.5
-    spawn_escape_reward: float = 0.0
 
     # ════════════════════════════════════════════════════════════════════════
     # DYNAMICS — effort-controlled DC-motor drivetrain (AWD), tuned to real car
@@ -318,7 +294,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # TERMINATION THRESHOLDS
     # ════════════════════════════════════════════════════════════════════════
     # Horizontal contact force on any robot link that counts as a wall hit.
-    wall_contact_force_thresh_n: float = 1.0  # Newtonsgz
+    wall_contact_force_thresh_n: float = 1.0  # Newtons
 
     # slow_stop_speed_fraction — episode terminates when speed falls below this
     # (catches truly stuck / reversed agents; keep low so normal braking is fine)
@@ -343,10 +319,6 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # Distance: rewards physical metres covered each step (v × dt).
     distance_weight: float = 4.0
 
-    # Average-speed bonus: every step rewards the episode's mean forward speed
-    # from reset through the current step, normalized by max_velocity_m_s.
-    average_speed_weight: float = 0.0  # redundant with distance + non-Markovian; off
-
     # Steering deadzone penalty: only penalises steering beyond the deadzone.
     steer_deadzone_weight: float = 0.003
     steer_deadzone: float = 0.05  # fraction of max_steer_rad that is free
@@ -362,17 +334,6 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
 
     # Wheel slip penalty: penalises the difference between theoretical wheel speed and actual car speed.
     slip_weight: float = 0.5
-
-    # Braking reward V2: dense, instantaneous, no session state.
-    #   r_braking_v2 = weight × forward_speed² × |brake_input|       (only when throttle < 0)
-    # Quadratic in speed: braking at low speeds is nearly free reward-wise, while
-    # braking at high speed delivers a much larger payout — incentivises braking
-    # specifically where it matters (corner entries) rather than continuously.
-    #   At v = max_velocity, |brake| = 1 → r_braking_v2 = weight × v_max²
-    #   r_distance at v = max_velocity   ≈ distance_weight × dt × 1.0
-    # With weight = 0.1, v_max = 8 m/s   → r_braking_v2 = 6.4/step at full brake at top speed.
-    # At v = 2 m/s the same brake input yields only 0.4/step — 16× weaker than at top speed.
-    braking_v2_weight: float = 0.0
 
     # ── Lap completion reward ────────────────────────────────────────────────
     # Sparse reward fired when the agent crosses the start line (the line through
@@ -492,7 +453,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
         # update_period is set in __post_init__ from policy_hz
         height=_CROPPED_CAM_H,
         width=CAM_W,
-        data_types=["rgb"],
+        data_types=["rgb", "distance_to_camera"],
         spawn=sim_utils.PinholeCameraCfg(
             focal_length=_RGB_FOCAL_MM,
             horizontal_aperture=_RGB_H_APERTURE_MM,
@@ -512,11 +473,6 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
         debug_vis=False,
     )
 
-    # Live debug view in training — use scripts/rsl_rl/visualize.py instead.
-    show_camera_debug: bool = False
-    camera_debug_env_id: int = 0
-    camera_debug_interval: int = 2
-
 
 # ===========================================================================
 # Environment Class
@@ -530,23 +486,26 @@ class ConeTrackEnv(DirectRLEnv):
         # ContactSensor dict must exist before super().__init__() calls _setup_scene().
         self._wall_contact_sensors: dict[str, ContactSensor] = {}
 
-        # Lane-feature observation size (no downsampling, no CNN).
-        lane_obs_size = LANE_FEATURE_SIZE
+        # Apply downscale factor to camera resolution
+        if cfg.downscale_factor > 1:
+            cfg.camera_center_cfg.width = CAM_W // cfg.downscale_factor
+            cfg.camera_center_cfg.height = max(1, _CROPPED_CAM_H // cfg.downscale_factor)
+        self._cam_w = cfg.camera_center_cfg.width
+        self._cam_h = cfg.camera_center_cfg.height
 
-        extra_obs = 0
-        if cfg.include_wheel_vel:
-            extra_obs += 1
+        # Bbox observation: 5 values per bounding box (normalized x1, y1, x2, y2, valid) + wheel speed + 2 prev actions
+        bbox_obs_size = 5 * cfg.max_bboxes
 
-        cfg.observation_space = lane_obs_size + extra_obs
+        self._max_bboxes = cfg.max_bboxes
+        self._include_wheel_vel = True  # always append wheel speed
 
-        # Vision mask resolution (used by image_saver.py / visualize.py / play.py)
-        self._policy_depth_h = cfg.camera_center_cfg.height
-        self._policy_depth_w = cfg.camera_center_cfg.width
+        cfg.observation_space = bbox_obs_size + (1 if self._include_wheel_vel else 0) + 2
 
         print(
-            f"[ConeTrackEnv] Lane features: {lane_obs_size} params  |  "
-            f"+ veloc={cfg.include_wheel_vel}  |  "
-            f"total obs = {cfg.observation_space}"
+            f"[ConeTrackEnv] Bbox obs: {cfg.max_bboxes} bboxes × 4 = {bbox_obs_size}  |  "
+            f"+ wheel_vel={self._include_wheel_vel}  |  "
+            f"total obs = {cfg.observation_space}",
+            flush=True,
         )
 
         super().__init__(cfg, render_mode, **kwargs)
@@ -658,21 +617,12 @@ class ConeTrackEnv(DirectRLEnv):
             self.num_envs, dtype=torch.bool, device=self.device
         )
 
-        # Average-speed reward accumulator: sum of clamped forward velocity per env.
-        self._cumulative_forward_vel = torch.zeros(
-            self.num_envs, dtype=torch.float32, device=self.device
-        )
-        # Spawn-escape bonus tracking: world XY position at reset + one-time fired flag.
+        # Spawn position in world XY — used for lap-gate / start-line detection.
         self._spawn_pos = torch.zeros(self.num_envs, 2, device=self.device)
-        self._spawn_escaped = torch.zeros(
-            self.num_envs, dtype=torch.bool, device=self.device
+        # Bbox output buffer — [N, max_bboxes, 5] zeroed; filled each step.
+        self._bbox_obs = torch.zeros(
+            self.num_envs, cfg.max_bboxes, 5, device=self.device, dtype=torch.float32
         )
-        # Lane-feature cache (replaces old flat-mask observation)
-        self._lane_features = torch.zeros(
-            self.num_envs, LANE_FEATURE_SIZE, device=self.device, dtype=torch.float32
-        )
-        self._lane_mask_cache = None  # [N, H, W] binary mask, held for debug use
-        self._vision_cache_valid = False
 
     # ------------------------------------------------------------------
     # Scene setup
@@ -705,6 +655,22 @@ class ConeTrackEnv(DirectRLEnv):
         from pxr import Usd, UsdGeom, UsdPhysics, UsdShade
 
         stage = omni.usd.get_context().get_stage()
+
+        # Apply semantic labels to each cylinder mesh for bbox detection
+        track_root = stage.GetPrimAtPath("/World/Track")
+        if track_root.IsValid():
+            from pxr import Semantics
+
+            mesh_count = 0
+            for prim in Usd.PrimRange(track_root):
+                if prim.IsA(UsdGeom.Mesh):
+                    sem = Semantics.SemanticsAPI.Apply(prim, "class_cone")
+                    sem.CreateSemanticTypeAttr().Set("class")
+                    sem.CreateSemanticDataAttr().Set("cone")
+                    mesh_count += 1
+            print(
+                f"[ConeTrackEnv] Applied semantic labels to {mesh_count} track meshes"
+            )
 
         wheel_link_names = {
             "front_left_wheel_link",
@@ -816,6 +782,39 @@ class ConeTrackEnv(DirectRLEnv):
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
+        # ── Replicator annotator for semantic bbox detection ────────────────
+        self._setup_replicator_bbox(stage)
+
+    def _setup_replicator_bbox(self, stage) -> None:
+        """Create ONE tiled Replicator bbox annotator for all env cameras.
+
+        Uses a single tiled render product (matching TiledCamera's tile layout)
+        instead of per-env render products.  Saves (N-1) GPU framebuffers.
+        """
+        import omni.replicator.core as rep
+
+        camera_prim_paths = [
+            f"/World/envs/env_{env_id}/Robot/mushr_nano/base_link/camera_center"
+            for env_id in range(self.num_envs)
+        ]
+        rp = rep.create.render_product_tiled(
+            cameras=camera_prim_paths,
+            tile_resolution=(self._cam_w, self._cam_h),
+        )
+        annotator = rep.AnnotatorRegistry.get_annotator(
+            "bounding_box_2d_tight_fast"
+        )
+        annotator.attach([rp])
+        self._rep_annotator = annotator
+
+        # Tile grid layout: same convention as TiledCamera._tiling_grid_shape
+        self._tile_cols = math.ceil(math.sqrt(self.num_envs))
+        print(
+            f"[ConeTrackEnv] Created 1 tiled Replicator bbox annotator "
+            f"(grid {self._tile_cols}×{math.ceil(self.num_envs / self._tile_cols)}, "
+            f"{self._cam_w}×{self._cam_h} per tile)"
+        )
+
     # ------------------------------------------------------------------
     # Step hooks
     # ------------------------------------------------------------------
@@ -829,8 +828,6 @@ class ConeTrackEnv(DirectRLEnv):
         Latency model: raw actions are pushed into _action_delay_buf; actuators
         receive the command from delay_steps ticks ago.
         """
-        self._vision_cache_valid = False
-
         raw = actions[:, :2].clamp(-1.0, 1.0)  # [N, 2]  — undelayed policy output
 
         # Push into delay FIFO and read the oldest (delayed) entry
@@ -922,77 +919,174 @@ class ConeTrackEnv(DirectRLEnv):
         self.robot.set_joint_position_target(steer_positions, joint_ids=self._steer_ids)
 
     # ------------------------------------------------------------------
-    # Vision cache  (called once per step, shared by obs + rewards)
+    # Bbox observation pipeline
     # ------------------------------------------------------------------
 
-    def _process_single_rgb(self, camera) -> torch.Tensor:
-        """GPU vision pipeline for RGB camera → [N, H, W] binary blue mask.
+    @staticmethod
+    def filter_bboxes_numpy(
+        boxes_arr: np.ndarray,
+        depth_map: np.ndarray | None,
+        max_dist: float,
+        min_area: int,
+        min_side: int,
+        occlusion_tol: int,
+    ) -> np.ndarray:
+        """Apply YOLO-like filters to a structured bbox array.
 
-        Pipeline: raw RGB → HSV → blue threshold → morphological noise removal.
-        Entirely GPU-based: no CPU copies or per-env Python loops.
-        Returns the mask at the camera's native resolution (already cropped
-        by Isaac Sim) — no downsampling.
+        Returns a (M, 5) array where each row is (x1, y1, x2, y2, distance).
+        Filters applied in order: small → distance → occlusion.
         """
-        rgb = camera.data.output["rgb"][..., :3].float()  # [N, H, W, 3]
-        rgb.div_(255.0)
+        if boxes_arr is None or len(boxes_arr) == 0:
+            return np.zeros((0, 5), dtype=np.float32)
 
-        # ── RGB → HSV (vectorized, no branching) ───────────────────────────
-        r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
-        cmax, _ = rgb.max(dim=-1)
-        cmin, _ = rgb.min(dim=-1)
-        delta = cmax - cmin
-        valid = delta > 1e-8
-        delta_safe = delta.clamp(min=1e-8)
+        if boxes_arr.ndim == 0:
+            boxes_arr = boxes_arr[np.newaxis]
 
-        h = torch.where(
-            cmax == r, ((g - b) / delta_safe) % 6.0,
-            torch.where(cmax == g, (b - r) / delta_safe + 2.0,
-                        (r - g) / delta_safe + 4.0)
-        )
-        h = h * 60.0 % 360.0
-        h[~valid] = 0.0
+        H, W = depth_map.shape if depth_map is not None else (1, 1)
+        candidates = []
+        for i in range(len(boxes_arr)):
+            x1 = int(boxes_arr["x_min"][i])
+            y1 = int(boxes_arr["y_min"][i])
+            x2 = int(boxes_arr["x_max"][i])
+            y2 = int(boxes_arr["y_max"][i])
 
-        s = torch.where(cmax > 0, delta / cmax, torch.zeros_like(cmax))
-        v = cmax
+            w, h = x2 - x1, y2 - y1
+            if w < min_side or h < min_side or w * h < min_area:
+                continue
 
-        # ── Blue inRange mask ──────────────────────────────────────────────
-        mask = (
-            (h >= 180.0) & (h <= 300.0)
-            & (s >= 30.0 / 255.0)
-            & (v >= 50.0 / 255.0)
-        ).float()
+            dist = float("inf")
+            if depth_map is not None:
+                cx = int(np.clip((x1 + x2) // 2, 0, W - 1))
+                cy = int(np.clip((y1 + y2) // 2, 0, H - 1))
+                d = float(depth_map[cy, cx])
+                if d > 0 and np.isfinite(d):
+                    dist = d
+            if dist > max_dist:
+                continue
 
-        # ── Morphological opening: remove noise ──
-        mask = mask.unsqueeze_(1)
-        mask = -F.max_pool2d(-mask, 3, stride=1, padding=1)
-        mask = F.max_pool2d(mask, 3, stride=1, padding=1)
+            candidates.append((x1, y1, x2, y2, dist))
 
-        return mask.squeeze_(1)  # [N, H, W]
+        candidates.sort(key=lambda b: b[4])  # closest first
+        kept = []
+        for bbox in candidates:
+            x1, y1, x2, y2, _ = bbox
+            occluded = any(
+                (
+                    kx1 - occlusion_tol <= x1
+                    and ky1 - occlusion_tol <= y1
+                    and kx2 + occlusion_tol >= x2
+                    and ky2 + occlusion_tol >= y2
+                )
+                for kx1, ky1, kx2, ky2, _ in kept
+            )
+            if not occluded:
+                kept.append(bbox)
 
-    def _update_vision_cache(self) -> None:
-        """Process center camera → binary mask → lane features."""
-        if self._vision_cache_valid:
-            return
-        self._vision_cache_valid = True
+        return np.array(kept, dtype=np.float32).reshape(-1, 5)
 
-        # Step 1: raw RGB → binary blue mask  [N, H, W]
-        mask = self._process_single_rgb(self.camera_center)
+    def _update_bbox_cache(self) -> None:
+        """Read bounding boxes from the single tiled Replicator annotator.
 
-        # Cache mask for optional debug visualisation
-        self._lane_mask_cache = mask
+        The annotator is attached to a tiled render product covering all envs.
+        We split the tiled-space bboxes per-env using the same tile grid
+        as TiledCamera, convert to local pixel coords, filter, and
+        pad/truncate to max_bboxes.  Result in self._bbox_obs [N, max_bboxes, 4].
+        """
+        N = self.num_envs
+        device = self.device
+        bboxes = torch.zeros(N, self._max_bboxes, 5, device=device)
 
-        # Step 2: binary mask → lane geometry parameters  [N, LANE_FEATURE_SIZE]
-        self._lane_features = extract_lane_features(mask)
+        data = self._rep_annotator.get_data()
+        raw = data.get("data")
+        if raw is not None and len(raw) > 0:
+            if raw.ndim == 0:
+                raw = raw[np.newaxis]
+
+            cols = self._tile_cols
+            cam_w = float(self._cam_w)
+            cam_h = float(self._cam_h)
+
+            # Group bboxes by env based on tile position, convert to local coords
+            env_raw = [[] for _ in range(N)]
+            for i in range(len(raw)):
+                x1 = float(raw["x_min"][i])
+                y1 = float(raw["y_min"][i])
+                x2 = float(raw["x_max"][i])
+                y2 = float(raw["y_max"][i])
+
+                tile_col = int(x1 // cam_w)
+                tile_row = int(y1 // cam_h)
+                env_id = tile_row * cols + tile_col
+                if env_id >= N:
+                    continue
+
+                lx1 = x1 - tile_col * cam_w
+                ly1 = y1 - tile_row * cam_h
+                lx2 = x2 - tile_col * cam_w
+                ly2 = y2 - tile_row * cam_h
+
+                env_raw[env_id].append((lx1, ly1, lx2, ly2))
+
+            dt = np.dtype(
+                [("x_min", "f4"), ("y_min", "f4"), ("x_max", "f4"), ("y_max", "f4")]
+            )
+            cfg = self.cfg
+
+            for env_id in range(N):
+                if not env_raw[env_id]:
+                    continue
+
+                filtered_arr = np.array(
+                    [(x1, y1, x2, y2) for x1, y1, x2, y2 in env_raw[env_id]],
+                    dtype=dt,
+                )
+
+                depth_map = None
+                if "distance_to_camera" in self.camera_center.data.output:
+                    depth_map = (
+                        self.camera_center.data.output["distance_to_camera"][
+                            env_id, :, :, 0
+                        ]
+                        .cpu()
+                        .numpy()
+                    )
+
+                filtered = self.filter_bboxes_numpy(
+                    filtered_arr,
+                    depth_map,
+                    max_dist=cfg.max_bbox_distance,
+                    min_area=cfg.min_bbox_area,
+                    min_side=cfg.min_bbox_side,
+                    occlusion_tol=cfg.bbox_occlusion_tol,
+                )
+                k = min(len(filtered), self._max_bboxes)
+
+                env_boxes = torch.zeros(k, 5, device=device)
+                if k > 0:
+                    # Normalize by camera resolution
+                    env_boxes[:, 0] = torch.as_tensor(filtered[:k, 0], device=device) / cam_w
+                    env_boxes[:, 1] = torch.as_tensor(filtered[:k, 1], device=device) / cam_h
+                    env_boxes[:, 2] = torch.as_tensor(filtered[:k, 2], device=device) / cam_w
+                    env_boxes[:, 3] = torch.as_tensor(filtered[:k, 3], device=device) / cam_h
+                    env_boxes[:, 4] = 1.0  # validity flag
+
+                # Sort by bounding box area (descending) instead of x_min
+                areas = (env_boxes[:, 2] - env_boxes[:, 0]) * (env_boxes[:, 3] - env_boxes[:, 1])
+                sort_order = areas.argsort(descending=True)
+                env_boxes = env_boxes[sort_order]
+                bboxes[env_id, :k] = env_boxes
+
+        self._bbox_obs = bboxes
 
     # ------------------------------------------------------------------
     # Observations
     # ------------------------------------------------------------------
 
     def _get_observations(self) -> dict:
-        self._update_vision_cache()
+        self._update_bbox_cache()
 
-        parts = [self._lane_features]
-        if self.cfg.include_wheel_vel:
+        parts = [self._bbox_obs.reshape(self.num_envs, -1)]
+        if self._include_wheel_vel:
             wheel_omega_mean = (
                 self.robot.data.joint_vel[:, self._all_throttle_ids].abs().mean(dim=-1)
             )
@@ -1003,6 +1097,10 @@ class ConeTrackEnv(DirectRLEnv):
             )
             parts.append(wheel_vel_norm.unsqueeze(-1))  # [N, 1]
 
+        # Append previous actions to provide state for the rate penalties
+        parts.append(self._throttle_cmd_curr.unsqueeze(-1))
+        parts.append(self._steer_cmd_curr.unsqueeze(-1))
+
         obs = torch.cat(parts, dim=-1)
         return {"policy": obs}
 
@@ -1011,8 +1109,6 @@ class ConeTrackEnv(DirectRLEnv):
     # ------------------------------------------------------------------
 
     def _get_rewards(self) -> torch.Tensor:
-        self._update_vision_cache()
-
         lin_vel_b = self.robot.data.root_lin_vel_b[:, 0]  # m/s forward
         dt = self.cfg.decimation * self.cfg.sim.dt  # ≈ 1/policy_hz s
 
@@ -1021,16 +1117,7 @@ class ConeTrackEnv(DirectRLEnv):
             self.cfg.distance_weight * lin_vel_b / self.cfg.max_velocity_m_s * dt
         )
 
-        # Episode average-speed bonus: rewards sustained pace, not just current speed.
         forward_speed = lin_vel_b.clamp(min=0.0)
-        self._cumulative_forward_vel += forward_speed
-        speed_sample_count = self.episode_length_buf.float().clamp(min=1.0)
-        avg_speed_norm = (
-            self._cumulative_forward_vel
-            / speed_sample_count
-            / self.cfg.max_velocity_m_s
-        ).clamp(0.0, 1.0)
-        r_average_speed = self.cfg.average_speed_weight * avg_speed_norm
 
         pos_xy = self.robot.data.root_pos_w[:, :2]
 
@@ -1061,19 +1148,6 @@ class ConeTrackEnv(DirectRLEnv):
 
         r_alive = torch.full(
             (self.num_envs,), self.cfg.alive_weight, device=self.device
-        )
-
-        # ── Spawn-escape bonus ────────────────────────────────────────────────
-        # One-time reward scaled by speed at the moment of escape.  Full bonus only
-        # if the car is already moving at max speed when it crosses the radius.
-        spawn_dist = torch.linalg.vector_norm(pos_xy - self._spawn_pos, dim=-1)
-        just_escaped = (~self._spawn_escaped) & (
-            spawn_dist > self.cfg.spawn_escape_radius_m
-        )
-        self._spawn_escaped |= just_escaped
-        speed_frac = (lin_vel_b / self.cfg.max_velocity_m_s).clamp(0.0, 1.0)
-        r_spawn_escape = (
-            self.cfg.spawn_escape_reward * just_escaped.float() * speed_frac
         )
 
         # ── Proximity speed penalty (ray-cast against /World/Walls) ──────────────
@@ -1175,31 +1249,13 @@ class ConeTrackEnv(DirectRLEnv):
             "Lap/laps_per_min": laps_per_min,
         }
 
-        # ── Braking reward V2 ────────────────────────────────────────────────
-        # Instantaneous, no session state: r = weight × v_forward² × |brake_input|.
-        # The v² scaling means braking at low speed contributes almost nothing,
-        # while braking at high speed dominates — strong incentive to brake
-        # specifically when going fast (e.g., before corners) rather than always.
-        if self.cfg.braking_v2_weight > 0.0:
-            throttle_cmd_v2 = self._action_delay_buf[:, 0, 0]
-            brake_input_v2 = (-throttle_cmd_v2).clamp(0.0, 1.0)  # 0 if not braking
-            speed_fwd_v2 = lin_vel_b.clamp(min=0.0) / self.cfg.max_velocity_m_s
-            r_braking_v2 = (
-                self.cfg.braking_v2_weight * torch.pow(speed_fwd_v2, 2) * brake_input_v2
-            )
-        else:
-            r_braking_v2 = torch.zeros(self.num_envs, device=self.device)
-
         total = (
             r_alive
             + r_distance
-            + r_average_speed
             + r_steer_shape
             + r_steer_rate
             + r_throttle_rate
             + r_slip
-            + r_spawn_escape
-            + r_braking_v2
             + r_lap
         )
 
@@ -1311,9 +1367,7 @@ class ConeTrackEnv(DirectRLEnv):
         self._action_delay_buf[env_ids] = 0.0  # clears latency FIFO
 
         self._wall_ever_touched[env_ids] = False
-        self._cumulative_forward_vel[env_ids] = 0.0
         self._spawn_pos[env_ids_t] = spawn_xy
-        self._spawn_escaped[env_ids_t] = False
         self._lap_state[env_ids_t] = 0
         self._lap_start_step[env_ids_t] = 0
         self._spawn_heading_cos[env_ids_t] = torch.cos(base_yaw)

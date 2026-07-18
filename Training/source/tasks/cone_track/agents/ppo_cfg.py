@@ -11,7 +11,7 @@ from isaaclab_rl.rsl_rl import (
 
 @configclass
 class ConeTrackPPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    num_steps_per_env: int = 2000
+    num_steps_per_env: int = 1000
     max_iterations: int = 1000
     save_interval: int = 10
     experiment_name: str = "cone_track"
@@ -20,26 +20,25 @@ class ConeTrackPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     obs_groups = {"policy": ["policy"], "critic": ["policy"]}
 
     policy: RslRlPpoActorCriticCfg = RslRlPpoActorCriticCfg(
-        class_name="ConeTrackActorCritic",
         init_noise_std=1.0,
         actor_obs_normalization=True,
         critic_obs_normalization=True,
-        # Small MLP — input is just 19 compact lane parameters (no CNN)
-        actor_hidden_dims=[128, 64],
-        critic_hidden_dims=[128, 64],
+        # Small MLP — input is (4 × max_bboxes + optional wheel_speed) bbox coords
+        actor_hidden_dims=[256, 128, 64],
+        critic_hidden_dims=[256, 128, 64],
         activation="mish",
     )
 
     algorithm: RslRlPpoAlgorithmCfg = RslRlPpoAlgorithmCfg(
-        learning_rate=3e-5,
+        learning_rate=3e-4,
         schedule="adaptive",
         num_learning_epochs=4,
         num_mini_batches=8,
         clip_param=0.2,
-        entropy_coef=0.007,
+        entropy_coef=0.006,
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
-        gamma=0.9935,
+        gamma=0.993,
         lam=0.95,
         desired_kl=0.01,
         max_grad_norm=0.75,
@@ -54,7 +53,7 @@ class ConeTrackPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     #     activation="elu",
     #     # Recurrent core: gives the policy temporal memory so it can integrate
     #     # wheel-speed odometry, anticipate corners beyond the 2 m sensing horizon,
-    #     # and temporally filter the noisy depth frames.
+    #     # and temporally filter the noisy bbox observations.
     #     rnn_type="lstm",
     #     rnn_hidden_dim=256,
     #     rnn_num_layers=1,

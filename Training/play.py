@@ -45,7 +45,7 @@ parser.add_argument(
     "--fpv",
     action="store_true",
     default=False,
-    help="First-person view: force 1 env and open live Raw Camera + Cone Mask windows.",
+    help="First-person view: force 1 env and open live RGB + bbox overlay windows.",
 )
 parser.add_argument(
     "--vel_cap",
@@ -87,18 +87,20 @@ sys.path = [
 ]
 import cv2, time, signal
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.fonts.warning=false")
 OUT_DIR = "/tmp/mushr_debug"
 FILES = [
     (os.path.join(OUT_DIR, "raw_center.png"),    "Center Raw RGB"),
-    (os.path.join(OUT_DIR, "policy_center.png"), "Center Policy Mask"),
+    (os.path.join(OUT_DIR, "bbox_center.png"),   "Center BBox Overlay"),
 ]
 while not os.path.exists(os.path.join(OUT_DIR, "raw_center.png")):
     time.sleep(0.05)
 while True:
     for fpath, name in FILES:
-        img = cv2.imread(fpath)
-        if img is not None:
-            cv2.imshow(name, img)
+        if os.path.exists(fpath):
+            img = cv2.imread(fpath)
+            if img is not None:
+                cv2.imshow(name, img)
     if cv2.waitKey(33) & 0xFF == ord("q"):
         break
 cv2.destroyAllWindows()
@@ -125,11 +127,6 @@ import isaaclab_tasks  # noqa: F401
 import tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
-
-# Register custom CNN-ActorCritic so rsl_rl's eval("ConeTrackActorCritic") resolves
-import rsl_rl.runners.on_policy_runner
-from tasks.cone_track.agents.actor_critic_vision import ConeTrackActorCritic
-rsl_rl.runners.on_policy_runner.ConeTrackActorCritic = ConeTrackActorCritic
 
 # PLACEHOLDER: Extension template (do not remove this comment)
 
@@ -289,26 +286,46 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         cv2.imwrite(tmp, img)
         os.replace(tmp, path)
 
-    def _vision_to_bgr(camera, suffix: str) -> None:
-        """Process one camera → write raw_{suffix}.png and policy_{suffix}.png."""
-        rgb_tensor = camera.data.output["rgb"][0, :, :, :3].cpu().numpy().astype(np.uint8)
-        raw_bgr = cv2.cvtColor(rgb_tensor, cv2.COLOR_RGB2BGR)
-        _write_atomic(os.path.join(_fpv_out_dir, f"raw_{suffix}.png"), raw_bgr)
-
-        # Policy window
-        pol_flat = _mushr_env._process_single_rgb(camera)
-        pol_2d   = pol_flat[0].reshape(
-            _mushr_env._policy_depth_h, _mushr_env._policy_depth_w,
-        ).cpu().numpy()
-        pol_bgr  = cv2.cvtColor((pol_2d * 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
-        _write_atomic(os.path.join(_fpv_out_dir, f"policy_{suffix}.png"), pol_bgr)
-
     def _fpv_step() -> None:
-        """Grab vision frame from center camera, write PNGs."""
-        _vision_to_bgr(_mushr_env.camera_center, "center")
+        """Grab vision frame from center camera, write raw + bbox PNGs."""
+        rgb_tensor = _mushr_env.camera_center.data.output["rgb"][0, :, :, :3].cpu().numpy().astype(np.uint8)
+        raw_bgr = cv2.cvtColor(rgb_tensor, cv2.COLOR_RGB2BGR)
+        _write_atomic(os.path.join(_fpv_out_dir, "raw_center.png"), raw_bgr)
+
+        # ── Bbox overlay with YOLO-like filtering ────────────────────────────
+        bbox_bgr = raw_bgr.copy()
+        annotator_data = _mushr_env._rep_annotators[0].get_data()
+        raw = annotator_data.get("data")
+        if isinstance(raw, (list, tuple)):
+            raw_data = raw[0] if raw else None
+        else:
+            raw_data = raw
+
+        depth_map = (
+            _mushr_env.camera_center.data.output["distance_to_camera"][0, :, :, 0]
+            .cpu()
+            .numpy()
+        )
+
+        cfg = _mushr_env.cfg
+        if raw_data is not None:
+            filtered = _mushr_env.filter_bboxes_numpy(
+                raw_data, depth_map,
+                max_dist=cfg.max_bbox_distance,
+                min_area=cfg.min_bbox_area,
+                min_side=cfg.min_bbox_side,
+                occlusion_tol=cfg.bbox_occlusion_tol,
+            )
+            for i in range(len(filtered)):
+                x1 = int(filtered[i, 0])
+                y1 = int(filtered[i, 1])
+                x2 = int(filtered[i, 2])
+                y2 = int(filtered[i, 3])
+                cv2.rectangle(bbox_bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+        _write_atomic(os.path.join(_fpv_out_dir, "bbox_center.png"), bbox_bgr)
+
         if _fpv_writer is not None:
-            rgb_tensor = _mushr_env.camera_center.data.output["rgb"][0, :, :, :3].cpu().numpy().astype(np.uint8)
-            raw_bgr = cv2.cvtColor(rgb_tensor, cv2.COLOR_RGB2BGR)
             _fpv_writer.write(raw_bgr)
     # ──────────────────────────────────────────────────────────────────────────
 

@@ -1,4 +1,4 @@
-"""Visualize MuSHR center RGB camera + blue-mask policy pipeline from Isaac Sim.
+"""Visualize MuSHR center RGB camera + Replicator bbox detections from Isaac Sim.
 
 The robot is spawned at its start position.  WASD keys drive it manually
 (requires pynput — install with: pip install pynput).
@@ -7,13 +7,13 @@ A separate display subprocess owns the cv2.imshow windows (avoids Qt conflict).
 
 Two windows are shown:
   "Center Raw RGB"      — full-resolution 848×480 RGB feed (clean Isaac Sim output)
-  "Center Policy Mask"  — EXACT policy pipeline: blue-only HSV mask + downsample, upscaled
+  "Center BBox Overlay" — raw RGB with detected cone bounding boxes drawn in green
 
 Frames are exchanged via PNG files written to /tmp/mushr_debug/.
 Press  Ctrl+C  in this terminal  OR  Q  in any display window to stop.
 
 Usage:
-    python .../visualize.py --task Mushr
+    python .../visualize.py --task ConeTrack
 """
 
 import argparse
@@ -45,9 +45,13 @@ import cv2, time, signal
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
 OUT_DIR = "/tmp/mushr_debug"
+
+# suppress Qt font warnings when cv2 creates its first GUI window
+os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.fonts.warning=false")
+
 FILES = [
     (os.path.join(OUT_DIR, "raw_center.png"),    "Center Raw RGB"),
-    (os.path.join(OUT_DIR, "policy_center.png"), "Center Policy Mask"),
+    (os.path.join(OUT_DIR, "bbox_center.png"),   "Center BBox Overlay"),
 ]
 
 while not os.path.exists(os.path.join(OUT_DIR, "raw_center.png")):
@@ -55,9 +59,10 @@ while not os.path.exists(os.path.join(OUT_DIR, "raw_center.png")):
 
 while True:
     for fpath, name in FILES:
-        img = cv2.imread(fpath)
-        if img is not None:
-            cv2.imshow(name, img)
+        if os.path.exists(fpath):
+            img = cv2.imread(fpath)
+            if img is not None:
+                cv2.imshow(name, img)
     if cv2.waitKey(33) & 0xFF == ord("q"):
         break
 
@@ -137,7 +142,6 @@ def _write_atomic(path: str, img: np.ndarray) -> None:
 def main():
     env_cfg = ConeTrackEnvCfg()
     env_cfg.scene.num_envs = 1
-    env_cfg.show_camera_debug = False
     if args_cli.device is not None:
         env_cfg.sim.device = args_cli.device
 
@@ -182,7 +186,7 @@ def main():
 
     print(
         f"[visualize] Camera: {cam_w}×{cam_h} RGB  "
-        f"| Policy mask res: {mushr_env._policy_depth_w}×{mushr_env._policy_depth_h}"
+        f"| Bbox observation: {mushr_env._max_bboxes} max boxes"
     )
     print(f"[visualize] Frames → {out_dir}/   |   Press Ctrl+C to stop.")
 
@@ -200,40 +204,56 @@ def main():
 
     env.reset()
 
-    def _write_camera(cam_obj, suffix: str) -> None:
-        """Write raw RGB and policy blue-mask frames to disk."""
+    def _write_camera_with_bboxes() -> None:
         rgb_tensor = (
-            cam_obj.data.output["rgb"][0, :, :, :3].cpu().numpy().astype(np.uint8)
+            mushr_env.camera_center.data.output["rgb"][0, :, :, :3]
+            .cpu()
+            .numpy()
+            .astype(np.uint8)
         )
         raw_bgr = cv2.cvtColor(rgb_tensor, cv2.COLOR_RGB2BGR)
-        _write_atomic(os.path.join(out_dir, f"raw_{suffix}.png"), raw_bgr)
+        _write_atomic(os.path.join(out_dir, "raw_center.png"), raw_bgr)
 
-        # ── Policy vision ──────────────────────────────────
-        pol_flat = mushr_env._process_single_rgb(cam_obj)
-        pol_2d = (
-            pol_flat[0]
-            .reshape(
-                mushr_env._policy_depth_h,
-                mushr_env._policy_depth_w,
-            )
+        # ── Depth map for distance-based filtering ────────────────────────
+        depth_map = (
+            mushr_env.camera_center.data.output["distance_to_camera"][0, :, :, 0]
             .cpu()
             .numpy()
         )
 
-        pol_bgr = cv2.cvtColor((pol_2d * 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+        # ── Bounding boxes with YOLO-like filtering ───────────────────────
+        bbox_bgr = raw_bgr.copy()
+        annotator_data = mushr_env._rep_annotators[0].get_data()
+        raw = annotator_data.get("data")
+        if isinstance(raw, (list, tuple)):
+            raw_data = raw[0] if raw else None
+        else:
+            raw_data = raw
 
-        disp_h = max(
-            1, round(cam_w * mushr_env._policy_depth_h / mushr_env._policy_depth_w)
-        )
-        pol_bgr = cv2.resize(pol_bgr, (cam_w, disp_h), interpolation=cv2.INTER_NEAREST)
-        _write_atomic(os.path.join(out_dir, f"policy_{suffix}.png"), pol_bgr)
+        cfg = mushr_env.cfg
+        if raw_data is not None:
+            filtered = mushr_env.filter_bboxes_numpy(
+                raw_data, depth_map,
+                max_dist=cfg.max_bbox_distance,
+                min_area=cfg.min_bbox_area,
+                min_side=cfg.min_bbox_side,
+                occlusion_tol=cfg.bbox_occlusion_tol,
+            )
+        else:
+            filtered = np.zeros((0, 5), dtype=np.float32)
+
+        for i in range(len(filtered)):
+            x1, y1, x2, y2 = int(filtered[i, 0]), int(filtered[i, 1]), int(filtered[i, 2]), int(filtered[i, 3])
+            cv2.rectangle(bbox_bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+        _write_atomic(os.path.join(out_dir, "bbox_center.png"), bbox_bgr)
 
     try:
         while simulation_app.is_running():
             throttle, steer = key_state.get_actions()
             actions = torch.tensor([[throttle, steer]], device=device)
             env.step(actions)
-            _write_camera(mushr_env.camera_center, "center")
+            _write_camera_with_bboxes()
 
     except KeyboardInterrupt:
         pass
