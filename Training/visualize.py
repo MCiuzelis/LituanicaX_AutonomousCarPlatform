@@ -186,7 +186,7 @@ def main():
 
     print(
         f"[visualize] Camera: {cam_w}×{cam_h} RGB  "
-        f"| Bbox observation: {mushr_env._max_bboxes} max boxes"
+        f"| Pseudo-lidar observation: {mushr_env._num_lidar_bins} bins × 2 classes"
     )
     print(f"[visualize] Frames → {out_dir}/   |   Press Ctrl+C to stop.")
 
@@ -223,12 +223,24 @@ def main():
 
         # ── Bounding boxes with YOLO-like filtering ───────────────────────
         bbox_bgr = raw_bgr.copy()
-        annotator_data = mushr_env._rep_annotators[0].get_data()
+        annotator_data = mushr_env._rep_annotator.get_data()
         raw = annotator_data.get("data")
         if isinstance(raw, (list, tuple)):
             raw_data = raw[0] if raw else None
         else:
             raw_data = raw
+
+        # Map semantic IDs to left/right cone labels
+        id_to_labels = annotator_data.get("info", {}).get("idToLabels", {})
+        label_to_color = {
+            "left_cone": (255, 100, 0),   # blue in BGR
+            "right_cone": (0, 200, 0),     # green in BGR
+        }
+        default_color = (0, 255, 0)       # fallback green
+
+        sem_ids = None
+        if raw_data is not None and "semanticId" in raw_data.dtype.names:
+            sem_ids = raw_data["semanticId"]
 
         cfg = mushr_env.cfg
         if raw_data is not None:
@@ -238,13 +250,21 @@ def main():
                 min_area=cfg.min_bbox_area,
                 min_side=cfg.min_bbox_side,
                 occlusion_tol=cfg.bbox_occlusion_tol,
+                semantic_ids=sem_ids,
             )
         else:
-            filtered = np.zeros((0, 5), dtype=np.float32)
+            filtered = np.zeros((0, 6), dtype=np.float32)
 
         for i in range(len(filtered)):
             x1, y1, x2, y2 = int(filtered[i, 0]), int(filtered[i, 1]), int(filtered[i, 2]), int(filtered[i, 3])
-            cv2.rectangle(bbox_bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            if filtered.shape[1] >= 6:
+                sid = int(filtered[i, 5])
+                label_dict = id_to_labels.get(sid, {})
+                cone_label = next(iter(label_dict.values()), None)
+                color = label_to_color.get(cone_label, default_color)
+            else:
+                color = default_color
+            cv2.rectangle(bbox_bgr, (x1, y1), (x2, y2), color, 2)
 
         _write_atomic(os.path.join(out_dir, "bbox_center.png"), bbox_bgr)
 

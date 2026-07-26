@@ -1,20 +1,27 @@
 """MuSHR nano v2 RC car — cone-track navigation environment (DirectRLEnv).
 
-Observation space (4×N + 1, no CNN needed):
-    Raw bounding boxes from Replicator's GPU-accelerated bbox annotator
-    (simulates YOLO output).
+Observation space (2×K + 3, no CNN needed):
+    Pseudo-lidar cone grid built from Replicator's GPU-accelerated bbox
+    annotator (simulates YOLO output).
 
-    [0:4*N]  bounding boxes (x_min, y_min, x_max, y_max) for up to N cones,
-             sorted left-to-right by x_min.  Padded with zeros when fewer
-             than N cones are visible.  Coordinates are in pixel space of the
-             (cropped) camera image [0, W) × [0, H).
+    [0:2*K]      pseudo-lidar grid, K angular bins across the image width ×
+                 2 channels (channel 0 = left/blue cones, 1 = right/green).
+                 Each detected cone bbox is rasterized into every bin its
+                 horizontal extent [x1, x2] overlaps; the bin value is the
+                 cone's proximity = bbox_height / image_height ∈ [0, 1]
+                 (taller box = closer cone), max-combined when several cones
+                 share a bin.  0 = no cone in that direction.  The layout is
+                 permutation-invariant by construction: values slide smoothly
+                 between adjacent bins as cones move across the image.
 
-    [4*N]    wheel speed normalised by max_velocity_m_s  ∈ [0, 1]
+    [2*K]        wheel speed normalised by max_velocity_m_s  ∈ [0, 1]
+    [2*K+1]      previous throttle command  ∈ [-1, 1]
+    [2*K+2]      previous steering command  ∈ [-1, 1]
 
     Bounding boxes are produced by the Replicator bounding_box_2d_tight_fast
-    annotator attached to each environment's camera render product.  This
-    matches the YOLO detection pipeline on the real car — the policy never
-    sees raw pixels.
+    annotator attached to each environment's camera render product.  The
+    identical binning runs on the real car's YOLO output (class → channel,
+    box height → proximity) — the policy never sees raw pixels.
 
 Action space (2):
     [0]  throttle command in [-1, 1] — forward-only (the car never reverses):
@@ -35,11 +42,13 @@ Actuation (Ackermann / AWD, effort-controlled DC motor):
       (tan-convention matches the joint representation in mushr_nano_v2.usd)
 
 Observation pipeline (Replicator bbox annotator):
-    Cone prims with semantic label "cone" are placed at track boundary
-    positions during scene setup.  The Replicator bounding_box_2d_tight_fast
-    annotator returns GPU-resident bounding boxes for each env's camera at
-    every policy step.  Boxes are sorted left-right, padded/truncated to
-    MAX_BBOXES, and concatenated with scalar wheel speed.
+    Cone meshes are semantically labelled "left_cone" / "right_cone" during
+    scene setup (from their BLUE / GREEN material subsets).  The Replicator
+    bounding_box_2d_tight_fast annotator returns bounding boxes + semantic
+    IDs for each env's camera at every policy step.  Boxes are filtered
+    (size, distance, occlusion) and rasterized into the per-class
+    pseudo-lidar grid, then concatenated with wheel speed and previous
+    actions.
 
 Termination conditions:
     - Wall contact: any horizontal normal force on robot links above wall_contact_force_thresh_n
@@ -83,10 +92,6 @@ from isaaclab.utils.math import quat_from_euler_xyz
 CAM_H: int = 480  # 480p vertical resolution (matches raw sensor)
 CAM_W: int = 848  # preserves original 848/480 ≈ 1.767 aspect ratio
 
-# Number of bounding boxes in the observation (configurable via
-# ConeTrackEnvCfg.max_bboxes at the task level).
-MAX_BBOXES: int = 20
-
 # ---------------------------------------------------------------------------
 # Asset USD paths  (relative to this file → project root → assets/)
 # ---------------------------------------------------------------------------
@@ -97,8 +102,8 @@ _REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "../../../
 _EXPORT_DIR = os.path.join(_REPO_ROOT, "CAD", "Track", "Export")
 
 MUSHR_USD = os.path.join(_ASSETS_DIR, "mushr_nano_v2.usd")
-TRACK_USD = os.path.join(_EXPORT_DIR, "Track_2.usdc")
-WALL_USD = os.path.join(_EXPORT_DIR, "Walls.usdc")
+TRACK_USD = os.path.join(_EXPORT_DIR, "Track_SmallCones.usdc")
+WALL_USD = os.path.join(_EXPORT_DIR, "Walls_NEW.usdc")
 
 # ---------------------------------------------------------------------------
 # Physical constants — MuSHR nano v2 (fixed by the USD / hardware)
@@ -161,13 +166,16 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     decimation: int = 4  # sim steps per policy step
     episode_length_s: float = 90.0  # episode duration in seconds
     action_space: int = 2
-    # observation_space is patched in ConeTrackEnv.__init__ (4×max_bboxes
-    # bbox coords + optional wheel speed).  The placeholder below keeps
-    # @configclass happy.
+    # observation_space is patched in ConeTrackEnv.__init__ (2×num_lidar_bins
+    # pseudo-lidar grid + wheel speed + 2 previous actions).  The placeholder
+    # below keeps @configclass happy.
     observation_space: int = 1  # patched in __init__
     state_space: int = 0
-    # Number of bounding boxes in the observation (padded/truncated).
-    max_bboxes: int = 30
+    # Pseudo-lidar grid: angular bins across the image width.  Each bin holds,
+    # per cone class (left / right), the proximity of the nearest cone whose
+    # bbox overlaps that bin — proximity = bbox_height / image_height ∈ [0, 1],
+    # 0 = nothing there.  At 32 bins each bin spans ≈3.75° of the 120° HFOV.
+    num_lidar_bins: int = 32
     # Downscale camera resolution by this factor to save VRAM.
     # Effective resolution = (CAM_W // downscale_factor, CAM_H // downscale_factor)
     downscale_factor: int = 2
@@ -179,9 +187,9 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # Max distance (meters).  Cones farther away are discarded.
     max_bbox_distance: float = 4.0
     # Minimum bbox area (px²).  Smaller detections are discarded.
-    min_bbox_area: int = 150
+    min_bbox_area: int = 25
     # Minimum bbox side length (px).  Detections narrower or shorter are discarded.
-    min_bbox_side: int = 5
+    min_bbox_side: int = 4
     # Tolerance (px) for the occlusion containment check.
     bbox_occlusion_tol: int = 2
 
@@ -215,12 +223,12 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     #   spawn_yaw_jitter_rad is applied.
     preset_spawn_points: list = [
         # (x_m, y_m, theta_deg) — raw Blender coordinates
-        (0.756, 5.0, 20.8),
-        (3.91, 3.31, -156.0),
-        (3.62, 1.97, -154.48),
-        # (0.0,  0.0, 0.0),
-        (-5.46, 3.7, 0.0),
-        (-3.6, 4.7, -217.86),
+        # (0.756, 5.0, 20.8),
+        # (3.91, 3.31, -156.0),
+        # (3.62, 1.97, -154.48),
+        (0.0,  0.0, 0.0),
+        # (-5.46, 3.7, 0.0),
+        # (-3.6, 4.7, -217.86),
         # (-5.0,  0.0, 180.0),
         # (3.4,  0.0, 0.0),
     ]
@@ -229,7 +237,13 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     spawn_x_scale: float = -1.15 * TRACK_SCALE
     spawn_y_scale: float = -1.15 * TRACK_SCALE
 
-    duplicate_with_flipped_yaw: bool = True  # if True, each (x, y, θ) spawns two episodes: one with +180deg rotation around z
+    # DO NOT enable while the observation uses left/right cone classes: the colors are
+    # painted on the physical track (blue = outer lane, green = inner), so "blue = left"
+    # only holds in ONE driving direction.  Flipped spawns invert the class↔side mapping
+    # in half the data, forcing the policy to ignore the class channels (it then can't
+    # know which way to pass cones at corners).  If direction augmentation is ever
+    # needed, mirror the track geometry instead (a mirrored world swaps colors correctly).
+    duplicate_with_flipped_yaw: bool = False  # each (x, y, θ) also spawns with +180° yaw
     spawn_yaw_jitter_rad: float = 0.1  # ± heading noise applied in both modes
 
     # ════════════════════════════════════════════════════════════════════════
@@ -493,16 +507,15 @@ class ConeTrackEnv(DirectRLEnv):
         self._cam_w = cfg.camera_center_cfg.width
         self._cam_h = cfg.camera_center_cfg.height
 
-        # Bbox observation: 5 values per bounding box (normalized x1, y1, x2, y2, valid) + wheel speed + 2 prev actions
-        bbox_obs_size = 5 * cfg.max_bboxes
-
-        self._max_bboxes = cfg.max_bboxes
+        # Pseudo-lidar observation: num_lidar_bins × 2 classes + wheel speed + 2 prev actions
+        self._num_lidar_bins = cfg.num_lidar_bins
+        lidar_obs_size = 2 * cfg.num_lidar_bins
         self._include_wheel_vel = True  # always append wheel speed
 
-        cfg.observation_space = bbox_obs_size + (1 if self._include_wheel_vel else 0) + 2
+        cfg.observation_space = lidar_obs_size + (1 if self._include_wheel_vel else 0) + 2
 
         print(
-            f"[ConeTrackEnv] Bbox obs: {cfg.max_bboxes} bboxes × 4 = {bbox_obs_size}  |  "
+            f"[ConeTrackEnv] Pseudo-lidar obs: {cfg.num_lidar_bins} bins × 2 classes = {lidar_obs_size}  |  "
             f"+ wheel_vel={self._include_wheel_vel}  |  "
             f"total obs = {cfg.observation_space}",
             flush=True,
@@ -619,9 +632,14 @@ class ConeTrackEnv(DirectRLEnv):
 
         # Spawn position in world XY — used for lap-gate / start-line detection.
         self._spawn_pos = torch.zeros(self.num_envs, 2, device=self.device)
-        # Bbox output buffer — [N, max_bboxes, 5] zeroed; filled each step.
-        self._bbox_obs = torch.zeros(
-            self.num_envs, cfg.max_bboxes, 5, device=self.device, dtype=torch.float32
+        # Pseudo-lidar output buffer — [N, num_lidar_bins, 2] zeroed; filled each step.
+        # Channel 0 = left cones, channel 1 = right cones.
+        self._lidar_obs = torch.zeros(
+            self.num_envs,
+            cfg.num_lidar_bins,
+            2,
+            device=self.device,
+            dtype=torch.float32,
         )
 
     # ------------------------------------------------------------------
@@ -656,20 +674,43 @@ class ConeTrackEnv(DirectRLEnv):
 
         stage = omni.usd.get_context().get_stage()
 
-        # Apply semantic labels to each cylinder mesh for bbox detection
+        # Apply semantic labels to each cone mesh for bbox detection.
+        # Meshes with a BLUE GeomSubset → left_cone, GREEN → right_cone.
         track_root = stage.GetPrimAtPath("/World/Track")
         if track_root.IsValid():
-            from pxr import Semantics
+            from pxr import Semantics, UsdShade
 
-            mesh_count = 0
+            left_count = 0
+            right_count = 0
             for prim in Usd.PrimRange(track_root):
-                if prim.IsA(UsdGeom.Mesh):
-                    sem = Semantics.SemanticsAPI.Apply(prim, "class_cone")
-                    sem.CreateSemanticTypeAttr().Set("class")
-                    sem.CreateSemanticDataAttr().Set("cone")
-                    mesh_count += 1
+                if not prim.IsA(UsdGeom.Mesh):
+                    continue
+                has_blue = False
+                has_green = False
+                for child in prim.GetChildren():
+                    if child.GetTypeName() == "GeomSubset":
+                        binding = UsdShade.MaterialBindingAPI(child)
+                        mat, _ = binding.ComputeBoundMaterial()
+                        if mat is not None:
+                            mat_name = str(mat.GetPath()).rsplit("/", 1)[-1]
+                            if mat_name == "BLUE":
+                                has_blue = True
+                            elif mat_name == "GREEN":
+                                has_green = True
+                if has_blue:
+                    label = "left_cone"
+                    left_count += 1
+                elif has_green:
+                    label = "right_cone"
+                    right_count += 1
+                else:
+                    label = "cone"
+                sem = Semantics.SemanticsAPI.Apply(prim, f"class_{label}")
+                sem.CreateSemanticTypeAttr().Set("class")
+                sem.CreateSemanticDataAttr().Set(label)
             print(
-                f"[ConeTrackEnv] Applied semantic labels to {mesh_count} track meshes"
+                f"[ConeTrackEnv] Semantic labels: {left_count} left_cone (blue), "
+                f"{right_count} right_cone (green)"
             )
 
         wheel_link_names = {
@@ -930,14 +971,18 @@ class ConeTrackEnv(DirectRLEnv):
         min_area: int,
         min_side: int,
         occlusion_tol: int,
+        semantic_ids: np.ndarray | None = None,
     ) -> np.ndarray:
         """Apply YOLO-like filters to a structured bbox array.
 
         Returns a (M, 5) array where each row is (x1, y1, x2, y2, distance).
+        If *semantic_ids* is provided, returns (M, 6) with column 5 being the
+        carried-through semantic ID.
         Filters applied in order: small → distance → occlusion.
         """
         if boxes_arr is None or len(boxes_arr) == 0:
-            return np.zeros((0, 5), dtype=np.float32)
+            cols = 6 if semantic_ids is not None else 5
+            return np.zeros((0, cols), dtype=np.float32)
 
         if boxes_arr.ndim == 0:
             boxes_arr = boxes_arr[np.newaxis]
@@ -964,12 +1009,13 @@ class ConeTrackEnv(DirectRLEnv):
             if dist > max_dist:
                 continue
 
-            candidates.append((x1, y1, x2, y2, dist))
+            sid = int(semantic_ids[i]) if semantic_ids is not None else -1
+            candidates.append((x1, y1, x2, y2, dist, sid))
 
         candidates.sort(key=lambda b: b[4])  # closest first
         kept = []
         for bbox in candidates:
-            x1, y1, x2, y2, _ = bbox
+            x1, y1, x2, y2, _, _ = bbox
             occluded = any(
                 (
                     kx1 - occlusion_tol <= x1
@@ -977,30 +1023,58 @@ class ConeTrackEnv(DirectRLEnv):
                     and kx2 + occlusion_tol >= x2
                     and ky2 + occlusion_tol >= y2
                 )
-                for kx1, ky1, kx2, ky2, _ in kept
+                for kx1, ky1, kx2, ky2, _, _ in kept
             )
             if not occluded:
                 kept.append(bbox)
 
-        return np.array(kept, dtype=np.float32).reshape(-1, 5)
+        if not kept:
+            cols = 6 if semantic_ids is not None else 5
+            return np.zeros((0, cols), dtype=np.float32)
+
+        result = np.array(kept, dtype=np.float32)
+        if semantic_ids is not None:
+            return result.reshape(-1, 6)
+        return result[:, :5].reshape(-1, 5)
 
     def _update_bbox_cache(self) -> None:
-        """Read bounding boxes from the single tiled Replicator annotator.
+        """Rasterize cone detections into the per-class pseudo-lidar grid.
 
         The annotator is attached to a tiled render product covering all envs.
-        We split the tiled-space bboxes per-env using the same tile grid
-        as TiledCamera, convert to local pixel coords, filter, and
-        pad/truncate to max_bboxes.  Result in self._bbox_obs [N, max_bboxes, 4].
+        We split the tiled-space bboxes per-env using the same tile grid as
+        TiledCamera, convert to local pixel coords, filter, and rasterize each
+        kept box into every angular bin its horizontal extent overlaps.  The
+        bin value is the cone's proximity = bbox_height / image_height (taller
+        box = closer cone), max-combined when boxes overlap the same bin.
+        Channel 0 = left_cone, channel 1 = right_cone; detections without a
+        left/right label are dropped (the real YOLO only knows the 2 classes).
+        Result in self._lidar_obs [N, num_lidar_bins, 2].
         """
         N = self.num_envs
-        device = self.device
-        bboxes = torch.zeros(N, self._max_bboxes, 5, device=device)
+        K = self._num_lidar_bins
+        grid = torch.zeros(N, K, 2, device=self.device)
 
         data = self._rep_annotator.get_data()
         raw = data.get("data")
         if raw is not None and len(raw) > 0:
             if raw.ndim == 0:
                 raw = raw[np.newaxis]
+
+            # Semantic ID → grid channel, from the annotator's label table.
+            id_to_labels = (data.get("info") or {}).get("idToLabels", {})
+            chan_of_sid: dict[int, int] = {}
+            for sid, label in id_to_labels.items():
+                name = (
+                    next(iter(label.values()), None)
+                    if isinstance(label, dict)
+                    else label
+                )
+                if name == "left_cone":
+                    chan_of_sid[int(sid)] = 0
+                elif name == "right_cone":
+                    chan_of_sid[int(sid)] = 1
+
+            has_sid = "semanticId" in raw.dtype.names
 
             cols = self._tile_cols
             cam_w = float(self._cam_w)
@@ -1025,7 +1099,8 @@ class ConeTrackEnv(DirectRLEnv):
                 lx2 = x2 - tile_col * cam_w
                 ly2 = y2 - tile_row * cam_h
 
-                env_raw[env_id].append((lx1, ly1, lx2, ly2))
+                sid = int(raw["semanticId"][i]) if has_sid else -1
+                env_raw[env_id].append((lx1, ly1, lx2, ly2, sid))
 
             dt = np.dtype(
                 [("x_min", "f4"), ("y_min", "f4"), ("x_max", "f4"), ("y_max", "f4")]
@@ -1037,8 +1112,11 @@ class ConeTrackEnv(DirectRLEnv):
                     continue
 
                 filtered_arr = np.array(
-                    [(x1, y1, x2, y2) for x1, y1, x2, y2 in env_raw[env_id]],
+                    [(x1, y1, x2, y2) for x1, y1, x2, y2, _ in env_raw[env_id]],
                     dtype=dt,
+                )
+                sids = np.array(
+                    [sid for *_, sid in env_raw[env_id]], dtype=np.int64
                 )
 
                 depth_map = None
@@ -1058,25 +1136,25 @@ class ConeTrackEnv(DirectRLEnv):
                     min_area=cfg.min_bbox_area,
                     min_side=cfg.min_bbox_side,
                     occlusion_tol=cfg.bbox_occlusion_tol,
+                    semantic_ids=sids,
                 )
-                k = min(len(filtered), self._max_bboxes)
+                if len(filtered) == 0:
+                    continue
 
-                env_boxes = torch.zeros(k, 5, device=device)
-                if k > 0:
-                    # Normalize by camera resolution
-                    env_boxes[:, 0] = torch.as_tensor(filtered[:k, 0], device=device) / cam_w
-                    env_boxes[:, 1] = torch.as_tensor(filtered[:k, 1], device=device) / cam_h
-                    env_boxes[:, 2] = torch.as_tensor(filtered[:k, 2], device=device) / cam_w
-                    env_boxes[:, 3] = torch.as_tensor(filtered[:k, 3], device=device) / cam_h
-                    env_boxes[:, 4] = 1.0  # validity flag
+                env_grid = np.zeros((K, 2), dtype=np.float32)
+                for x1, y1, x2, y2, _, sid in filtered:
+                    chan = chan_of_sid.get(int(sid))
+                    if chan is None:
+                        continue
+                    prox = min((y2 - y1) / cam_h, 1.0)
+                    b0 = int(np.clip(x1 / cam_w * K, 0, K - 1))
+                    b1 = int(np.clip((x2 - 1e-3) / cam_w * K, b0, K - 1))
+                    env_grid[b0 : b1 + 1, chan] = np.maximum(
+                        env_grid[b0 : b1 + 1, chan], prox
+                    )
+                grid[env_id] = torch.from_numpy(env_grid).to(self.device)
 
-                # Sort by bounding box area (descending) instead of x_min
-                areas = (env_boxes[:, 2] - env_boxes[:, 0]) * (env_boxes[:, 3] - env_boxes[:, 1])
-                sort_order = areas.argsort(descending=True)
-                env_boxes = env_boxes[sort_order]
-                bboxes[env_id, :k] = env_boxes
-
-        self._bbox_obs = bboxes
+        self._lidar_obs = grid
 
     # ------------------------------------------------------------------
     # Observations
@@ -1085,7 +1163,7 @@ class ConeTrackEnv(DirectRLEnv):
     def _get_observations(self) -> dict:
         self._update_bbox_cache()
 
-        parts = [self._bbox_obs.reshape(self.num_envs, -1)]
+        parts = [self._lidar_obs.reshape(self.num_envs, -1)]
         if self._include_wheel_vel:
             wheel_omega_mean = (
                 self.robot.data.joint_vel[:, self._all_throttle_ids].abs().mean(dim=-1)

@@ -20,10 +20,11 @@ class ConeTrackPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     obs_groups = {"policy": ["policy"], "critic": ["policy"]}
 
     policy: RslRlPpoActorCriticCfg = RslRlPpoActorCriticCfg(
-        init_noise_std=1.0,
+        init_noise_std=0.8,
         actor_obs_normalization=True,
         critic_obs_normalization=True,
-        # Small MLP — input is (4 × max_bboxes + optional wheel_speed) bbox coords
+        # Small MLP — input is the (2 × num_lidar_bins) pseudo-lidar grid
+        # + wheel speed + previous actions
         actor_hidden_dims=[256, 128, 64],
         critic_hidden_dims=[256, 128, 64],
         activation="mish",
@@ -38,7 +39,7 @@ class ConeTrackPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         entropy_coef=0.006,
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
-        gamma=0.993,
+        gamma=0.995,
         lam=0.95,
         desired_kl=0.01,
         max_grad_norm=0.75,
