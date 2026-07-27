@@ -186,7 +186,6 @@ def _write_atomic(path: str, img: np.ndarray) -> None:
 def main():
     env_cfg = ConeTrackEnvCfg()
     env_cfg.scene.num_envs = 1
-    env_cfg.show_camera_debug = False
     if args_cli.device is not None:
         env_cfg.sim.device = args_cli.device
 

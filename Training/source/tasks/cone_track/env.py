@@ -13,7 +13,7 @@ Camera profile (ArduCam TOF sensor for Raspberry Pi):
     - Sensor: Time-of-Flight depth, 240×180 pixels at 30 fps
     - Diagonal FOV: 70°  →  HFOV ≈ 58.5°, VFOV ≈ 45.6°  (4:3 aspect, pinhole)
     - Depth accuracy: ±2 cm (simulated via Gaussian noise σ ≈ 0.007 m)
-    - Policy runs at 30 Hz, synced with camera (sim 240 Hz, decimation=8)
+    - Policy runs at 30 Hz, synced with camera (sim 120 Hz, decimation=4)
 
 Action space (2):
     [0]  throttle command in [-1, 1] — forward-only (the car never reverses):
@@ -40,12 +40,16 @@ Why depth camera vs RGB cone mask:
     the agent can correlate "high depth values filling the frame → wall approaching →
     reduce throttle" without needing to understand color or stripe classification.
 
-Termination conditions:
-    - Wall contact: any horizontal normal force on robot links above wall_contact_force_thresh_n
+Termination conditions (each ends the episode; the first two are also priced into the
+reward so that no exit is cheaper than continuing to drive — see crash_penalty_weight
+and stall_penalty_weight):
+    - Wall contact: any horizontal normal force on robot links above
+      wall_contact_force_thresh_n, charged in proportion to the impact severity
+    - Slow driving: speed below slow_stop_speed_fraction of the cap after
+      slow_stop_grace_steps, charged a flat stall penalty
     - Robot tilt > 72° from vertical (up_z < 0.3)
-    - Slow driving: speed < 2% of vel_cap for > ~1.5 s after episode start
 
-TUNING NOTES (first run):
+TUNING NOTES:
     - All adjustable parameters are in ConeTrackEnvCfg in one place below.
     - Spawn position: set preset_spawn_points in cfg.
     - Camera crop: depth_crop_top_fraction, depth_crop_bottom_fraction.
@@ -98,9 +102,7 @@ ASSET_SET_USDS = [
     os.path.join(_EXPORT_DIR, "Assets4.usdc"),
     os.path.join(_EXPORT_DIR, "Assets5.usdc"),
 ]
-NUM_ASSET_SETS = len(
-    ASSET_SET_USDS
-)  # randomisation draws from [0, NUM_ASSET_SETS] inclusive
+NUM_ASSET_SETS = len(ASSET_SET_USDS)
 
 # ---------------------------------------------------------------------------
 # Physical constants — MuSHR nano v2 (fixed by the USD / hardware)
@@ -160,8 +162,8 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     """
 
     # ── Core env parameters ────────────────────────────────────────────────
-    decimation: int = 8  # policy at ~30 Hz  (sim 240 Hz / 8)
-    episode_length_s: float = 90.0  # 180 s × 30 Hz = 5 400 steps
+    decimation: int = 4  # policy at 30 Hz  (sim 120 Hz / 4)
+    episode_length_s: float = 90.0  # 90 s × 30 Hz = 2 700 steps
     action_space: int = 2
     # observation_space is patched in ConeTrackEnv.__init__ after computing
     # the exact cropped depth image size.  The placeholder below keeps
@@ -169,7 +171,9 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     observation_space: int = 1  # patched in __init__
     state_space: int = 0
 
-    sim: SimulationCfg = SimulationCfg(dt=1.0 / 240.0, render_interval=8)
+    # render_interval is counted in SIM steps, so it must equal decimation for the
+    # RTX sensors to be rendered exactly once per policy step (at 30 Hz).
+    sim: SimulationCfg = SimulationCfg(dt=1.0 / 120.0, render_interval=4)
 
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
         num_envs=26,
@@ -183,7 +187,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # Crop fractions (fraction of raw pixel rows discarded before the policy):
     #   top  → removes ceiling / sky (depth = max / inf)
     #   bottom → removes near-ground clutter and the robot's own body shadow
-    depth_crop_top_fraction: float = 0.375
+    depth_crop_top_fraction: float = 0.35
     depth_crop_bottom_fraction: float = 0.45
 
     # Gaussian depth noise: σ ≈ 0.007 m gives a ±2 cm (3σ) error band,
@@ -195,14 +199,14 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # TOF output.  Affected pixels are set to depth_max_m (treated as far/safe by the
     # policy, matching the real camera's low-confidence masking behaviour).
     # Visible as black dots in both windows of visualize.py.  Set to 0.0 to disable.
-    depth_invalid_pixel_prob: float = 0.008
+    depth_invalid_pixel_prob: float = 0.006
 
     # Random-depth (coloured) speckle: each pixel is set to a uniform random depth in
     # [0, depth_max_m] with this probability.  Models stray reflections and multi-path
     # interference that appear as bright or mid-range dots (unlike depth_invalid_pixel_prob
     # which always sets the pixel to the far/black depth_max_m value).
     # Set to 0.0 to disable.
-    depth_color_noise_prob: float = 0.006
+    depth_color_noise_prob: float = 0.005
 
     # Edge blur noise — simulates the mixed-pixel / depth-bleeding artefact common in
     # real ToF sensors: pixels whose sensing area straddles a depth discontinuity report
@@ -224,7 +228,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
 
     # Depth range for normalization.  Readings > depth_max_m are clamped.
     # Must match autopilot.py MAX_DISTANCE / 1000.  ArduCam supports 2000 mm or 4000 mm only.
-    depth_max_m: float = 2.0
+    depth_max_m: float = 4.0
 
     # ── Policy image downsampling ──────────────────────────────────────────
     # After cropping the raw depth frame (240×≈40 at defaults) the image is
@@ -248,31 +252,25 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     #   spawn_yaw_jitter_rad is applied.
     preset_spawn_points: list = [
         # (x_m, y_m, theta_deg) — raw Blender coordinates
-        (0.756, 5.0, 20.8),
-        (3.91, 3.31, -156.0),
-        (3.62, 1.97, -154.48),
-        # (0.0,  0.0, 0.0),
-        (-5.46, 3.7, 0.0),
-        (-3.6, 4.7, -217.86),
+        # (0.756, 5.0, 20.8),
+        # (3.91, 3.31, -156.0),
+        # (3.62, 1.97, -154.48),
+        (0.0,  0.0, 0.0),
+        (0.0,  -5.5, 0.0),
+        (18.0,  0.0, 0.0),
+        (18.0,  -5.5, 0.0)
+        # (-5.46, 3.7, 0.0),
+        # (-3.6, 4.7, -217.86),
         # (-5.0,  0.0, 180.0),
         # (3.4,  0.0, 0.0),
     ]
     # Coordinate transform applied to every spawn point at runtime.
     # Blender exports X/Y inverted relative to Isaac Sim's frame, so both are -1.
-    spawn_x_scale: float = -1.15 * TRACK_SCALE
-    spawn_y_scale: float = -1.15 * TRACK_SCALE
+    spawn_x_scale: float = -TRACK_SCALE
+    spawn_y_scale: float = -TRACK_SCALE
 
     duplicate_with_flipped_yaw: bool = True  # if True, each (x, y, θ) spawns two episodes: one with +180deg rotation around z
     spawn_yaw_jitter_rad: float = 0.1  # ± heading noise applied in both modes
-
-    # One-time bonus the first time the car moves farther than spawn_escape_radius_m
-    # from its spawn position, scaled by how fast the car is moving at that moment:
-    #   reward = spawn_escape_reward × (current_speed / max_velocity_m_s)
-    # At max speed this gives the full bonus; at crawl speed it gives nearly nothing.
-    # Teaches aggressive initial acceleration without rewarding slow drift.
-    # Set spawn_escape_reward=0 to disable.
-    spawn_escape_radius_m: float = 0.5
-    spawn_escape_reward: float = 0.0
 
     # ════════════════════════════════════════════════════════════════════════
     # SPAWN SPEED — initial robot velocity at each episode reset
@@ -345,11 +343,18 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # TERMINATION THRESHOLDS
     # ════════════════════════════════════════════════════════════════════════
     # Horizontal contact force on any robot link that counts as a wall hit.
-    wall_contact_force_thresh_n: float = 1.0  # Newtonsgz
+    # ANY contact above this ends the episode — touching a wall is failure, full
+    # stop.  The crash penalty is still scaled by impact angle and speed (see
+    # crash_penalty_weight), so a tangential graze and a head-on hit cost very
+    # different amounts, but both end the run.
+    wall_contact_force_thresh_n: float = 1.0  # Newtons
 
     # slow_stop_speed_fraction — episode terminates when speed falls below this
     # (catches truly stuck / reversed agents; keep low so normal braking is fine)
-    slow_stop_speed_fraction: float = 0.03  # terminate if speed < 3 % of vel_cap
+    slow_stop_speed_fraction: float = 0.02  # terminate if speed < 3 % of vel_cap
+    # Steps after reset before the slow-stop check arms, so the car can accelerate
+    # away from a standstill spawn without being killed for it.
+    slow_stop_grace_steps: int = 45  # ≈1.5 s at 30 Hz
 
     # ════════════════════════════════════════════════════════════════════════
     # OBSERVATION EXTRAS
@@ -361,18 +366,51 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # divide by max_velocity_m_s, clamp to [0, 1].
     include_wheel_vel: bool = True
 
+    # Append the last action the policy issued (throttle, steer) to the observation.
+    # Not a nicety: action_delay_ms puts one policy step between a command and the
+    # actuators, so without this the network cannot know what steering angle is
+    # currently applied, and a memoryless MLP physically cannot produce smooth
+    # closed-loop control — it shows up as servo chatter and sliding.  Free on the
+    # real car: it is just the command you sent last tick.
+    include_prev_actions: bool = True
+
     # ════════════════════════════════════════════════════════════════════════
     # REWARD WEIGHTS
     # ════════════════════════════════════════════════════════════════════════
     # Constant reward per step the agent stays alive (not crashed / stuck).
-    alive_weight: float = 0.03  # 0.04
+    alive_weight: float = 0.01  # 0.04
+
+    # ── Crash penalty ────────────────────────────────────────────────────────
+    # One-off cost charged on the step a wall contact is latched (the same step the
+    # episode terminates), scaled by how hard the car actually hit:
+    #     r_crash = -crash_penalty_weight × (v_normal / max_velocity_m_s) ** crash_penalty_exponent
+    # v_normal = |v · n̂| is the component of the car's world-frame velocity along the
+    # normal of the wall it touched, taken from the nearest segment of the cached wall
+    # footprint.  This makes the penalty a pure function of impact severity:
+    #     head-on at top speed   → v ∥ n̂ → ratio 1.0   → full crash_penalty_weight
+    #     tangential graze       → v ⟂ n̂ → ratio ≈ 0   → ≈ 0
+    # so brushing a barrier while running alongside it costs almost nothing while
+    # ploughing into one is expensive.  The exponent controls how sharply the two are
+    # separated: 2.0 tracks kinetic energy, 1.0 tracks momentum and bites harder at
+    # the low impact speeds (~0.8 m/s) the car currently achieves.  Revisit once it
+    # is fast enough for the quadratic to matter.  Set the weight to 0.0 to disable.
+    crash_penalty_weight: float = 3.0
+    crash_penalty_exponent: float = 1.0
+
+    # ── Stall penalty ────────────────────────────────────────────────────────
+    # Charged when the episode ends via the slow-stop rule.  MANDATORY companion to
+    # the crash penalty: without it, "stop moving" is a free exit.  The agent banks
+    # slow_stop_grace_steps × alive_weight (45 × 0.03 = 1.35) for doing nothing, then
+    # gets terminated at zero cost — so the moment crashing became expensive, sitting
+    # still at the spawn was the highest-return policy the agent could reach, and it
+    # took it.  Keep this strictly greater than that banked alive reward, otherwise
+    # passivity is profitable again:
+    #     stall return = slow_stop_grace_steps × alive_weight − stall_penalty_weight
+    # At the defaults: 1.35 − 3.0 = −1.65, i.e. clearly worse than trying to drive.
+    stall_penalty_weight: float = 3.0
 
     # Distance: rewards physical metres covered each step (v × dt).
     distance_weight: float = 4.0
-
-    # Average-speed bonus: every step rewards the episode's mean forward speed
-    # from reset through the current step, normalized by max_velocity_m_s.
-    average_speed_weight: float = 0.0  # redundant with distance + non-Markovian; off
 
     # Steering deadzone penalty: only penalises steering beyond the deadzone.
     steer_deadzone_weight: float = 0.003
@@ -381,37 +419,21 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # Steering-rate (smoothness) penalty: penalises the change in steering command
     # between consecutive policy steps, r = -weight × |steer_t − steer_{t-1}|.
     # Directly suppresses the jerky servo chatter; encourages smooth, committed lines.
-    steer_rate_weight: float = 0.005
+    steer_rate_weight: float = 0.006
 
     # Throttle-rate penalty: penalises the change in throttle/brake command
     # between consecutive policy steps to suppress banging between full throttle and brake.
     throttle_rate_weight: float = 0.007
 
-    # Wheel slip penalty: penalises the difference between theoretical wheel speed and actual car speed.
-    slip_weight: float = 2.0
-
-    # Proximity speed penalty: penalises going fast when a wall is close along the
-    # car's current velocity direction.  Each step a 2D ray is cast from the car
-    # along its world-frame linear velocity vector against /World/Walls (the same
-    # invisible mesh used for termination — visibility, collision, and termination
-    # behaviour are untouched, only the cached 2D footprint is read once at startup).
-    # The closest intersection along the ray gives `dist_m`; the penalty is then
-    #     r = -weight × speed_norm × max(0, 1 − dist_m / proximity_lookahead_m)
-    # so it is largest when the car is fast AND the wall is close in front of it
-    # (corner entry).  Set to 0.0 to disable entirely.
-    proximity_speed_weight: float = 0.01
-    proximity_lookahead_m: float = 2.0  # walls farther than this give zero signal
-
-    # Braking reward V2: dense, instantaneous, no session state.
-    #   r_braking_v2 = weight × forward_speed² × |brake_input|       (only when throttle < 0)
-    # Quadratic in speed: braking at low speeds is nearly free reward-wise, while
-    # braking at high speed delivers a much larger payout — incentivises braking
-    # specifically where it matters (corner entries) rather than continuously.
-    #   At v = max_velocity, |brake| = 1 → r_braking_v2 = weight × v_max²
-    #   r_distance at v = max_velocity   ≈ distance_weight × dt × 1.0
-    # With weight = 0.1, v_max = 8 m/s   → r_braking_v2 = 6.4/step at full brake at top speed.
-    # At v = 2 m/s the same brake input yields only 0.4/step — 16× weaker than at top speed.
-    braking_v2_weight: float = 0.0
+    # Wheel slip penalty — ONE-SIDED: charges wheelspin (wheels turning faster than
+    # the car) but not lockup (wheels slower than the car).  It used to be symmetric,
+    # |wheel_vel − forward_speed|, which taxed hard braking at exactly the same rate
+    # as wheelspin.  Braking hard is precisely what the car must do on corner entry,
+    # and brake_throttle_scale=0.4 sits above the ~0.3 slip onset, so the whole top
+    # of the brake range was penalised — a second of hard braking cost ~11x the
+    # explicit crash penalty.  That is a large part of "enters corners too fast,
+    # then slides".
+    slip_weight: float = 1.2
 
     # ── Lap completion reward ────────────────────────────────────────────────
     # Sparse reward fired when the agent crosses the start line (the line through
@@ -424,19 +446,29 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # dense distance reward (~25/sec at top speed → ~750 per 30 s lap).
     # Until the agent can actually finish a lap this reward stays at 0, so it has
     # no effect on early training.
-    lap_reward_weight: float = 8.0  # rescaled to the new O(10) return scale; pays
-    # more for faster laps (lap_max/lap_time, 20-40 s)
+    # 15.0 made a single lap worth 15 × 30 / 12.8 ≈ +35 in ONE step — more than the
+    # whole rest of the episode return — and the critic could not fit the spike:
+    # value loss tripled from 3.6 to 13.9 the moment it went 8 → 15, which fed
+    # high-variance advantages into the KL controller and pinned the LR to its floor.
+    lap_reward_weight: float = 6.0
+    # pays more for faster laps (lap_max/lap_time)
     lap_return_radius_m: float = (
         0.3  # start circle: leaving it starts the lap timer; crossing the
     )
     # start line while back inside closes the lap
-    lap_min_time_s: float = 20.0  # lower clamp (caps maximum reward per lap)
-    lap_max_time_s: float = 50.0  # upper clamp & numerator anchor
+    lap_min_time_s: float = 5.0  # lower clamp (caps maximum reward per lap)
+    lap_max_time_s: float = 30.0  # upper clamp & numerator anchor
 
     # How often to advance to the next asset set in the round-robin cycle (in policy steps).
     # Set to num_steps_per_env / (NUM_ASSET_SETS * 2) so every set appears exactly twice
     # per PPO iteration.  At num_steps_per_env=2000: 2000 / (5*2) = 200.
     asset_randomize_every_n_steps: int = 200
+
+    # Hide every decorative asset set for the whole run (set index NUM_ASSET_SETS =
+    # "no decorations").  The sets are still loaded so RTX builds their BVHs at
+    # startup, but they stay invisible and the round-robin cycling is disabled, so
+    # the cameras only ever see the track and the (invisible) walls.
+    hide_all_assets: bool = True
 
     # ════════════════════════════════════════════════════════════════════════
     # HARDWARE CONFIG  (robot articulation + camera sensor)
@@ -549,8 +581,8 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     #             right: (cos27°, -sin27°, 0) = (0.891, -0.454, 0.000)
     camera_left_cfg: TiledCameraCfg = TiledCameraCfg(
         prim_path="/World/envs/env_.*/Robot/mushr_nano/base_link/camera_left",
-        update_period=8.0
-        / 240.0,  # render only at policy steps (decimation=8, sim=240Hz)
+        update_period=4.0
+        / 120.0,  # render only at policy steps (decimation=4, sim=120Hz)
         # Render at the sensor's native 240x180 to match the real ArduCam TOF.
         # All noise effects are applied at this full resolution before cropping
         # and downsampling, mirroring how the real camera produces noisy depth.
@@ -576,8 +608,8 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     )
     camera_right_cfg: TiledCameraCfg = TiledCameraCfg(
         prim_path="/World/envs/env_.*/Robot/mushr_nano/base_link/camera_right",
-        update_period=8.0
-        / 240.0,  # render only at policy steps (decimation=8, sim=240Hz)
+        update_period=4.0
+        / 120.0,  # render only at policy steps (decimation=4, sim=120Hz)
         height=180,
         width=240,
         data_types=["distance_to_image_plane"],
@@ -598,11 +630,6 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
         ),
         debug_vis=False,
     )
-
-    # Live debug view in training — use scripts/rsl_rl/visualize.py instead.
-    show_camera_debug: bool = False
-    camera_debug_env_id: int = 0
-    camera_debug_interval: int = 2
 
     # Spawn a pair of visible cones in the sim to verify camera placement.
     # Tip at each camera sensor origin; base (wide end) pointing along the camera's
@@ -644,17 +671,23 @@ class ConeTrackEnv(DirectRLEnv):
 
         depth_obs_size = self._policy_depth_h * self._policy_depth_w
 
+        # Proprioceptive tail, appended after the two depth images.  Its width must
+        # match ConeTrackActorCriticCfg.num_proprio_obs, which is the boundary the
+        # policy network splits on to route these through their own encoder.
         extra_obs = 0
         if cfg.include_wheel_vel:
             extra_obs += 1  # scalar: avg wheel surface speed normalized to [0, 1]
+        if cfg.include_prev_actions:
+            extra_obs += 2  # last (throttle, steer) command issued
         cfg.observation_space = depth_obs_size * 2 + extra_obs  # left + right cameras
+        self._num_proprio_obs = extra_obs
 
         print(
             f"[ConeTrackEnv] Depth obs per camera: raw {cam_w}×{cam_h} "
             f"→ crop {cropped_w}×{cropped_h} "
             f"→ policy {self._policy_depth_w}×{self._policy_depth_h} "
             f"= {depth_obs_size} px  |  2 cameras  |  "
-            f"total obs = {cfg.observation_space}"
+            f"+{extra_obs} proprio  |  total obs = {cfg.observation_space}"
         )
 
         super().__init__(cfg, render_mode, **kwargs)
@@ -714,6 +747,10 @@ class ConeTrackEnv(DirectRLEnv):
         # Steering LPF state
         self._filtered_steer = torch.zeros(self.num_envs, device=self.device)
 
+        # Last raw action (throttle, steer) the policy issued, fed back as an
+        # observation so the network knows what the actuators are applying.
+        self._prev_action = torch.zeros(self.num_envs, 2, device=self.device)
+
         # Last two raw steering/throttle commands (undelayed), kept for rate penalties.
         self._steer_cmd_curr = torch.zeros(self.num_envs, device=self.device)
         self._steer_cmd_prev = torch.zeros(self.num_envs, device=self.device)
@@ -761,20 +798,30 @@ class ConeTrackEnv(DirectRLEnv):
         self._spawn_heading_cos = torch.ones(self.num_envs, device=self.device)
         self._spawn_heading_sin = torch.zeros(self.num_envs, device=self.device)
         self._lap_prev_forward = torch.zeros(self.num_envs, device=self.device)
-        # Contact / termination flags
-        self._wall_ever_touched = torch.zeros(
+        # Contact / termination state.
+        #   _wall_touched      — latched on the first wall contact of the episode.
+        #                        Terminates the episode and, on that same step,
+        #                        charges the crash penalty; the reset that follows
+        #                        clears it, so the penalty can never double-charge.
+        #   _crash_impact_speed — severity (m/s along the wall normal) of that hit,
+        #                        resolved once per step by _resolve_crash_impact_speed.
+        self._wall_touched = torch.zeros(
             self.num_envs, dtype=torch.bool, device=self.device
         )
+        self._crash_impact_speed = torch.zeros(self.num_envs, device=self.device)
+        # Set by _get_dones each step, consumed by _get_rewards for the stall penalty.
+        self._stalled = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        # World-frame XY velocity and position captured the instant a wall hit is
+        # latched — i.e. before the collision has bled the car's speed off.  The
+        # impact ANGLE is resolved against the wall geometry once per policy step in
+        # _get_rewards, which keeps the nearest-segment search off the substep path.
+        self._crash_impact_vel = torch.zeros(self.num_envs, 2, device=self.device)
+        self._crash_impact_pos = torch.zeros(self.num_envs, 2, device=self.device)
 
-        # Average-speed reward accumulator: sum of clamped forward velocity per env.
-        self._cumulative_forward_vel = torch.zeros(
-            self.num_envs, dtype=torch.float32, device=self.device
-        )
-        # Spawn-escape bonus tracking: world XY position at reset + one-time fired flag.
+        # World XY position at reset — the origin of the lap start line.
         self._spawn_pos = torch.zeros(self.num_envs, 2, device=self.device)
-        self._spawn_escaped = torch.zeros(
-            self.num_envs, dtype=torch.bool, device=self.device
-        )
         # Index of the currently active decorative asset set (-1 = none selected yet).
         self._current_asset_set: int = -1
         self._asset_step_counter: int = 0
@@ -796,9 +843,9 @@ class ConeTrackEnv(DirectRLEnv):
         )
         self._last_camera_update_step = -1
 
-        # Wall geometry for the proximity_speed reward — ray-cast against the same
-        # /World/Walls mesh used for termination (visibility / collision untouched).
-        # Extracted once here and cached on-device for fast batched intersection.
+        # 2D wall footprint, read once from the same /World/Walls mesh used for
+        # termination (visibility / collision untouched) and cached on-device.
+        # Consumed by _wall_normal_at to get the impact angle for the crash penalty.
         _wall_segs = self._extract_wall_segments_xy()
         if _wall_segs:
             import numpy as _np
@@ -809,7 +856,7 @@ class ConeTrackEnv(DirectRLEnv):
             self._wall_seg_a = _seg_arr[:, 0, :].contiguous()  # [M, 2]
             self._wall_seg_b = _seg_arr[:, 1, :].contiguous()  # [M, 2]
             print(
-                f"[ConeTrackEnv] Proximity ray-cast: cached {_seg_arr.shape[0]} wall segments"
+                f"[ConeTrackEnv] Wall footprint: cached {_seg_arr.shape[0]} segments"
             )
         else:
             self._wall_seg_a = None
@@ -1033,7 +1080,7 @@ class ConeTrackEnv(DirectRLEnv):
     # ------------------------------------------------------------------
 
     def _extract_wall_segments_xy(self):
-        """Extract 2D line segments from /World/Walls for proximity ray-cast.
+        """Extract the 2D footprint of /World/Walls as a list of line segments.
 
         Read-only pass over the same wall mesh used for termination.  Each triangle
         edge is projected to the XY plane; we keep only edges whose endpoints have
@@ -1051,7 +1098,8 @@ class ConeTrackEnv(DirectRLEnv):
             wall_root = stage.GetPrimAtPath("/World/Walls")
             if not wall_root.IsValid():
                 print(
-                    "[ConeTrackEnv] /World/Walls not found — proximity ray-cast disabled"
+                    "[ConeTrackEnv] /World/Walls not found — crash-impact angle "
+                    "unavailable, every hit will be scored as head-on"
                 )
                 return []
 
@@ -1106,7 +1154,11 @@ class ConeTrackEnv(DirectRLEnv):
             return []
 
     def _set_active_assets(self, set_idx: int) -> None:
-        """Show asset set set_idx; hide all others."""
+        """Show asset set set_idx; hide all others.
+
+        set_idx == NUM_ASSET_SETS (or any out-of-range index) matches no set and
+        therefore hides every decorative asset.
+        """
         try:
             import omni.usd
             from pxr import UsdGeom
@@ -1138,18 +1190,21 @@ class ConeTrackEnv(DirectRLEnv):
         receive the command from delay_steps ticks ago.
         """
         # On the very first physics step all asset sets are still visible (RTX has
-        # already built every BVH during sim init). Now hide all but set 0.
+        # already built every BVH during sim init). Now hide all but the active set —
+        # or every set when cfg.hide_all_assets is on (index NUM_ASSET_SETS = none).
         if not self._assets_warmup_done:
-            self._set_active_assets(0)
+            self._set_active_assets(NUM_ASSET_SETS if self.cfg.hide_all_assets else 0)
             self._assets_warmup_done = True
 
         # Round-robin asset cycling — each set appears exactly twice per PPO iteration.
         # Sequence: 0,1,2,3,4,0,1,2,3,4,... advancing every asset_randomize_every_n_steps.
-        self._asset_step_counter += 1
-        if self._asset_step_counter >= self.cfg.asset_randomize_every_n_steps:
-            self._asset_step_counter = 0
-            self._asset_round_robin_idx += 1
-            self._set_active_assets(self._asset_round_robin_idx % NUM_ASSET_SETS)
+        # Skipped entirely when all decorations are hidden.
+        if not self.cfg.hide_all_assets:
+            self._asset_step_counter += 1
+            if self._asset_step_counter >= self.cfg.asset_randomize_every_n_steps:
+                self._asset_step_counter = 0
+                self._asset_round_robin_idx += 1
+                self._set_active_assets(self._asset_round_robin_idx % NUM_ASSET_SETS)
 
         raw = actions[:, :2].clamp(-1.0, 1.0)  # [N, 2]  — undelayed policy output
 
@@ -1214,21 +1269,99 @@ class ConeTrackEnv(DirectRLEnv):
         self._throttle_cmd_prev = self._throttle_cmd_curr
         self._throttle_cmd_curr = raw[:, 0]
 
-    def _apply_action(self) -> None:
-        wall_hit_now = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        # Fed back as an observation at the end of this step.
+        self._prev_action = raw.clone()
+
+    def _wall_normal_at(self, pos_xy: torch.Tensor) -> torch.Tensor | None:
+        """Unit XY normal of the wall segment nearest to each of the given positions.
+
+        Uses the wall footprint cached at startup.  Only the
+        handful of envs that just crashed are passed in, so the [K, M] point-to-segment
+        distance matrix stays small.  The sign of the returned normal is arbitrary
+        (either face of the wall); callers must take |v · n̂|.
+
+        Returns [K, 2], or None if no wall geometry was extracted at startup.
+        """
+        if self._wall_seg_a is None:
+            return None
+        a = self._wall_seg_a.unsqueeze(0)  # [1, M, 2]
+        ab = (self._wall_seg_b - self._wall_seg_a).unsqueeze(0)  # [1, M, 2]
+        ap = pos_xy.unsqueeze(1) - a  # [K, M, 2]
+        # Closest point on each segment: clamp the projection parameter to [0, 1].
+        t = ((ap * ab).sum(-1) / ab.pow(2).sum(-1).clamp(min=1e-12)).clamp(0.0, 1.0)
+        delta = ap - t.unsqueeze(-1) * ab  # [K, M, 2] point → segment
+        nearest = delta.pow(2).sum(-1).argmin(dim=1)  # [K]
+        seg = ab[0, nearest]  # [K, 2] direction of the hit wall
+        normal = torch.stack([-seg[:, 1], seg[:, 0]], dim=-1)  # rotate 90°
+        return normal / torch.linalg.vector_norm(
+            normal, dim=-1, keepdim=True
+        ).clamp(min=1e-6)
+
+    def _update_wall_contact(self) -> torch.Tensor:
+        """Poll the wall contact sensors, latch new hits and their pre-collision state.
+
+        Called from both _apply_action (inside the physics substep loop) and _get_dones
+        so that whichever poll first sees the contact captures the car's velocity while
+        it is still the pre-collision one — a step later the wall has already absorbed
+        it and every crash would look gentle.
+
+        Any contact ends the episode, so the latch only ever fires once; the reset
+        that follows clears it.  Severity is not judged here — contact force cannot
+        tell a graze from a head-on hit (stopping 1.27 kg from 3 m/s inside one
+        1/120 s substep is ~450 N either way).  _resolve_crash_impact_speed turns
+        the latched pre-collision state into a severity for the crash penalty.
+
+        Returns the accumulated, grace-filtered wall-contact mask.
+        """
+        peak_force = torch.zeros(self.num_envs, device=self.device)
         for sensor in self._wall_contact_sensors.values():
             fm = sensor.data.force_matrix_w
             if fm is not None:
                 h = torch.linalg.vector_norm(fm[..., :2], dim=-1)
-                wall_hit_now |= (
-                    h.reshape(self.num_envs, -1)
-                    .gt(self.cfg.wall_contact_force_thresh_n)
-                    .any(dim=1)
+                peak_force = torch.maximum(
+                    peak_force, h.reshape(self.num_envs, -1).amax(dim=1)
                 )
-        in_grace = self.episode_length_buf < self.cfg.spawn_grace_steps
-        self._wall_ever_touched |= wall_hit_now & ~in_grace
 
-        wall_mask = self._wall_ever_touched
+        in_grace = self.episode_length_buf < self.cfg.spawn_grace_steps
+        touching = peak_force.gt(self.cfg.wall_contact_force_thresh_n) & ~in_grace
+
+        # Branchless latch of the pre-collision state: this runs on every physics
+        # substep, so it must not read a mask back to the host (a `.any()` here would
+        # add a GPU sync per substep).
+        newly_hit = (touching & ~self._wall_touched).unsqueeze(-1)
+        self._crash_impact_vel = torch.where(
+            newly_hit, self.robot.data.root_lin_vel_w[:, :2], self._crash_impact_vel
+        )
+        self._crash_impact_pos = torch.where(
+            newly_hit, self.robot.data.root_pos_w[:, :2], self._crash_impact_pos
+        )
+
+        self._wall_touched |= touching
+        return self._wall_touched
+
+    def _resolve_crash_impact_speed(self, crashed: torch.Tensor) -> torch.Tensor:
+        """Impact severity of this step's wall hits, in m/s along the wall normal.
+
+        Resolves the latched pre-collision velocity against the normal of the
+        nearest cached wall segment, so a tangential graze reads ≈0 and a head-on
+        hit reads the full closing speed.  Runs once per policy step and only for
+        the envs that actually crashed, which keeps the nearest-segment search off
+        the physics substep path.
+        """
+        self._crash_impact_speed = torch.zeros(self.num_envs, device=self.device)
+        idx = crashed.nonzero(as_tuple=False).squeeze(-1)
+        vel_xy = self._crash_impact_vel[idx]
+        normal = self._wall_normal_at(self._crash_impact_pos[idx])
+        if normal is None:
+            # No wall footprint cached — no angle information available, so treat
+            # every hit as head-on rather than silently under-penalising crashes.
+            self._crash_impact_speed[idx] = torch.linalg.vector_norm(vel_xy, dim=-1)
+        else:
+            self._crash_impact_speed[idx] = (vel_xy * normal).sum(dim=-1).abs()
+        return self._crash_impact_speed
+
+    def _apply_action(self) -> None:
+        wall_mask = self._update_wall_contact()
         wheel_torque = self._wheel_torque.clone()
         wheel_torque[wall_mask] = (
             0.0  # cut drive torque after a wall hit (car coasts to a stop)
@@ -1341,6 +1474,10 @@ class ConeTrackEnv(DirectRLEnv):
     def _get_observations(self) -> dict:
         self._update_depth_cache()
 
+        # Layout is [depth_left | depth_right | proprio...], and the proprio tail
+        # MUST stay last and match ConeTrackActorCriticCfg.num_proprio_obs — the
+        # policy network splits the flat vector on that boundary to route the
+        # scalars through their own encoder branch.
         parts = [self._camera_left_obs, self._camera_right_obs]
         if self.cfg.include_wheel_vel:
             wheel_omega_mean = (
@@ -1350,6 +1487,11 @@ class ConeTrackEnv(DirectRLEnv):
                 wheel_omega_mean * WHEEL_RADIUS / self.cfg.max_velocity_m_s
             ).clamp(0.0, 1.0)
             parts.append(wheel_vel_norm.unsqueeze(-1))  # [N, 1]
+        if self.cfg.include_prev_actions:
+            # The action issued this step is what the actuators will apply next
+            # step (action_delay_ms ≈ one policy tick), so this tells the policy
+            # the control state it is about to be acting from.
+            parts.append(self._prev_action)  # [N, 2]
 
         obs = torch.cat(parts, dim=-1)
         return {"policy": obs}
@@ -1369,17 +1511,7 @@ class ConeTrackEnv(DirectRLEnv):
             self.cfg.distance_weight * lin_vel_b / self.cfg.max_velocity_m_s * dt
         )
 
-        # Episode average-speed bonus: rewards sustained pace, not just current speed.
         forward_speed = lin_vel_b.clamp(min=0.0)
-        self._cumulative_forward_vel += forward_speed
-        speed_sample_count = self.episode_length_buf.float().clamp(min=1.0)
-        avg_speed_norm = (
-            self._cumulative_forward_vel
-            / speed_sample_count
-            / self.cfg.max_velocity_m_s
-        ).clamp(0.0, 1.0)
-        r_average_speed = self.cfg.average_speed_weight * avg_speed_norm
-
         pos_xy = self.robot.data.root_pos_w[:, :2]
 
         # ── Steering deadzone penalty ────────────────────────────────────────────
@@ -1404,88 +1536,44 @@ class ConeTrackEnv(DirectRLEnv):
             self.robot.data.joint_vel[:, self._all_throttle_ids].abs().mean(dim=-1)
         )
         wheel_vel = wheel_omega_mean * WHEEL_RADIUS
-        slip_ratio = (wheel_vel - forward_speed).abs() / self.cfg.max_velocity_m_s
+        # One-sided: only wheelspin (wheels outrunning the car) is charged.  Lockup
+        # under braking is left free — see slip_weight for why taxing it was
+        # actively harmful.
+        slip_ratio = (wheel_vel - forward_speed).clamp(min=0.0) / (
+            self.cfg.max_velocity_m_s
+        )
         r_slip = -self.cfg.slip_weight * slip_ratio.clamp(0.0, 1.0)
 
         r_alive = torch.full(
             (self.num_envs,), self.cfg.alive_weight, device=self.device
         )
 
-        # ── Spawn-escape bonus ────────────────────────────────────────────────
-        # One-time reward scaled by speed at the moment of escape.  Full bonus only
-        # if the car is already moving at max speed when it crosses the radius.
-        spawn_dist = torch.linalg.vector_norm(pos_xy - self._spawn_pos, dim=-1)
-        just_escaped = (~self._spawn_escaped) & (
-            spawn_dist > self.cfg.spawn_escape_radius_m
-        )
-        self._spawn_escaped |= just_escaped
-        speed_frac = (lin_vel_b / self.cfg.max_velocity_m_s).clamp(0.0, 1.0)
-        r_spawn_escape = (
-            self.cfg.spawn_escape_reward * just_escaped.float() * speed_frac
-        )
+        # ── Crash penalty ─────────────────────────────────────────────────────
+        # Charged once, on the step the wall hit is latched — which is also the step
+        # _get_dones terminates the episode, so _wall_touched is cleared by the reset
+        # that immediately follows and the penalty can never be double-charged.
+        # The angle is resolved here (once per policy step, only for the envs that
+        # actually crashed) from the state latched in _update_wall_contact.
+        crashed_now = self._wall_touched
+        any_crash = bool(crashed_now.any())  # single host sync, reused for logging
+        r_crash = torch.zeros(self.num_envs, device=self.device)
+        impact_speed = self._crash_impact_speed
+        if any_crash:
+            impact_speed = self._resolve_crash_impact_speed(crashed_now)
+            if self.cfg.crash_penalty_weight > 0.0:
+                idx = crashed_now.nonzero(as_tuple=False).squeeze(-1)
+                impact_norm = (impact_speed / self.cfg.max_velocity_m_s).clamp(
+                    0.0, 1.0
+                )
+                r_crash[idx] = -(
+                    self.cfg.crash_penalty_weight
+                    * impact_norm[idx].pow(self.cfg.crash_penalty_exponent)
+                )
 
-        # ── Proximity speed penalty (ray-cast against /World/Walls) ──────────────
-        # Cast a virtual ray from the car's XY position along its world-frame
-        # linear-velocity vector and find the closest hit on the (invisible) wall
-        # geometry.  Walls remain hidden / termination-only — this only reads the
-        # cached 2D footprint built once at startup.
-        #
-        # Closeness = 1 − dist / proximity_lookahead_m, clamped to [0, 1].  Walls
-        # beyond the lookahead give zero signal; walls right ahead give 1.0.
-        # Penalty = -weight × speed_norm × closeness.  Strongest exactly when the
-        # car is fast AND a wall is close along the heading of motion (corner entry).
-        if self.cfg.proximity_speed_weight > 0.0 and self._wall_seg_a is not None:
-            vel_w = self.robot.data.root_lin_vel_w[:, :2]  # [N, 2]
-            speed_w = torch.linalg.vector_norm(vel_w, dim=-1)  # [N]
-            moving = speed_w > 0.5
-            dir_w = vel_w / speed_w.clamp(min=1e-3).unsqueeze(-1)  # [N, 2]
-
-            # Vectorised 2D ray-vs-segment intersection across [N envs, M segs].
-            # Ray:     P(t) = origin + t · dir_w,        t ≥ 0
-            # Segment: Q(u) = a + u · (b − a),           0 ≤ u ≤ 1
-            # With s = b − a:
-            #     t = ((a − origin) × s)   / (dir × s)
-            #     u = ((a − origin) × dir) / (dir × s)
-            # where × is the 2D pseudo-cross (a × b = a_x*b_y − a_y*b_x).
-            a = self._wall_seg_a.unsqueeze(0)  # [1, M, 2]
-            b = self._wall_seg_b.unsqueeze(0)  # [1, M, 2]
-            s = b - a  # [1, M, 2]
-            r = dir_w.unsqueeze(1)  # [N, 1, 2]
-            ap = a - pos_xy.unsqueeze(1)  # [N, M, 2]
-
-            cross_rs = r[..., 0] * s[..., 1] - r[..., 1] * s[..., 0]  # [N, M]
-            cross_ap_s = ap[..., 0] * s[..., 1] - ap[..., 1] * s[..., 0]
-            cross_ap_r = ap[..., 0] * r[..., 1] - ap[..., 1] * r[..., 0]
-
-            denom = torch.where(
-                cross_rs.abs() > 1e-8,
-                cross_rs,
-                torch.full_like(cross_rs, 1e-8),
-            )
-            t_hit = cross_ap_s / denom
-            u_hit = cross_ap_r / denom
-
-            hit = (
-                (cross_rs.abs() > 1e-8)
-                & (t_hit > 0.0)
-                & (u_hit >= 0.0)
-                & (u_hit <= 1.0)
-            )
-            t_masked = torch.where(hit, t_hit, torch.full_like(t_hit, float("inf")))
-            nearest_dist = t_masked.min(dim=1).values  # [N]
-
-            closeness = 1.0 - (nearest_dist / self.cfg.proximity_lookahead_m).clamp(
-                0.0, 1.0
-            )
-            speed_norm = (speed_w / self.cfg.max_velocity_m_s).clamp(0.0, 1.0)
-            r_proximity_speed = (
-                -self.cfg.proximity_speed_weight
-                * closeness
-                * speed_norm
-                * moving.float()
-            )
-        else:
-            r_proximity_speed = torch.zeros(self.num_envs, device=self.device)
+        # ── Stall penalty ─────────────────────────────────────────────────────
+        # Mirrors the crash penalty on the other exit from the episode.  _get_dones
+        # has already run this step, so _stalled is current.
+        r_stall = -self.cfg.stall_penalty_weight * self._stalled.float()
 
         # ── Lap completion reward ─────────────────────────────────────────────
         # State machine: 0 = at-start, 1 = away-from-start, lap closes on 1→0.
@@ -1579,63 +1667,48 @@ class ConeTrackEnv(DirectRLEnv):
 
         laps_per_min = completing.float().sum().unsqueeze(0) * (60.0 / dt)
 
+        # Crash metrics follow the same "empty on non-event steps" convention as the
+        # lap keys above, so the iteration mean reads as the average over actual
+        # crashes rather than being diluted by thousands of zero-padded steps.
         self.extras["log"] = {
             "Lap/lap_time_s": lap_times_done,
             "Lap/fastest_lap_s": fastest_log,
             "Lap/laps_per_min": laps_per_min,
+            "Crash/impact_speed_m_s": impact_speed[crashed_now].detach()
+            if any_crash
+            else empty,
+            "Crash/penalty": r_crash[crashed_now].detach() if any_crash else empty,
+            # Event rates — zero-padded per-step MEANS over envs, so the iteration
+            # mean is a per-env-step rate that is comparable across runs.  These used
+            # to be sums, which silently scaled with num_envs and made runs at 12 and
+            # 16 envs look different when they were behaving identically.
+            # Contact = any wall touch (now survivable); wall = the hard hits and
+            # contact-cap exhaustions that actually end the episode.
+            "Term/wall": crashed_now.float().mean().unsqueeze(0),
+            "Term/stall": self._stalled.float().mean().unsqueeze(0),
         }
 
-        # ── Braking reward V2 ────────────────────────────────────────────────
-        # Instantaneous, no session state: r = weight × v_forward² × |brake_input|.
-        # The v² scaling means braking at low speed contributes almost nothing,
-        # while braking at high speed dominates — strong incentive to brake
-        # specifically when going fast (e.g., before corners) rather than always.
-        if self.cfg.braking_v2_weight > 0.0:
-            throttle_cmd_v2 = self._action_delay_buf[:, 0, 0]
-            brake_input_v2 = (-throttle_cmd_v2).clamp(0.0, 1.0)  # 0 if not braking
-            speed_fwd_v2 = lin_vel_b.clamp(min=0.0) / self.cfg.max_velocity_m_s
-            r_braking_v2 = (
-                self.cfg.braking_v2_weight * torch.pow(speed_fwd_v2, 2) * brake_input_v2
-            )
-        else:
-            r_braking_v2 = torch.zeros(self.num_envs, device=self.device)
-
-        total = (
+        return (
             r_alive
+            + r_crash
+            + r_stall
             + r_distance
-            + r_average_speed
             + r_steer_shape
             + r_steer_rate
             + r_throttle_rate
             + r_slip
-            + r_spawn_escape
-            + r_proximity_speed
-            + r_braking_v2
             + r_lap
         )
-
-        return total
 
     # ------------------------------------------------------------------
     # Termination
     # ------------------------------------------------------------------
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        wall_terminated = self._wall_ever_touched.clone()
-
-        for sensor in self._wall_contact_sensors.values():
-            fm = sensor.data.force_matrix_w
-            if fm is not None:
-                h = torch.linalg.vector_norm(fm[..., :2], dim=-1)
-                wall_terminated |= (
-                    h.reshape(self.num_envs, -1)
-                    .gt(self.cfg.wall_contact_force_thresh_n)
-                    .any(dim=1)
-                )
-
+        # Polls the sensors once more: the final sim substep runs after the last
+        # _apply_action, so a contact made on it is first seen here.
+        wall_terminated = self._update_wall_contact()
         in_grace = self.episode_length_buf < self.cfg.spawn_grace_steps
-        self._wall_ever_touched |= wall_terminated & ~in_grace
-        wall_terminated = self._wall_ever_touched
 
         # Flip detection (suppressed during grace)
         q = self.robot.data.root_quat_w
@@ -1643,12 +1716,16 @@ class ConeTrackEnv(DirectRLEnv):
         flipped = (up_z < 0.3) & ~in_grace
 
         # Near-stop termination — only fires if agent is essentially stationary
-        # (slow_stop_speed_fraction × vel_cap, default 3% = 0.075 m/s at 2.5 m/s cap).
-        # Grace period of 45 steps (~1.5 s) lets the car accelerate from spawn.
+        # (slow_stop_speed_fraction × max_velocity_m_s), and only after
+        # slow_stop_grace_steps so the car can accelerate away from a standstill spawn.
         lin_vel_b = self.robot.data.root_lin_vel_b[:, 0]
         stopped = (
             lin_vel_b < (self.cfg.slow_stop_speed_fraction * self.cfg.max_velocity_m_s)
-        ) & (self.episode_length_buf > 45)
+        ) & (self.episode_length_buf > self.cfg.slow_stop_grace_steps)
+        # Handed to _get_rewards (which runs immediately after) to charge the stall
+        # penalty; without that cost, stalling out here is a free way to bank the
+        # alive reward while dodging all crash risk.
+        self._stalled = stopped
 
         terminated = wall_terminated | flipped | stopped
         time_out = self.episode_length_buf >= self.max_episode_length - 1
@@ -1727,11 +1804,13 @@ class ConeTrackEnv(DirectRLEnv):
         self._throttle_cmd_curr[env_ids] = 0.0
         self._throttle_cmd_prev[env_ids] = 0.0
         self._action_delay_buf[env_ids] = 0.0  # clears latency FIFO
+        self._prev_action[env_ids] = 0.0
 
-        self._wall_ever_touched[env_ids] = False
-        self._cumulative_forward_vel[env_ids] = 0.0
+        self._wall_touched[env_ids] = False
+        self._crash_impact_speed[env_ids] = 0.0
+        self._crash_impact_vel[env_ids] = 0.0
+        self._crash_impact_pos[env_ids] = 0.0
         self._spawn_pos[env_ids_t] = spawn_xy
-        self._spawn_escaped[env_ids_t] = False
         self._lap_state[env_ids_t] = 0
         self._lap_start_step[env_ids_t] = 0
         self._spawn_heading_cos[env_ids_t] = torch.cos(base_yaw)
