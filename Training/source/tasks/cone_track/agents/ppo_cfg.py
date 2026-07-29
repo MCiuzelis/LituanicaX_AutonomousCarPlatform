@@ -31,7 +31,7 @@ class ConeTrackActorCriticCfg(RslRlPpoActorCriticCfg):
 
 @configclass
 class ConeTrackPPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    num_steps_per_env: int = 800
+    num_steps_per_env: int = 1200
     max_iterations: int = 1000
     save_interval: int = 10
     experiment_name: str = "cone_track"
@@ -40,7 +40,7 @@ class ConeTrackPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     obs_groups = {"policy": ["policy"], "critic": ["policy"]}
 
     policy: ConeTrackActorCriticCfg = ConeTrackActorCriticCfg(
-        init_noise_std=0.75,
+        init_noise_std=0.65,
         actor_obs_normalization=True,
         critic_obs_normalization=True,
         # First two entries size the depth trunk, the last sizes the head that
@@ -78,7 +78,7 @@ class ConeTrackPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         # 0.0045 held mean_noise_std at 0.49 after 148 iterations.  At 30 Hz that
         # much noise on throttle/steering IS the observed erratic driving, and it
         # also biases the mean action toward whatever survives its own jitter.
-        entropy_coef=0.001,
+        entropy_coef=0.0,#0.001,
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         # 0.995 is a 200-step horizon; a lap is ~385 steps at 30 Hz, so the lap
@@ -97,9 +97,6 @@ class ConeTrackPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     #     actor_hidden_dims=[256, 128],
     #     critic_hidden_dims=[512, 256],
     #     activation="elu",
-    #     # Recurrent core: gives the policy temporal memory so it can integrate
-    #     # wheel-speed odometry, anticipate corners beyond the 2 m sensing horizon,
-    #     # and temporally filter the noisy depth frames.
     #     rnn_type="lstm",
     #     rnn_hidden_dim=256,
     #     rnn_num_layers=1,

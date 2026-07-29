@@ -1,6 +1,12 @@
 # LituanicaX Deployment
 
-ROS 2-based control stack for the RL-trained autonomous RC car, running on a **Raspberry Pi 5**.
+Control stack for the RL-trained autonomous RC car, running on a **Raspberry Pi 5**.
+
+It exists in two interchangeable forms with identical behaviour:
+
+- **`Ros2/`** — the ROS 2 node graph (documented below).
+- **`Python/`** — the same stack as plain Python classes, no ROS. See
+  [Python/README.md](./Python/README.md).
 
 ## Overview
 
@@ -12,6 +18,9 @@ Deployment/
 ├── ros2_jazzy_build_guide.md  # Build ROS 2 Jazzy from source on Pi 5 / Debian Trixie
 ├── Ros2/                      # ROS 2 colcon workspace
 │   └── src/LituanicaX_RC_Car/ # ROS package with all deployment nodes
+├── Python/                    # Same stack without ROS: one process, plain classes
+│   ├── run                    # Launcher: Deployment/Python/run [--disable-tof ...]
+│   └── lituanicax/            # Robot + one module class per ROS node
 └── old_python/                # Legacy standalone Python deployment (deprecated)
     ├── autopilot.py
     ├── hardware.py
@@ -49,6 +58,12 @@ ros2 launch lituanicax_rc_car ros_autopilot.launch.py
 ```
 
 Open the dashboard at `http://<raspberry-pi-ip>:8080`.
+
+To run the same stack without ROS (no colcon build, no sourcing):
+
+```bash
+Deployment/Python/run
+```
 
 ## ROS Nodes
 

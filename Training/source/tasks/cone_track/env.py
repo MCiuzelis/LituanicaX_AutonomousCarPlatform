@@ -140,6 +140,19 @@ WALL_CONTACT_LINKS = (
     "back_right_wheel_link",
 )
 
+# The four wheels, i.e. the subset of WALL_CONTACT_LINKS whose GROUND contact is
+# read back for the wheel-lift penalty.  No extra sensors are needed for that: a
+# ContactSensor always reports the body's total contact force in `net_forces_w`,
+# and `filter_prim_paths_expr` only adds the per-filter breakdown on top of it.
+# So the wall sensors already carry the ground reaction; the wall pair-force is
+# read from force_matrix_w, the ground support from net_forces_w[..., 2].
+WHEEL_LINKS = (
+    "front_left_wheel_link",
+    "front_right_wheel_link",
+    "back_left_wheel_link",
+    "back_right_wheel_link",
+)
+
 
 # ===========================================================================
 # Environment Configuration  ←  ALL TUNABLE PARAMETERS LIVE HERE
@@ -163,7 +176,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
 
     # ── Core env parameters ────────────────────────────────────────────────
     decimation: int = 4  # policy at 30 Hz  (sim 120 Hz / 4)
-    episode_length_s: float = 90.0  # 90 s × 30 Hz = 2 700 steps
+    episode_length_s: float = 30.0  # 30 s × 30 Hz = 900 steps (≈2 laps at 13 s)
     action_space: int = 2
     # observation_space is patched in ConeTrackEnv.__init__ after computing
     # the exact cropped depth image size.  The placeholder below keeps
@@ -378,7 +391,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # REWARD WEIGHTS
     # ════════════════════════════════════════════════════════════════════════
     # Constant reward per step the agent stays alive (not crashed / stuck).
-    alive_weight: float = 0.01  # 0.04
+    alive_weight: float = 0.0  # 0.01
 
     # ── Crash penalty ────────────────────────────────────────────────────────
     # One-off cost charged on the step a wall contact is latched (the same step the
@@ -413,17 +426,17 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     distance_weight: float = 4.0
 
     # Steering deadzone penalty: only penalises steering beyond the deadzone.
-    steer_deadzone_weight: float = 0.003
+    steer_deadzone_weight: float = 0.005
     steer_deadzone: float = 0.05  # fraction of max_steer_rad that is free
 
     # Steering-rate (smoothness) penalty: penalises the change in steering command
     # between consecutive policy steps, r = -weight × |steer_t − steer_{t-1}|.
     # Directly suppresses the jerky servo chatter; encourages smooth, committed lines.
-    steer_rate_weight: float = 0.006
+    steer_rate_weight: float = 0.04
 
     # Throttle-rate penalty: penalises the change in throttle/brake command
     # between consecutive policy steps to suppress banging between full throttle and brake.
-    throttle_rate_weight: float = 0.007
+    throttle_rate_weight: float = 0.015
 
     # Wheel slip penalty — ONE-SIDED: charges wheelspin (wheels turning faster than
     # the car) but not lockup (wheels slower than the car).  It used to be symmetric,
@@ -433,31 +446,108 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # of the brake range was penalised — a second of hard braking cost ~11x the
     # explicit crash penalty.  That is a large part of "enters corners too fast,
     # then slides".
-    slip_weight: float = 1.2
+    slip_weight: float = 1.0
+
+    # ── Lateral slip (sideslip / oversteer) penalty ──────────────────────────
+    # Charges the car for travelling at an angle to where it points — i.e. sliding.
+    # Zero in a straight line BY CONSTRUCTION, whatever the wheels are doing, so it
+    # can be made firm without taxing straight-line acceleration or braking the way
+    # the longitudinal slip_weight does.
+    #
+    #   r = -lateral_slip_weight × ((beta - deadzone) / (pi - deadzone))**2
+    #
+    # Calibrated against the measured distance reward at the current 2.7 m/s average
+    # (Rew/distance ≈ 0.054 per step), so a normal cornering slip angle is cheap and
+    # a deliberate slide is not worth what it buys:
+    #
+    #     sideslip     penalty/step    vs distance reward
+    #       8.6°          0.000              free (deadzone)
+    #      20°            0.0066             12 %
+    #      30°            0.023              43 %
+    #      45°            0.068             126 %   <- sliding now costs more than
+    #      90°            0.34              630 %      the progress it makes
+    #
+    # If the agent still flicks the rear out, raise the weight before touching the
+    # deadzone — shrinking the deadzone starts penalising legitimate fast cornering.
+    lateral_slip_weight: float = 1
+    lateral_slip_deadzone_rad: float = 0.15  # ≈8.6°, free: normal tyre slip angle
+    lateral_slip_min_speed_m_s: float = 0.5  # below this the angle is meaningless
+
+    # ── Wheel-lift penalty ───────────────────────────────────────────────────
+    # Charges the car for any wheel that is not carrying load.  This is the ROOT
+    # CAUSE of the corner-slide exploit rather than one of its symptoms: the car
+    # enters too fast, lateral load transfer unloads the inside wheels, and once a
+    # wheel is off the ground the remaining contact patches cannot hold the corner,
+    # so the rear steps out.  Some cars catch it and land back on four wheels, some
+    # tip over.  The lateral-slip penalty above only sees the slide AFTER it starts;
+    # this one prices the condition that causes it, one step earlier.
+    #
+    #   r = -wheel_lift_weight × (wheels_off / 4)**wheel_lift_exponent
+    #
+    # The exponent matters more than the weight.  One unloaded wheel is the normal
+    # consequence of cornering genuinely hard and should cost something but stay
+    # survivable; TWO wheels off is a rollover already in progress and must be far
+    # worse than twice as bad.  Squaring gives exactly that shape:
+    #
+    #     wheels off    penalty/step    vs distance reward @2.7 m/s (0.054/step)
+    #        1             0.25              460 %
+    #        2             1.00             1850 %
+    #        3             2.25             4170 %
+    #        4             4.00             7410 %
+    #
+    # In episode terms a 0.5 s (15-step) tip-up on one wheel costs 3.75, i.e. more
+    # than a full-speed crash (3.0); on two wheels it costs 15, roughly a whole lap
+    # bonus.  Cornering that needs a wheel in the air is therefore never profitable.
+    #
+    # Detection is the vertical ground reaction on each wheel link, peak-held over
+    # the 4 physics substeps of the policy step, so a single-substep contact dropout
+    # cannot produce a false accusation.  Static load is 1.27 kg × 9.81 / 4 ≈ 3.1 N
+    # per wheel, so the 0.5 N threshold fires at ~16 % of static load — slightly
+    # BEFORE the tyre physically leaves the ground, which is deliberate: a wheel
+    # carrying 0.4 N generates no useful grip either way, and the earlier signal is
+    # easier to act on.  Suppressed during spawn grace, when the car is still
+    # dropping the 2 mm onto the ground and the sensor history is post-reset zeros.
+    wheel_lift_weight: float = 4.0
+    wheel_lift_exponent: float = 2.0
+    wheel_ground_force_thresh_n: float = 0.5  # vertical load below this = unloaded
 
     # ── Lap completion reward ────────────────────────────────────────────────
     # Sparse reward fired when the agent crosses the start line (the line through
     # the spawn point perpendicular to the spawn heading) while back inside the
-    # `lap_return_radius_m` start circle, after having left that circle.  Reward scales
-    # inversely with lap time, so faster laps yield much more reward:
-    #   r_lap = lap_reward_weight × lap_max_time_s / clamp(lap_time_s, lap_min, lap_max)
-    # At base=500 and a 30 s lap → +500.  A 10 s lap → +1500.  Designed to be the
-    # primary improvement driver once the agent can complete laps, dwarfing the
-    # dense distance reward (~25/sec at top speed → ~750 per 30 s lap).
-    # Until the agent can actually finish a lap this reward stays at 0, so it has
-    # no effect on early training.
-    # 15.0 made a single lap worth 15 × 30 / 12.8 ≈ +35 in ONE step — more than the
-    # whole rest of the episode return — and the critic could not fit the spike:
-    # value loss tripled from 3.6 to 13.9 the moment it went 8 → 15, which fed
-    # high-variance advantages into the KL controller and pinned the LR to its floor.
-    lap_reward_weight: float = 6.0
-    # pays more for faster laps (lap_max/lap_time)
+    # `lap_return_radius_m` start circle, after having left that circle.
+    #
+    #   r_lap = lap_reward_weight × (lap_reward_ref_time_s / lap_time)**lap_reward_exponent
+    #
+    # ACCELERATING payoff: the exponent makes each further second of lap time worth
+    # progressively MORE, which is the point — shaving 15 s → 14 s is easy and should
+    # pay little, while 10 s → 9 s is hard and should pay a lot.  The marginal reward
+    # per second saved is  p·r_lap/T, so it grows as the lap time falls:
+    #
+    #     lap time    r_lap    marginal reward per 1 s saved
+    #      15.0 s     10.5              1.4
+    #      13.0 s     14.0              2.2      <- current operating point
+    #      11.4 s     18.3              3.2
+    #      10.0 s     23.7              4.7
+    #       8.0 s     36.9              9.2
+    #
+    # The reference time anchors the scale: a lap at exactly lap_reward_ref_time_s
+    # pays exactly lap_reward_weight.  It is set to the lap time the agent is
+    # currently achieving, and the weight to what the old linear form paid there
+    # (6 × 30/13 ≈ 13.9), so switching to the exponent changes the SHAPE of the
+    # incentive without changing the scale of the return.  That matters: at
+    # lap_reward_weight=15 the old form put +35 into a single step, the critic could
+    # not fit the spike (value loss 3.6 → 13.9) and the resulting high-variance
+    # advantages pinned the LR to its floor.  Raise the weight only alongside the
+    # value-loss trace.
+    lap_reward_weight: float = 16.0  # reward for a lap at exactly the reference time
+    lap_reward_ref_time_s: float = 13.0  # calibration anchor (current typical lap)
+    lap_reward_exponent: float = 2.0  # 1.0 = the old ~linear form; 2.0 = quadratic
     lap_return_radius_m: float = (
         0.3  # start circle: leaving it starts the lap timer; crossing the
     )
     # start line while back inside closes the lap
     lap_min_time_s: float = 5.0  # lower clamp (caps maximum reward per lap)
-    lap_max_time_s: float = 30.0  # upper clamp & numerator anchor
+    lap_max_time_s: float = 30.0  # upper clamp (floors the reward for a crawl)
 
     # How often to advance to the next asset set in the round-robin cycle (in policy steps).
     # Set to num_steps_per_env / (NUM_ASSET_SETS * 2) so every set appears exactly twice
@@ -1544,6 +1634,87 @@ class ConeTrackEnv(DirectRLEnv):
         )
         r_slip = -self.cfg.slip_weight * slip_ratio.clamp(0.0, 1.0)
 
+        # ── Lateral slip (sideslip / oversteer) penalty ──────────────────────────
+        # Sideslip angle = the angle between where the car is GOING and where it is
+        # POINTING, from body-frame velocity:
+        #     beta = atan2(|v_lateral|, v_forward)      0 = tracking straight
+        #                                            pi/2 = travelling pure sideways
+        #                                              pi = spun fully backwards
+        # This is the term that targets the corner exploit — brake in, then power the
+        # rear loose to rotate the car — and it is deliberately NOT the longitudinal
+        # slip above.  The two are independent by construction: in a straight line
+        # v_lateral is zero, so accelerating hard enough to spin the wheels or braking
+        # hard enough to lock them costs exactly nothing here no matter how large the
+        # longitudinal slip gets.  Only rotating the car away from its velocity vector
+        # is charged.  That separation is why longitudinal slip_weight previously had
+        # to be cranked to 1.2 to suppress the flick: it was a blunt proxy that taxed
+        # every straight-line throttle and brake input to reach the cornering
+        # behaviour it was actually aimed at.
+        v_fwd_b = self.robot.data.root_lin_vel_b[:, 0]
+        v_lat_b = self.robot.data.root_lin_vel_b[:, 1]
+        planar_speed = torch.linalg.vector_norm(
+            self.robot.data.root_lin_vel_b[:, :2], dim=-1
+        )
+        slip_angle = torch.atan2(v_lat_b.abs(), v_fwd_b)
+        # Deadzone: tyres only generate cornering force by running at some slip angle,
+        # so committed fast cornering must stay free — only a genuine slide is charged.
+        slip_excess = (slip_angle - self.cfg.lateral_slip_deadzone_rad).clamp(min=0.0)
+        slip_excess_norm = slip_excess / max(
+            math.pi - self.cfg.lateral_slip_deadzone_rad, 1e-6
+        )
+        # Squared, so the penalty stays near zero just past the deadzone and climbs
+        # steeply into a real slide, and speed-gated because the angle is numerically
+        # meaningless when the car is barely moving (a car creeping at 0.05 m/s with
+        # 0.04 m/s of drift reads 39°, which is noise, not a slide).
+        slip_moving = (planar_speed > self.cfg.lateral_slip_min_speed_m_s).float()
+        r_lateral_slip = (
+            -self.cfg.lateral_slip_weight * slip_excess_norm.pow(2) * slip_moving
+        )
+        # Same gate on the diagnostic: report the angle averaged over the envs the
+        # penalty actually applies to, otherwise stationary envs dominate the mean
+        # with meaningless angles and the trace can't be read.
+        slip_angle_deg = torch.rad2deg(slip_angle)
+        slip_moving_n = slip_moving.sum().clamp(min=1.0)
+        slip_angle_deg_gated = (slip_angle_deg * slip_moving).sum() / slip_moving_n
+        slip_angle_deg_peak = (slip_angle_deg * slip_moving).max()
+
+        # ── Wheel-lift penalty ───────────────────────────────────────────────────
+        # Counts wheels carrying no vertical load, from the ground reaction the wall
+        # sensors already report in net_forces_w (see WHEEL_LINKS for why no extra
+        # sensor is needed).  The z component isolates ground support specifically:
+        # the ground is a flat plane so its reaction is essentially world +z, while a
+        # wall reaction is horizontal and cannot be mistaken for support.
+        #
+        # The history buffer holds one entry per physics substep (history_length =
+        # decimation), and the peak over it is what decides contact, so a wheel counts
+        # as DOWN if it carried load at any point during the policy step.  That errs
+        # toward not charging the penalty, which is the right direction for a term
+        # this heavy.
+        wheels_down = torch.zeros(self.num_envs, device=self.device)
+        for link_name in WHEEL_LINKS:
+            forces = self._wall_contact_sensors[link_name].data.net_forces_w_history
+            fz_peak = (
+                forces[..., 2].abs().reshape(self.num_envs, -1).amax(dim=1)
+            )
+            wheels_down += fz_peak.gt(self.cfg.wheel_ground_force_thresh_n).float()
+
+        n_wheels = float(len(WHEEL_LINKS))
+        wheels_off = n_wheels - wheels_down
+        lift_frac = wheels_off / n_wheels
+        # Grace gate is mandatory, not cosmetic: _reset_idx zeroes the sensor history,
+        # and the car spawns 2 mm above the ground, so without it every episode would
+        # open with several steps of a full four-wheels-airborne charge.
+        lift_active = (self.episode_length_buf >= self.cfg.spawn_grace_steps).float()
+        r_wheel_lift = (
+            -self.cfg.wheel_lift_weight
+            * lift_frac.pow(self.cfg.wheel_lift_exponent)
+            * lift_active
+        )
+        # Incidence rate (fraction of env-steps with at least one wheel unloaded) is
+        # the readable trace; the mean count alone hides whether a rare 3-wheel event
+        # or a constant 1-wheel one is driving it.
+        lift_incidence = ((wheels_off > 0).float() * lift_active).mean()
+
         r_alive = torch.full(
             (self.num_envs,), self.cfg.alive_weight, device=self.device
         )
@@ -1625,7 +1796,10 @@ class ConeTrackEnv(DirectRLEnv):
         )
         r_lap = torch.where(
             completing,
-            self.cfg.lap_reward_weight * self.cfg.lap_max_time_s / lap_time_clamped,
+            self.cfg.lap_reward_weight
+            * (self.cfg.lap_reward_ref_time_s / lap_time_clamped).pow(
+                self.cfg.lap_reward_exponent
+            ),
             torch.zeros_like(lap_time_s),
         )
 
@@ -1682,10 +1856,45 @@ class ConeTrackEnv(DirectRLEnv):
             # mean is a per-env-step rate that is comparable across runs.  These used
             # to be sums, which silently scaled with num_envs and made runs at 12 and
             # 16 envs look different when they were behaving identically.
-            # Contact = any wall touch (now survivable); wall = the hard hits and
-            # contact-cap exhaustions that actually end the episode.
             "Term/wall": crashed_now.float().mean().unsqueeze(0),
             "Term/stall": self._stalled.float().mean().unsqueeze(0),
+            # ── Reward decomposition ──────────────────────────────────────────
+            # Per-env-step means, so they sum to Train/mean_reward / mean_episode_length
+            # and each one's PER-EPISODE contribution is (its value × mean_episode_length).
+            # The sparse terms (lap, crash, stall) are zero on almost every step, so read
+            # them per-episode; the dense ones are meaningful per-step as they stand.
+            # These exist because the split between distance, slip and the smoothness
+            # penalties is otherwise only recoverable by arithmetic on the total, which
+            # is how slip_weight went unnoticed at 100x every other coefficient.
+            "Rew/alive": r_alive.mean().unsqueeze(0),
+            "Rew/distance": r_distance.mean().unsqueeze(0),
+            "Rew/lap": r_lap.mean().unsqueeze(0),
+            "Rew/crash": r_crash.mean().unsqueeze(0),
+            "Rew/stall": r_stall.mean().unsqueeze(0),
+            "Rew/slip": r_slip.mean().unsqueeze(0),
+            "Rew/lateral_slip": r_lateral_slip.mean().unsqueeze(0),
+            "Rew/wheel_lift": r_wheel_lift.mean().unsqueeze(0),
+            "Rew/steer_deadzone": r_steer_shape.mean().unsqueeze(0),
+            "Rew/steer_rate": r_steer_rate.mean().unsqueeze(0),
+            "Rew/throttle_rate": r_throttle_rate.mean().unsqueeze(0),
+            # Raw magnitudes behind the penalties, so a weight change can be reasoned
+            # about without re-deriving the underlying quantity from its product.
+            "Diag/slip_ratio": slip_ratio.mean().unsqueeze(0),
+            # Sideslip angle over the moving envs only, mean and peak.  The peak is
+            # the one to watch for the corner-flick: a slide that only happens at
+            # corner entry is averaged away over the straights where the angle is ~0.
+            "Diag/slip_angle_deg": slip_angle_deg_gated.unsqueeze(0),
+            "Diag/slip_angle_deg_max": slip_angle_deg_peak.unsqueeze(0),
+            # Wheels off the ground: mean count over all envs, and the fraction of
+            # env-steps with at least one wheel unloaded.  The incidence is the one
+            # that should collapse toward 0 as the penalty takes effect.
+            "Diag/wheels_off_ground": (wheels_off * lift_active)
+            .mean()
+            .unsqueeze(0),
+            "Diag/wheel_lift_incidence": lift_incidence.unsqueeze(0),
+            "Diag/steer_rate_abs": steer_rate.mean().unsqueeze(0),
+            "Diag/throttle_rate_abs": throttle_rate.mean().unsqueeze(0),
+            "Diag/fwd_speed_m_s": forward_speed.mean().unsqueeze(0),
         }
 
         return (
@@ -1697,6 +1906,8 @@ class ConeTrackEnv(DirectRLEnv):
             + r_steer_rate
             + r_throttle_rate
             + r_slip
+            + r_lateral_slip
+            + r_wheel_lift
             + r_lap
         )
 
