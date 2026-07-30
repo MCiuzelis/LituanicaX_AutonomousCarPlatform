@@ -18,7 +18,14 @@ import numpy as np
 from ..config import BRAKE_MAGNITUDE, POLICY_HZ
 from ..module import Module
 from .drive import Drive
-from .tof_camera import ACTION_HIST, OBS_DIM, TofCamera, process_for_policy
+from .tof_camera import (
+    ACTION_HIST,
+    OBS_DIM,
+    PER_CAM_DIM,
+    WHEEL_VEL_OBS,
+    TofCamera,
+    process_for_policy,
+)
 
 MAX_WHEEL_VELOCITY_M_S = 6.7
 WHEEL_VELOCITY_LPF_ALPHA = 0.1
@@ -100,8 +107,21 @@ class PolicyRunner(Module):
         self.session = ort.InferenceSession(
             str(self.policy_path), sess_options=opts, providers=["CPUExecutionProvider"]
         )
-        self.input_name = self.session.get_inputs()[0].name
+        model_input = self.session.get_inputs()[0]
+        self.input_name = model_input.name
         self.output_name = self.session.get_outputs()[0].name
+
+        # The exported policy hard-codes its input width, so a stale constant here
+        # is a silent sim-to-real mismatch.  Catch it at startup, not on the track.
+        expected_dim = model_input.shape[-1] if model_input.shape else None
+        if isinstance(expected_dim, int) and expected_dim != OBS_DIM:
+            raise ValueError(
+                f"Policy expects {expected_dim} observations but this build assembles "
+                f"{OBS_DIM} ({PER_CAM_DIM} px/camera × 2 + {WHEEL_VEL_OBS} wheel vel + "
+                f"{ACTION_HIST} action history).  Check that the crop fractions, "
+                f"policy width and prev_action_history_len in tof_camera.py still match "
+                f"ConeTrackEnvCfg in the training repo."
+            )
 
         self.log.info(
             f"Policy loaded from {self.policy_path}; obs={OBS_DIM}, target={self.rate_hz:.1f} Hz"
@@ -135,16 +155,22 @@ class PolicyRunner(Module):
         left_obs = process_for_policy(*left)
         right_obs = process_for_policy(*right)
 
-        # Temporarily replacing action_history with wheel_vel_norm
+        # Layout must match ConeTrackEnv._get_observations exactly:
+        # [depth_left | depth_right | wheel_vel | action history oldest→newest].
         wheel_vel_arr = np.array([self.wheel_vel_norm], dtype=np.float32)
-        obs = np.concatenate([left_obs, right_obs, wheel_vel_arr])[np.newaxis, :]
-        # obs = np.concatenate([left_obs, right_obs, self.action_history])[np.newaxis, :]
+        obs = np.concatenate(
+            [left_obs, right_obs, wheel_vel_arr, self.action_history]
+        )[np.newaxis, :]
 
         action = self.session.run([self.output_name], {self.input_name: obs})[0].clip(-1.0, 1.0)[0]
         throttle_raw = float(action[0])
         steer = float(action[1])
         throttle_motor = throttle_raw if throttle_raw >= 0 else throttle_raw * BRAKE_MAGNITUDE
 
+        # Push this tick's raw command onto the history FIFO, newest last — the sim
+        # does the same in _pre_physics_step, so the next observation carries it as
+        # the final pair.  Note it is the RAW policy output that is remembered, not
+        # the brake-scaled value handed to the motor.
         self.action_history = np.roll(self.action_history, -2)
         self.action_history[-2] = throttle_raw
         self.action_history[-1] = steer

@@ -1,10 +1,14 @@
-"""RSL-RL PPO configuration for the cone-track task."""
+"""PPO hyper-parameters for the cone-track task (RSL-RL ``OnPolicyRunner``).
+
+This is the file to edit when tuning LEARNING; ``env.py`` is the file to edit when
+tuning the ROBOT, the track, or the reward.  Values here are consumed by train.py
+and play.py through the ``rsl_rl_cfg_entry_point`` registered in ``__init__.py``.
+"""
 
 from isaaclab.utils import configclass
 from isaaclab_rl.rsl_rl import (
     RslRlOnPolicyRunnerCfg,
     RslRlPpoActorCriticCfg,
-    RslRlPpoActorCriticRecurrentCfg,
     RslRlPpoAlgorithmCfg,
 )
 
@@ -13,10 +17,10 @@ from isaaclab_rl.rsl_rl import (
 class ConeTrackActorCriticCfg(RslRlPpoActorCriticCfg):
     """Actor-critic with a dedicated encoder branch for the proprioceptive tail.
 
-    See agents/actor_critic.py for why the scalars need their own branch: as 3
-    columns out of 4323 they carry ~0.07 % of the first layer's activation
-    variance, so a plain MLP has to spend a very long time learning to hear them
-    over 4320 depth pixels.
+    See actor_critic.py for why the scalars need their own branch: as 11 columns
+    out of 4331 they carry ~0.25 % of the first layer's activation variance, so a
+    plain MLP has to spend a very long time learning to hear them over 4320 depth
+    pixels.
     """
 
     class_name: str = "ConeTrackActorCritic"
@@ -24,17 +28,21 @@ class ConeTrackActorCriticCfg(RslRlPpoActorCriticCfg):
     # Trailing observation entries treated as proprioception, i.e. routed through
     # the encoder branch instead of the depth trunk.  MUST match what
     # ConeTrackEnv._get_observations appends after the two depth images:
-    # wheel speed (include_wheel_vel) + last action (include_prev_actions, 2).
-    num_proprio_obs: int = 3
+    #   include_wheel_vel (1) + 2 × prev_action_history_len (5) = 11.
+    # A mismatch is silent — the split just lands in the wrong place — so update
+    # this whenever either env option changes.
+    num_proprio_obs: int = 11
     proprio_hidden_dims: list[int] = [64, 64]
 
 
 @configclass
 class ConeTrackPPORunnerCfg(RslRlOnPolicyRunnerCfg):
+    """Runner + algorithm settings for a ConeTrack PPO run."""
+
     num_steps_per_env: int = 1200
     max_iterations: int = 1000
     save_interval: int = 10
-    experiment_name: str = "cone_track"
+    experiment_name: str = "cone_track"  # → logs/rsl_rl/cone_track/<timestamp>/
 
     # Observation group mapping required by RslRlVecEnvWrapper
     obs_groups = {"policy": ["policy"], "critic": ["policy"]}
@@ -78,7 +86,7 @@ class ConeTrackPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         # 0.0045 held mean_noise_std at 0.49 after 148 iterations.  At 30 Hz that
         # much noise on throttle/steering IS the observed erratic driving, and it
         # also biases the mean action toward whatever survives its own jitter.
-        entropy_coef=0.0,#0.001,
+        entropy_coef=0.0,
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         # 0.995 is a 200-step horizon; a lap is ~385 steps at 30 Hz, so the lap
@@ -89,34 +97,3 @@ class ConeTrackPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         desired_kl=0.02,
         max_grad_norm=0.75,
     )
-
-    # policy: RslRlPpoActorCriticRecurrentCfg = RslRlPpoActorCriticRecurrentCfg(
-    #     init_noise_std=0.5,
-    #     actor_obs_normalization=True,
-    #     critic_obs_normalization=True,
-    #     actor_hidden_dims=[256, 128],
-    #     critic_hidden_dims=[512, 256],
-    #     activation="elu",
-    #     rnn_type="lstm",
-    #     rnn_hidden_dim=256,
-    #     rnn_num_layers=1,
-    # )
-
-    # algorithm: RslRlPpoAlgorithmCfg = RslRlPpoAlgorithmCfg(
-    #     learning_rate=1e-4,
-    #     schedule="adaptive",
-    #     num_learning_epochs=4,
-    #     # Few minibatches so RSL-RL keeps long trajectory sequences intact for
-    #     # BPTT through the LSTM (24 would fragment them and hurt recurrence).
-    #     num_mini_batches=2,
-    #     clip_param=0.2,
-    #     entropy_coef=0.004,
-    #     value_loss_coef=1.0,
-    #     use_clipped_value_loss=True,
-    #     # Longer credit-assignment horizon (~330 steps ≈ 11 s) so the "brake now
-    #     # to avoid a corner 1-2 s ahead" signal propagates back to the decision.
-    #     gamma=0.993,
-    #     lam=0.95,
-    #     desired_kl=0.01,
-    #     max_grad_norm=0.75,
-    # )

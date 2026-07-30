@@ -1,29 +1,22 @@
-"""Acceleration / braking test — uses the full ConeTrackEnv (identical physics).
+"""Drivetrain bench test — how fast the simulated car accelerates and stops.
 
-The car accelerates on the track at constant throttle until it reaches
-max_velocity_m_s or hits a wall, then applies constant braking until stopped.
-Prints top speed, per‑phase time, car distance, and average wheel‑rotation
-distance (captures slip).
+Runs the real ConeTrackEnv (same physics, same actuator model) with collisions and
+terminations disabled, holds a constant throttle until the target speed is reached,
+then holds a constant brake until the car stops.  Reports top speed, phase times,
+distance travelled, and how far the wheels rotated — the gap between the last two
+is tyre slip.
+
+This is the loop for matching the sim drivetrain to the measurements in
+real_car_acceleration_log.txt: run it, compare, then adjust drive_torque /
+brake_torque_base / brake_torque_gain / ground_*_friction in env.py.
 
 Usage:
-    python acceleration_test.py --headless
-    python acceleration_test.py --headless --accel_throttle 0.5 --brake_power 0.5
+    uv run python acceleration_test.py --headless
+    uv run python acceleration_test.py --headless --accel_throttle 0.5 --brake_power 0.5
 """
 
 import argparse
 import os
-import sys
-import time
-
-# ── libstdc++ fix (identical to train.py / play.py) ───────────────────────────
-if "ISAACLAB_LIBSTDCPP_FIXED" not in os.environ:
-    _conda_prefix = os.environ.get("CONDA_PREFIX")
-    if _conda_prefix:
-        _libstdcpp = os.path.join(_conda_prefix, "lib", "libstdc++.so.6")
-        if os.path.exists(_libstdcpp):
-            os.environ["ISAACLAB_LIBSTDCPP_FIXED"] = "1"
-            os.environ["LD_PRELOAD"] = _libstdcpp
-            os.execv(sys.executable, [sys.executable] + sys.argv)
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
@@ -35,7 +28,7 @@ parser.add_argument("--accel_throttle", type=float, default=1.0,
 parser.add_argument("--brake_power", type=float, default=1.0,
     help="Constant braking magnitude during deceleration phase [0, 1].")
 parser.add_argument("--max_speed", type=float, default=4.5,
-    help="Target top speed for the test threshold (default: 5.0 m/s).")
+    help="Speed (m/s) at which the acceleration phase is considered done.")
 parser.add_argument("--max_time", type=float, default=20.0,
     help="Max simulation seconds before abort.")
 parser.add_argument("--hide_obstacles", action="store_true", default=True,
@@ -51,13 +44,14 @@ app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
 # ── Post-launch imports ───────────────────────────────────────────────────────
+from typing import cast
+
 import numpy as np
 import torch
 import gymnasium as gym
-import isaaclab_tasks  # noqa: F401
-import tasks  # noqa: F401
+import cone_track  # noqa: F401  — registers the "ConeTrack" gym id
 
-from tasks.cone_track.env import ConeTrackEnvCfg, WHEEL_RADIUS
+from cone_track.env import ConeTrackEnv, ConeTrackEnvCfg, WHEEL_RADIUS
 
 
 def main():
@@ -74,7 +68,7 @@ def main():
     env_cfg.slow_stop_speed_fraction    = -1.0
 
     env = gym.make("ConeTrack", cfg=env_cfg)
-    mushr_env = env.unwrapped
+    mushr_env = cast(ConeTrackEnv, env.unwrapped)
     device    = mushr_env.device
 
     # ── Hide obstacles so the car accelerates freely ──────────────────────────
@@ -105,7 +99,7 @@ def main():
     brake_torque_gain = mushr_env.cfg.brake_torque_gain
     max_vel_cfg       = mushr_env.cfg.max_velocity_m_s
 
-    max_vel = args_cli.max_speed if args_cli.max_speed is not None else max_vel_cfg
+    max_vel = args_cli.max_speed
     accel_throttle = float(np.clip(args_cli.accel_throttle, 0.0, 1.0))
     brake_power    = float(np.clip(args_cli.brake_power, 0.0, 1.0))
 
@@ -238,7 +232,7 @@ def main():
 
     while simulation_app.is_running():
         if accel_steps + brake_steps >= max_env_steps:
-            print(f"[TIMEOUT] Aborting during braking")
+            print("[TIMEOUT] Aborting during braking")
             break
 
         _, _, terminated, truncated, _ = env.step(action_brake)
@@ -262,7 +256,7 @@ def main():
             break
 
     if brake_wall_hit:
-        print(f"[WALL HIT] during braking")
+        print("[WALL HIT] during braking")
 
     brake_time = brake_steps * dt_env
     brake_end_pos = mushr_env.robot.data.root_pos_w[0, :2].clone()
@@ -287,7 +281,7 @@ def main():
     print(f"  Max velocity target       = {max_vel:.3f}  m/s")
     print(f"  Speed ratio               = {top_speed / max_vel:.3f}")
     print()
-    print(f"  ── Acceleration phase ──")
+    print("  ── Acceleration phase ──")
     print(f"  Duration                  = {accel_time:.3f}  s")
     print(f"  Steps                     = {accel_steps}")
     print(f"  Car distance              = {accel_car_dist:.3f}  m")
@@ -298,7 +292,7 @@ def main():
         eff_r = accel_car_dist / avg_wheel_accel * WHEEL_RADIUS
         print(f"  Effective wheel radius    = {eff_r:.4f}  m")
     print()
-    print(f"  ── Braking phase ──")
+    print("  ── Braking phase ──")
     print(f"  Duration                  = {brake_time:.3f}  s")
     print(f"  Steps                     = {brake_steps}")
     print(f"  Car distance              = {brake_car_dist:.3f}  m")
@@ -307,7 +301,7 @@ def main():
         slip_frac_b = max(0.0, 1.0 - brake_car_dist / avg_wheel_brake) if avg_wheel_brake > brake_car_dist else 0.0
         print(f"  Slip fraction             = {slip_frac_b:.3f}")
     print()
-    print(f"  ── Combined ──")
+    print("  ── Combined ──")
     print(f"  Total car distance        = {total_car:.3f}  m")
     print(f"  Total avg wheel distance  = {total_wheel:.3f}  m")
     print("=" * 60)

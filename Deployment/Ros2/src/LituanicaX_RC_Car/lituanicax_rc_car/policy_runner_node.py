@@ -155,16 +155,22 @@ class PolicyRunnerNode(Node):
         left_obs = process_for_policy(self.left.depth, self.left.confidence)
         right_obs = process_for_policy(self.right.depth, self.right.confidence)
         
-        # Temporarily replacing action_history with wheel_vel_norm
+        # Layout must match ConeTrackEnv._get_observations exactly:
+        # [depth_left | depth_right | wheel_vel | action history oldest→newest].
         wheel_vel_arr = np.array([self.wheel_vel_norm], dtype=np.float32)
-        obs = np.concatenate([left_obs, right_obs, wheel_vel_arr])[np.newaxis, :]
-        # obs = np.concatenate([left_obs, right_obs, self.action_history])[np.newaxis, :]
+        obs = np.concatenate(
+            [left_obs, right_obs, wheel_vel_arr, self.action_history]
+        )[np.newaxis, :]
 
         action = self.session.run([self.output_name], {self.input_name: obs})[0].clip(-1.0, 1.0)[0]
         throttle_raw = float(action[0])
         steer = float(action[1])
         throttle_motor = throttle_raw if throttle_raw >= 0 else throttle_raw * BRAKE_MAGNITUDE
 
+        # Push this tick's raw command onto the history FIFO, newest last — the sim
+        # does the same in _pre_physics_step, so the next observation carries it as
+        # the final pair.  It is the RAW policy output that is remembered, not the
+        # brake-scaled value handed to the motor.
         self.action_history = np.roll(self.action_history, -2)
         self.action_history[-2] = throttle_raw
         self.action_history[-1] = steer

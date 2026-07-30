@@ -1,27 +1,29 @@
-"""Visualize MuSHR dual ArduCam TOF depth streams from Isaac Sim without running any policy.
+"""Drive the car by hand and watch what the depth cameras (and the policy) see.
 
-The robot is spawned at its start position.  WASD keys drive it manually
-(requires pynput — install with: pip install pynput).
+No policy is loaded: the car spawns on the track and WASD drives it, which makes
+this the tool for tuning the camera crop and the simulated ToF noise until the
+sim frames look like the real ArduCam ones.  Every noise parameter can be
+overridden from the command line, so a tuning pass is a restart, not an edit.
 
-A separate display subprocess owns the cv2.imshow windows (avoids Qt conflict).
+Four windows, owned by a separate display process (Omniverse Kit holds the Qt
+event loop in the main one):
+  "Left Raw Depth"      full-resolution left-camera depth, false-coloured
+                        COLORMAP_JET — clean Isaac Sim output, no noise
+  "Left Policy Depth"   the EXACT policy pipeline: crop → noise → downsample,
+                        upscaled for display, with the active noise settings
+                        printed along the bottom edge
+  "Right Raw Depth"     the same pair for the right camera
+  "Right Policy Depth"
 
-Four windows are shown:
-  "Left Raw Depth"      — full-resolution left-camera depth, false-coloured COLORMAP_JET
-                          (clean Isaac Sim output, no simulated noise)
-  "Left Policy Depth"   — EXACT policy pipeline: crop + all noise + downsample, upscaled
-  "Right Raw Depth"     — full-resolution right-camera depth (clean)
-  "Right Policy Depth"  — exact policy pipeline for right camera
-
-Noise parameters are all overridable from the command line — change them live to tune.
-The noise overlay text at the bottom of each policy window shows the active values.
-
-Frames are exchanged via PNG files written to /tmp/mushr_debug/.
-Press  Ctrl+C  in this terminal  OR  Q  in any display window to stop.
+Frames are exchanged as PNG files under /tmp/mushr_debug/, so with no $DISPLAY
+you can still watch them with e.g. `feh --reload 0.25 /tmp/mushr_debug/`.
+Controls: W accelerate, S brake, A/D steer (needs pynput).
+Quit with Ctrl+C here or Q in any window.
 
 Usage:
-    python .../visualize.py --task Mushr
-    python .../visualize.py --task Mushr --crop_top 0.2 --crop_bottom 0.15
-    python .../visualize.py --task Mushr --color_noise_prob 0.05 --edge_noise_sigma 0.08
+    visualize                                  # helper installed by install.sh
+    uv run python visualize.py --crop_top 0.2 --crop_bottom 0.15
+    uv run python visualize.py --color_noise_prob 0.05 --edge_noise_sigma 0.08
 """
 
 import argparse
@@ -30,22 +32,12 @@ import subprocess
 import sys
 import threading
 
-# Re-exec with conda's libstdc++ in LD_PRELOAD
-if "ISAACLAB_LIBSTDCPP_FIXED" not in os.environ:
-    _conda_prefix = os.environ.get("CONDA_PREFIX")
-    if _conda_prefix:
-        _libstdcpp = os.path.join(_conda_prefix, "lib", "libstdc++.so.6")
-        if os.path.exists(_libstdcpp):
-            os.environ["ISAACLAB_LIBSTDCPP_FIXED"] = "1"
-            os.environ["LD_PRELOAD"] = _libstdcpp
-            os.execv(sys.executable, [sys.executable] + sys.argv)
-
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 from isaaclab.app import AppLauncher
 
-parser = argparse.ArgumentParser(description="Visualize MuSHR TOF depth streams (no policy).")
-parser.add_argument("--task", type=str, default="ConeTrack", help="Gym task name.")
+parser = argparse.ArgumentParser(description="Manually drive the car and inspect the depth streams (no policy).")
+parser.add_argument("--task", type=str, default="ConeTrack", help="Gym task id to spawn.")
 parser.add_argument("--crop_top",    type=float, default=None,
     help="Override depth_crop_top_fraction (e.g. 0.15).")
 parser.add_argument("--crop_bottom", type=float, default=None,
@@ -67,18 +59,12 @@ args_cli = parser.parse_args()
 args_cli.enable_cameras = True
 
 # ── display subprocess ─────────────────────────────────────────────────────────
-_conda_prefix = os.environ.get("CONDA_PREFIX", "")
-_CONDA_SP = (
-    os.path.join(_conda_prefix, "lib", f"python{sys.version_info.major}.{sys.version_info.minor}", "site-packages")
-    if _conda_prefix else ""
-)
-
-_DISPLAY_SCRIPT = rf"""
+# Kit owns the Qt event loop in this process, so cv2.imshow has to live in a
+# child.  Dropping Kit's bundled paths from its sys.path makes it import the
+# GUI-capable opencv-python from .venv instead of Isaac Sim's headless build.
+_DISPLAY_SCRIPT = r"""
 import sys, os
-sys.path = [
-    "{_CONDA_SP}",
-    *[p for p in sys.path if "pip_prebundle" not in p and "omni" not in p],
-]
+sys.path = [p for p in sys.path if "pip_prebundle" not in p and "omni" not in p]
 import cv2, time, signal
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
@@ -155,15 +141,16 @@ app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
 # ── post-launch imports ────────────────────────────────────────────────────────
+from typing import cast
+
 import numpy as np
 import torch
 import gymnasium as gym
-import cv2  # headless fine here — only imwrite used
+import cv2  # headless build is fine here — only imwrite is used
 
-import isaaclab_tasks  # noqa: F401
-import tasks  # noqa: F401
+import cone_track  # noqa: F401  — registers the "ConeTrack" gym id
 
-from tasks.cone_track.env import ConeTrackEnvCfg
+from cone_track.env import ConeTrackEnv, ConeTrackEnvCfg
 
 
 def _depth_to_colormap(depth_float: np.ndarray) -> np.ndarray:
@@ -205,7 +192,7 @@ def main():
 
     print("[visualize] Creating environment …")
     env = gym.make(args_cli.task, cfg=env_cfg)
-    mushr_env = env.unwrapped
+    mushr_env = cast(ConeTrackEnv, env.unwrapped)
     device    = mushr_env.device
 
     out_dir = "/tmp/mushr_debug"

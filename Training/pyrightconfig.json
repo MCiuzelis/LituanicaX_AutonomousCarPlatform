@@ -1,0 +1,39 @@
+{
+  // Editor/type-checker setup (Zed, VS Code, and any other pyright-based LSP).
+  //
+  // Isaac Lab is installed into .venv as an EDITABLE install, which setuptools
+  // implements with an import hook (__editable___isaaclab_*_finder.py) rather
+  // than a real directory on sys.path.  Pyright cannot follow an import hook, so
+  // `import isaaclab` looks unresolved even though it runs fine.  Listing the
+  // submodule source trees in extraPaths below is what fixes that.
+  //
+  // NOTE: open Training/ as the project root (this file is only picked up from
+  // the workspace root).  Anything under omni.* comes from Omniverse Kit, which
+  // injects its extension paths at runtime; those imports carry an explicit
+  // `# pyright: ignore[reportMissingImports]` at their import site.
+  "venvPath": ".",
+  "venv": ".venv",
+  "extraPaths": [
+    "source",
+    "IsaacLab/source/isaaclab",
+    "IsaacLab/source/isaaclab_assets",
+    "IsaacLab/source/isaaclab_rl",
+    "IsaacLab/source/isaaclab_tasks"
+  ],
+  "exclude": [
+    "**/__pycache__",
+    ".venv",
+    "IsaacLab",
+    "logs",
+    "outputs"
+  ],
+  "typeCheckingMode": "basic",
+  // Isaac Lab's @configclass builds attributes dynamically, and rsl_rl ships no
+  // type stubs, so these produce noise rather than findings.  Stub-only
+  // resolution (typings/) is intentional, hence reportMissingModuleSource.
+  "reportMissingTypeStubs": "none",
+  "reportMissingModuleSource": "none",
+  "reportPrivateImportUsage": "none",
+  "pythonVersion": "3.11",
+  "pythonPlatform": "Linux"
+}

@@ -23,12 +23,18 @@ from .common import (
     DASHBOARD_HZ,
 )
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Observation layout — MUST mirror ConeTrackEnvCfg in
+# Training/source/cone_track/env.py.  The policy is a fixed-width MLP, so any
+# disagreement here is either an onnxruntime shape error at startup (best case)
+# or a silently misread observation (worst case).
+# ─────────────────────────────────────────────────────────────────────────────
 MAX_DISTANCE_MM = 2000
 CONF_THRESHOLD = 30
 
 DEPTH_RAW_H = 180
 DEPTH_RAW_W = 240
-CROP_TOP_FRAC = 0.375
+CROP_TOP_FRAC = 0.35
 CROP_BOTTOM_FRAC = 0.45
 POLICY_W = 120
 CROP_TOP_ROWS = int(CROP_TOP_FRAC * DEPTH_RAW_H)
@@ -36,10 +42,12 @@ CROP_BOTTOM_ROWS = int(CROP_BOTTOM_FRAC * DEPTH_RAW_H)
 CROPPED_H = DEPTH_RAW_H - CROP_TOP_ROWS - CROP_BOTTOM_ROWS
 POLICY_H = round(POLICY_W * CROPPED_H / DEPTH_RAW_W)
 
-PER_CAM_DIM = POLICY_W * POLICY_H
-ACTION_HIST = 30
-EXTRA_OBS = 1
-OBS_DIM = PER_CAM_DIM * 2 + EXTRA_OBS  # Temporarily changed from + ACTION_HIST
+PER_CAM_DIM = POLICY_W * POLICY_H  # 120 × 18 = 2160
+WHEEL_VEL_OBS = 1  # normalised wheel speed, one scalar
+ACTION_HIST_LEN = 5  # remembered (throttle, steer) commands
+ACTION_HIST = 2 * ACTION_HIST_LEN  # flattened width of that history
+# Order matters as much as width: [left | right | wheel_vel | action history].
+OBS_DIM = PER_CAM_DIM * 2 + WHEEL_VEL_OBS + ACTION_HIST
 
 
 def camera_index_for_side(side: str) -> int:

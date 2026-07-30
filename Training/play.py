@@ -3,25 +3,30 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Script to play a checkpoint of an RL agent from RSL-RL."""
+"""Run a trained ConeTrack checkpoint in Isaac Sim (inference only).
 
-"""Launch Isaac Sim Simulator first."""
+Loads the latest (or a named) checkpoint, exports it to TorchScript + ONNX next
+to the checkpoint, then drives the car with the policy until you quit.  The ONNX
+export is what Deployment/autopilot.py runs on the Raspberry Pi.
+
+Two viewing modes:
+    default   the Isaac Sim viewport, following the car.
+    --fpv     forces a single environment and opens four live depth windows —
+              raw and policy-pipeline views for each camera — in a separate
+              process (Qt cannot share this one with Omniverse Kit).
+Walls are hidden here: they exist only to terminate training episodes.
+
+Usage:
+    play --num_envs 4                          # helper installed by install.sh
+    play --fpv --real-time
+    play --checkpoint logs/rsl_rl/cone_track/<run>/model_500.pt
+    play --fpv --video                         # record the left depth stream
+"""
 
 import argparse
 import os
 import subprocess
 import sys
-
-# Re-exec with conda's libstdc++ in LD_PRELOAD so the dynamic linker picks up
-# CXXABI_1.3.15 before any C extensions load.  See train.py for rationale.
-if "ISAACLAB_LIBSTDCPP_FIXED" not in os.environ:
-    _conda_prefix = os.environ.get("CONDA_PREFIX")
-    if _conda_prefix:
-        _libstdcpp = os.path.join(_conda_prefix, "lib", "libstdc++.so.6")
-        if os.path.exists(_libstdcpp):
-            os.environ["ISAACLAB_LIBSTDCPP_FIXED"] = "1"
-            os.environ["LD_PRELOAD"] = _libstdcpp
-            os.execv(sys.executable, [sys.executable] + sys.argv)
 
 # Reduce PyTorch CUDA allocator fragmentation: returns unused blocks to the
 # system in smaller segments instead of holding giant cached arenas.
@@ -37,36 +42,18 @@ import cli_args  # isort: skip
 parser = argparse.ArgumentParser(description="Play an RL agent with RSL-RL.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
-parser.add_argument(
-    "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
-)
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default="ConeTrack", help="Name of the task.")
 parser.add_argument(
     "--agent", type=str, default="rsl_rl_cfg_entry_point", help="Name of the RL agent configuration entry point."
 )
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
-parser.add_argument(
-    "--use_pretrained_checkpoint",
-    action="store_true",
-    help="Use the pre-trained checkpoint from Nucleus.",
-)
-parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument("--real-time", action="store_true", default=False, help="Throttle the loop to wall-clock time.")
 parser.add_argument(
     "--fpv",
     action="store_true",
     default=False,
-    help="First-person view: force 1 env and open live Raw Camera + Cone Mask windows.",
-)
-parser.add_argument(
-    "--vel_cap",
-    type=float,
-    default=5.0,
-    help=(
-        "Override the velocity cap used during play (m/s).  "
-        "Sets both initial_vel_cap_m_s and vel_cap_max_m_s so the curriculum cannot "
-        "accidentally lower the cap during the play session.  Default: 7.0 m/s."
-    ),
+    help="First-person view: force 1 env and open the live raw/policy depth windows.",
 )
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -74,7 +61,7 @@ cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli, hydra_args = parser.parse_known_args()
-# always enable cameras to record video or for FPV mode
+# cameras are needed both for viewport recording and for the FPV depth windows
 if args_cli.video or args_cli.fpv:
     args_cli.enable_cameras = True
 if args_cli.fpv:
@@ -87,25 +74,19 @@ sys.argv = [sys.argv[0]] + hydra_args
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
-"""Rest everything follows."""
+# ─── Post-launch imports (safe now that Isaac Sim is up) ──────────────────────
 
 import time
 
 # ── FPV display subprocess ────────────────────────────────────────────────────
-# Identical approach to visualize.py: a separate Python process with the
-# GUI-capable opencv-python loaded from the conda site-packages polls two PNG
-# files written atomically by the main process and shows them via cv2.imshow.
-_conda_prefix = os.environ.get("CONDA_PREFIX", "")
-_CONDA_SP = (
-    os.path.join(_conda_prefix, "lib", f"python{sys.version_info.major}.{sys.version_info.minor}", "site-packages")
-    if _conda_prefix else ""
-)
-_FPV_DISPLAY_SCRIPT = rf"""
+# Same approach as visualize.py: Omniverse Kit owns the Qt event loop in this
+# process, so cv2.imshow cannot run here.  A child process instead polls the PNG
+# files this process writes atomically and shows them.  Its sys.path drops Kit's
+# bundled paths so it picks up the GUI-capable opencv-python from .venv rather
+# than Isaac Sim's headless build.
+_FPV_DISPLAY_SCRIPT = r"""
 import sys, os
-sys.path = [
-    "{_CONDA_SP}",
-    *[p for p in sys.path if "pip_prebundle" not in p and "omni" not in p],
-]
+sys.path = [p for p in sys.path if "pip_prebundle" not in p and "omni" not in p]
 import cv2, time, signal
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 OUT_DIR = "/tmp/mushr_debug"
@@ -127,44 +108,31 @@ while True:
 cv2.destroyAllWindows()
 """
 
+from typing import cast
+
 import cv2
 import gymnasium as gym
 import numpy as np
 import torch
-from rsl_rl.runners import DistillationRunner, OnPolicyRunner
+from rsl_rl.runners import OnPolicyRunner
 
-from isaaclab.envs import (
-    DirectMARLEnv,
-    DirectMARLEnvCfg,
-    DirectRLEnvCfg,
-    ManagerBasedRLEnvCfg,
-    multi_agent_to_single_agent,
-)
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
 
-from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper, export_policy_as_jit, export_policy_as_onnx
-import isaaclab_tasks  # noqa: F401
-import tasks  # noqa: F401
+from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper, export_policy_as_jit, export_policy_as_onnx
+import cone_track  # noqa: F401  — registers the "ConeTrack" gym id
+from cone_track.env import ConeTrackEnv, ConeTrackEnvCfg
+from cone_track.ppo_cfg import ConeTrackPPORunnerCfg
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
-# PLACEHOLDER: Extension template (do not remove this comment)
-
 
 @hydra_task_config(args_cli.task, args_cli.agent)
-def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
-    """Play with RSL-RL agent."""
-    # grab task name for checkpoint path
-    task_name = args_cli.task.split(":")[-1]
-    train_task_name = task_name.replace("-Play", "")
-
-    # override configurations with non-hydra CLI arguments
-    agent_cfg: RslRlBaseRunnerCfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
+def main(env_cfg: ConeTrackEnvCfg, agent_cfg: ConeTrackPPORunnerCfg):
+    """Load a checkpoint, export it, and run it in closed loop."""
+    # override configurations with non-hydra CLI arguments (mutates agent_cfg in place)
+    cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
-
-    env_cfg.spawn_vel_min_m_s = 0.0
-    env_cfg.spawn_vel_max_m_s = 0.0
 
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
@@ -174,13 +142,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # specify directory for logging experiments (absolute path, matches train.py)
     log_root_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "rsl_rl", agent_cfg.experiment_name)
     print(f"[INFO] Loading experiment from directory: {log_root_path}")
-    if args_cli.use_pretrained_checkpoint:
-        from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
-        resume_path = get_published_pretrained_checkpoint("rsl_rl", train_task_name)
-        if not resume_path:
-            print("[INFO] Unfortunately a pre-trained checkpoint is currently unavailable for this task.")
-            return
-    elif args_cli.checkpoint:
+    if args_cli.checkpoint:
         ckpt = args_cli.checkpoint
         if not os.path.isabs(ckpt) and not os.path.isfile(ckpt):
             # The play alias cds to Training/ before running; if the user gave a path
@@ -203,20 +165,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # When --fpv --video: cameras are already enabled by the fpv flag; render_mode not needed.
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if (args_cli.video and not args_cli.fpv) else None)
 
-    # Hide wall geometry in play mode — walls are only used during training to
-    # penalise boundary contact; they serve no purpose during inference.
-    import omni.usd
-    from pxr import UsdGeom
-    _stage = omni.usd.get_context().get_stage()
-    for _wall_path in ("/World/Walls", "/World/WallsMergedMesh"):
-        _prim = _stage.GetPrimAtPath(_wall_path)
-        if _prim.IsValid():
-            UsdGeom.Imageable(_prim).MakeInvisible()
-
-    # convert to single-agent instance if required by the RL algorithm
-    if isinstance(env.unwrapped, DirectMARLEnv):
-        env = multi_agent_to_single_agent(env)
-
     # wrap for video recording (Isaac viewport — skipped when --fpv, which records the raw camera instead)
     if args_cli.video and not args_cli.fpv:
         video_kwargs = {
@@ -225,34 +173,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             "video_length": args_cli.video_length,
             "disable_logger": True,
         }
-        print("[INFO] Recording videos during training.")
+        print("[INFO] Recording the Isaac Sim viewport.")
         print_dict(video_kwargs, nesting=4)
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
     # wrap around environment for rsl-rl
-    env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+    env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)  # pyright: ignore[reportArgumentType]
 
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-    # load previously trained model
-    if agent_cfg.class_name == "OnPolicyRunner":
-        runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    elif agent_cfg.class_name == "DistillationRunner":
-        runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    else:
-        raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
+    runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)  # pyright: ignore[reportAttributeAccessIssue]
     runner.load(resume_path)
 
     # obtain the trained policy for inference
     policy = runner.get_inference_policy(device=env.unwrapped.device)
 
-    # extract the neural network module
-    # we do this in a try-except to maintain backwards compatibility.
-    try:
-        # version 2.3 onwards
-        policy_nn = runner.alg.policy
-    except AttributeError:
-        # version 2.2 and below
-        policy_nn = runner.alg.actor_critic
+    # the raw network, for the exporters and for resetting recurrent state
+    policy_nn = runner.alg.policy
 
     # extract the normalizer
     if hasattr(policy_nn, "actor_obs_normalizer"):
@@ -275,7 +211,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     _fpv_out_dir = "/tmp/mushr_debug"
     if args_cli.fpv:
         os.makedirs(_fpv_out_dir, exist_ok=True)
-        _mushr_env = env.unwrapped          # DirectRLEnv (ConeTrackEnv)
+        _mushr_env = cast(ConeTrackEnv, env.unwrapped)
         if os.environ.get("DISPLAY"):
             _display_env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
             _display_env["QT_QPA_FONTDIR"] = "/usr/share/fonts"
@@ -287,18 +223,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             print("[FPV] No $DISPLAY — writing frames to /tmp/mushr_debug/ (use feh --reload 0.25)")
 
         if args_cli.video:
-            import time as _time
             _cam_h = _mushr_env.cfg.camera_left_cfg.height
             _cam_w = _mushr_env.cfg.camera_left_cfg.width
-            _fps   = round(1.0 / (env.unwrapped.cfg.decimation * env.unwrapped.cfg.sim.dt))
+            _fps   = round(1.0 / (_mushr_env.cfg.decimation * _mushr_env.cfg.sim.dt))
             os.makedirs(os.path.join(log_dir, "videos", "play"), exist_ok=True)
             _video_path = os.path.join(
                 log_dir, "videos", "play",
-                f"fpv_{_time.strftime('%Y%m%d_%H%M%S')}.mp4",
+                f"fpv_{time.strftime('%Y%m%d_%H%M%S')}.mp4",
             )
             _fpv_writer = cv2.VideoWriter(
                 _video_path,
-                cv2.VideoWriter_fourcc(*"mp4v"),
+                cv2.VideoWriter_fourcc(*"mp4v"),  # pyright: ignore[reportAttributeAccessIssue]
                 _fps,
                 (_cam_w, _cam_h),
             )
@@ -310,17 +245,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         cv2.imwrite(tmp, img)
         os.replace(tmp, path)
 
-    def _depth_to_bgr_pair(camera, suffix: str) -> None:
-        """Process one camera → write raw_{suffix}.png and policy_{suffix}.png."""
-        depth_tensor = camera.data.output["distance_to_image_plane"]  # [1,H,W,1]
-        depth_np = depth_tensor[0, :, :, 0].cpu().numpy()
+    def _raw_depth_bgr(camera) -> np.ndarray:
+        """Full-resolution sensor depth, false-coloured (blue = far, red = close)."""
+        depth_np = camera.data.output["distance_to_image_plane"][0, :, :, 0].cpu().numpy()
         depth_max = _mushr_env.cfg.depth_max_m
         depth_np = np.where(np.isfinite(depth_np), depth_np, depth_max)
         raw_norm = 1.0 - np.clip(depth_np / depth_max, 0.0, 1.0)
-        raw_bgr  = cv2.applyColorMap(
+        return cv2.applyColorMap(
             np.clip(raw_norm * 255, 0, 255).astype(np.uint8), cv2.COLORMAP_JET
         )
-        _write_atomic(os.path.join(_fpv_out_dir, f"raw_{suffix}.png"), raw_bgr)
+
+    def _write_camera(camera, suffix: str) -> None:
+        """Write raw_{suffix}.png (sensor output) and policy_{suffix}.png (what the policy sees)."""
+        _write_atomic(os.path.join(_fpv_out_dir, f"raw_{suffix}.png"), _raw_depth_bgr(camera))
 
         # Policy window: exact same pipeline as training (_process_single_depth).
         pol_flat = _mushr_env._process_single_depth(camera)   # [1, ph*pw], values [0,1]
@@ -333,20 +270,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         _write_atomic(os.path.join(_fpv_out_dir, f"policy_{suffix}.png"), pol_bgr)
 
     def _fpv_step() -> None:
-        """Grab depth frames from both cameras, false-colour them, write PNGs."""
-        _depth_to_bgr_pair(_mushr_env.camera_left,  "left")
-        _depth_to_bgr_pair(_mushr_env.camera_right, "right")
+        """Refresh all four depth windows, and append a video frame when recording."""
+        _write_camera(_mushr_env.camera_left,  "left")
+        _write_camera(_mushr_env.camera_right, "right")
         if _fpv_writer is not None:
-            # Write left raw frame to video for recording
-            depth_tensor = _mushr_env.camera_left.data.output["distance_to_image_plane"]
-            depth_np = depth_tensor[0, :, :, 0].cpu().numpy()
-            depth_max = _mushr_env.cfg.depth_max_m
-            depth_np = np.where(np.isfinite(depth_np), depth_np, depth_max)
-            raw_norm = 1.0 - np.clip(depth_np / depth_max, 0.0, 1.0)
-            raw_bgr  = cv2.applyColorMap(
-                np.clip(raw_norm * 255, 0, 255).astype(np.uint8), cv2.COLORMAP_JET
-            )
-            _fpv_writer.write(raw_bgr)
+            _fpv_writer.write(_raw_depth_bgr(_mushr_env.camera_left))
     # ──────────────────────────────────────────────────────────────────────────
 
     # reset environment
@@ -384,14 +312,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env.close()
     if _fpv_writer is not None:
         _fpv_writer.release()
-        print(f"[FPV] Video saved.")
+        print("[FPV] Video saved.")
     if args_cli.fpv and _fpv_proc is not None and _fpv_proc.poll() is None:
         _fpv_proc.terminate()
         _fpv_proc.wait()
 
 
 if __name__ == "__main__":
-    # run the main function
-    main()
+    # run the main function (hydra_task_config injects env_cfg / agent_cfg)
+    main()  # pyright: ignore[reportCallIssue]
     # close sim app
     simulation_app.close()

@@ -15,10 +15,8 @@
 #   3. Installs all Isaac Lab Python packages (isaaclab, isaaclab_tasks,
 #      isaaclab_assets, isaaclab_rl) as editable installs in Isaac Sim's
 #      bundled Python — source edits are reflected without reinstall.
-#   4. Pins rsl-rl-lib to 3.0.1 (the PPO config uses the legacy
-#      actor_hidden_dims / critic_hidden_dims format from that era).
-#   5. Installs the project's custom `tasks` package (contains ConeTrack)
-#      as editable.
+#   4. Pins rsl-rl-lib to 3.0.1 (the minimum version the PPO config targets).
+#   5. Installs the project's `cone_track` package (source/cone_track) as editable.
 #   6. Runs `uv sync` for local development tooling (ruff, mypy, …).
 #   7. Replaces opencv-python-headless → opencv-python (GUI imshow),
 #      pins setuptools < 82 (TensorBoard still needs pkg_resources).
@@ -27,7 +25,16 @@
 set -euo pipefail
 
 # Prerequisite check
-if [ ! -d /isaac-sim ]; then    echo "[ERROR] Isaac Sim not found at /isaac-sim."    echo "  Please install Isaac Sim 5.1.0 at /isaac-sim before running this script."    echo "  See: https://docs.omniverse.nvidia.com/isaacsim/latest/installation.html"    exit 1fiscript_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"repo_root="$(cd "${script_dir}/.." && pwd)"isaaclab_dir="${script_dir}/IsaacLab"
+if [ ! -d /isaac-sim ]; then
+    echo "[ERROR] Isaac Sim not found at /isaac-sim."
+    echo "  Please install Isaac Sim 5.1.0 at /isaac-sim before running this script."
+    echo "  See: https://docs.omniverse.nvidia.com/isaacsim/latest/installation.html"
+    exit 1
+fi
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+repo_root="$(cd "${script_dir}/.." && pwd)"
+isaaclab_dir="${script_dir}/IsaacLab"
 
 # ─── 1. Isaac Lab submodule (v2.3.0) ──────────────────────────────────────────
 
@@ -64,7 +71,7 @@ echo "=== 4/6 – Pinning rsl-rl-lib ==="
 
 # ─── 5. Custom tasks package ──────────────────────────────────────────────────
 
-echo "=== 5/6 – Installing custom tasks package ==="
+echo "=== 5/6 – Installing the cone_track package ==="
 "${isaaclab_dir}/isaaclab.sh" -p -m pip install --quiet --no-deps -e "${script_dir}"
 
 # ─── 6. Local tooling (uv) & patches ──────────────────────────────────────────

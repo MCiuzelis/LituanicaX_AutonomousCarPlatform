@@ -25,7 +25,7 @@ package-dir = {"" = "source"}
 
 [tool.setuptools.packages.find]
 where = ["source"]
-include = ["tasks*"]
+include = ["cone_track*"]
 
 [tool.uv]
 environments = ["sys_platform == 'linux' and platform_machine == 'x86_64' and python_full_version == '3.11.*'"]

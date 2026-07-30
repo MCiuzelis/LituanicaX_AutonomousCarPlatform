@@ -3,13 +3,13 @@
 WHY THIS EXISTS
 ---------------
 The cone-track observation is 4320 depth pixels followed by a handful of
-proprioceptive scalars (wheel speed, previous action).  Fed to a plain MLP those
-scalars are 3 input columns out of 4323, and that is a real handicap rather than
-a cosmetic one:
+proprioceptive scalars (wheel speed, plus a short history of past actions).  Fed
+to a plain MLP those scalars are 11 input columns out of 4331, and that is a real
+handicap rather than a cosmetic one:
 
   * At the standard 1/sqrt(fan_in) initialisation every first-layer unit's
-    pre-activation is a sum of 4323 terms of comparable size.  The proprio
-    scalars contribute 3/4323 ≈ 0.07 % of its variance — they are effectively
+    pre-activation is a sum of 4331 terms of comparable size.  The proprio
+    scalars contribute 11/4331 ≈ 0.25 % of its variance — they are effectively
     invisible at init.
   * To make wheel speed count as much as the whole image, its weight column has
     to grow by ~sqrt(4320) ≈ 66x.  At lr 1e-4 that takes a very long time, and
@@ -17,15 +17,15 @@ a cosmetic one:
 
 The natural reading of "feed it deeper" is to concatenate the scalars into layer
 2 or 3.  That alone does NOT fix it: a scalar at layer 2 is 1-in-4096 instead of
-1-in-4323, which is the same problem with a different denominator.  What matters
+1-in-4331, which is the same problem with a different denominator.  What matters
 is representational MASS, not depth.  So the scalars get their own small encoder
 and enter the trunk as a 64-wide feature block:
 
-    depth (4320) ──> 4096 ──> 1024 ─┐
-                                    ├─> 1088 ──> 256 ──> actions
-    proprio (3)  ──> 64 ──> 64 ─────┘
+    depth (4320) ──> 1024 ──> 512 ─┐
+                                   ├─> 576 ──> 256 ──> actions
+    proprio (11) ──> 64 ──> 64 ────┘
 
-64-in-1088 is ~6 % of the head's input width, roughly 85x the share the scalars
+64-in-576 is ~11 % of the head's input width, far more than the share the scalars
 had at the input layer, and the block bypasses the depth bottleneck entirely so
 its gradient path is short.
 
@@ -195,13 +195,14 @@ class ConeTrackActorCritic(ActorCritic):
         print(f"Critic (split encoder, {num_proprio_obs} proprio dims): {self.critic}")
 
 
-def register() -> None:
+def register_actor_critic() -> None:
     """Make ConeTrackActorCritic resolvable by OnPolicyRunner.
 
     rsl_rl instantiates the policy with a bare ``eval(class_name)`` evaluated in
     on_policy_runner's own module namespace (on_policy_runner.py:418), so a custom
-    class is only reachable if it is injected there.
+    class is only reachable if it is injected there.  Called from the package
+    __init__, i.e. before train.py / play.py ever build a runner.
     """
     import rsl_rl.runners.on_policy_runner as _on_policy_runner
 
-    _on_policy_runner.ConeTrackActorCritic = ConeTrackActorCritic
+    setattr(_on_policy_runner, "ConeTrackActorCritic", ConeTrackActorCritic)

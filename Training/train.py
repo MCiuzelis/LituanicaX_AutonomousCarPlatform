@@ -3,34 +3,34 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Script to train RL agent with RSL-RL."""
+"""Train the ConeTrack policy with PPO (RSL-RL) in Isaac Sim.
 
-"""Launch Isaac Sim Simulator first."""
+Launches Isaac Sim, builds the vectorised ConeTrack environment, runs PPO, and
+starts a TensorBoard server on the log directory.  Checkpoints land in
+``logs/rsl_rl/<experiment_name>/<timestamp>/``.
+
+The environment is configured in ``source/cone_track/env.py`` and the PPO
+hyper-parameters in ``source/cone_track/ppo_cfg.py``; the CLI only overrides the
+handful of run-level options below (plus anything passed as Hydra ``key=value``
+arguments, which are applied on top of both configs).
+
+Usage:
+    train --num_envs 26 --headless          # helper installed by install.sh
+    uv run python train.py --num_envs 26 --headless
+    uv run python train.py --resume --load_run 2026-07-26_11-41-00
+"""
 
 import argparse
 import os
 import sys
-
-# LD_PRELOAD must be set before any shared libraries load, which means before Python
-# itself initialises its C extensions. Setting os.environ inside an already-running
-# interpreter is too late for the current process. Re-exec with the flag in place so
-# the dynamic linker picks up conda's libstdc++ (which has CXXABI_1.3.15) on the
-# very first dlopen call. The sentinel variable prevents infinite recursion.
-if "ISAACLAB_LIBSTDCPP_FIXED" not in os.environ:
-    _conda_prefix = os.environ.get("CONDA_PREFIX")
-    if _conda_prefix:
-        _libstdcpp = os.path.join(_conda_prefix, "lib", "libstdc++.so.6")
-        if os.path.exists(_libstdcpp):
-            os.environ["ISAACLAB_LIBSTDCPP_FIXED"] = "1"
-            os.environ["LD_PRELOAD"] = _libstdcpp
-            os.execv(sys.executable, [sys.executable] + sys.argv)
 
 # Reduce PyTorch CUDA allocator fragmentation: returns unused blocks to the
 # system in smaller segments instead of holding giant cached arenas.
 # Must be set before any CUDA context is created (AppLauncher).
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-# ─── Local path: Isaac Sim starts here ────────────────────────────────────────
+# Isaac Sim must be launched before anything that touches omni/pxr is imported,
+# so the imports in this file are deliberately split around the AppLauncher call.
 from isaaclab.app import AppLauncher
 
 # local imports
@@ -51,10 +51,6 @@ parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy 
 parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
-parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
-parser.add_argument(
-    "--ray-proc-id", "-rid", type=int, default=None, help="Automatically configured by Ray integration, otherwise None."
-)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -71,62 +67,40 @@ sys.argv = [sys.argv[0]] + hydra_args
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
-"""Check for minimum supported RSL-RL version."""
+# ─── Post-launch imports (safe now that Isaac Sim is up) ──────────────────────
 
 import importlib.metadata as metadata
-import platform
-
-from packaging import version
-
-# check minimum supported rsl-rl version
-RSL_RL_VERSION = "3.0.1"
-installed_version = metadata.version("rsl-rl-lib")
-if version.parse(installed_version) < version.parse(RSL_RL_VERSION):
-    if platform.system() == "Windows":
-        cmd = [r".\isaaclab.bat", "-p", "-m", "pip", "install", f"rsl-rl-lib=={RSL_RL_VERSION}"]
-    else:
-        cmd = ["./isaaclab.sh", "-p", "-m", "pip", "install", f"rsl-rl-lib=={RSL_RL_VERSION}"]
-    print(
-        f"Please install the correct version of RSL-RL.\nExisting version is: '{installed_version}'"
-        f" and required version is: '{RSL_RL_VERSION}'.\nTo install the correct version, run:"
-        f"\n\n\t{' '.join(cmd)}\n"
-    )
-    exit(1)
-
-"""Rest everything follows."""
-
-import logging
 import socket
 import subprocess
 import time
 import webbrowser
 from datetime import datetime
+from packaging import version
 
 import gymnasium as gym
 import torch
-from rsl_rl.runners import DistillationRunner, OnPolicyRunner
+from rsl_rl.runners import OnPolicyRunner
 
-from isaaclab.envs import (
-    DirectMARLEnv,
-    DirectMARLEnvCfg,
-    DirectRLEnvCfg,
-    ManagerBasedRLEnvCfg,
-    multi_agent_to_single_agent,
-)
 from isaaclab.utils.dict import print_dict
 from isaaclab.utils.io import dump_yaml
 
-from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
+from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 
-import isaaclab_tasks  # noqa: F401
-import tasks  # noqa: F401
+import cone_track  # noqa: F401  — registers the "ConeTrack" gym id
+from cone_track.env import ConeTrackEnvCfg
+from cone_track.ppo_cfg import ConeTrackPPORunnerCfg
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
-# import logger
-logger = logging.getLogger(__name__)
-
-# PLACEHOLDER: Extension template (do not remove this comment)
+# The PPO config targets the rsl-rl 3.x API (obs groups, RslRlBaseRunnerCfg).
+RSL_RL_VERSION = "3.0.1"
+_installed_rsl_rl = metadata.version("rsl-rl-lib")
+if version.parse(_installed_rsl_rl) < version.parse(RSL_RL_VERSION):
+    print(
+        f"[ERROR] rsl-rl-lib {_installed_rsl_rl} is too old; this project needs "
+        f">= {RSL_RL_VERSION}.\n        Fix with:  uv pip install 'rsl-rl-lib=={RSL_RL_VERSION}'"
+    )
+    exit(1)
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -163,10 +137,10 @@ def _launch_tensorboard(log_root_path: str) -> None:
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
-def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
-    """Train with RSL-RL agent."""
-    # override configurations with non-hydra CLI arguments
-    agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
+def main(env_cfg: ConeTrackEnvCfg, agent_cfg: ConeTrackPPORunnerCfg):
+    """Build the env, restore an optional checkpoint, and run PPO to completion."""
+    # override configurations with non-hydra CLI arguments (mutates agent_cfg in place)
+    cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     agent_cfg.max_iterations = (
         args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
@@ -207,26 +181,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     _launch_tensorboard(log_root_path)
 
-    # set the IO descriptors export flag if requested
-    if isinstance(env_cfg, ManagerBasedRLEnvCfg):
-        env_cfg.export_io_descriptors = args_cli.export_io_descriptors
-    else:
-        logger.warning(
-            "IO descriptors are only supported for manager based RL environments. No IO descriptors will be exported."
-        )
-
-    # set the log directory for the environment (works for all environment types)
+    # tell the environment where to write its own artefacts
     env_cfg.log_dir = log_dir
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
-    # convert to single-agent instance if required by the RL algorithm
-    if isinstance(env.unwrapped, DirectMARLEnv):
-        env = multi_agent_to_single_agent(env)
-
-    # save resume path before creating a new log_dir
-    if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
+    # resolve the checkpoint to resume from BEFORE the fresh log_dir is created
+    if agent_cfg.resume:
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
     # wrap for video recording
@@ -244,21 +206,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     start_time = time.time()
 
     # wrap around environment for rsl-rl
-    env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+    env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)  # pyright: ignore[reportArgumentType]
 
     # create runner from rsl-rl
-    if agent_cfg.class_name == "OnPolicyRunner":
-        runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
-    elif agent_cfg.class_name == "DistillationRunner":
-        runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
-    else:
-        raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
+    runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)  # pyright: ignore[reportAttributeAccessIssue]
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
     # load the checkpoint
-    if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
+    if agent_cfg.resume:
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-        # load previously trained model
         runner.load(resume_path)
 
     # dump the configuration into log-directory
@@ -275,7 +231,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
 
 if __name__ == "__main__":
-    # run the main function
-    main()
+    # run the main function (hydra_task_config injects env_cfg / agent_cfg)
+    main()  # pyright: ignore[reportCallIssue]
     # close sim app
     simulation_app.close()

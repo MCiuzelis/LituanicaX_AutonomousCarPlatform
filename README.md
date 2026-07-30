@@ -18,26 +18,26 @@ Policy trained in NVIDIA Isaac Sim 5.1 / Isaac Lab (PPO); deployed on a Raspberr
 │
 ├── CAD/
 │   ├── Car/                  # MuSHR nano v2 CAD (Blender + STL)
-│   ├── PCB/                  # KiCAD schematic + layout for driver board
-│   └── Track/                # Race-track CAD (Blender + FBX)
+│   └── PCB/                  # KiCAD schematic + layout for driver board
 │
 └── Training/                 # Isaac Sim RL training pipeline
     ├── train.py              # Entry point — launches Isaac Sim, runs PPO
     ├── play.py               # Loads a checkpoint, runs inference + FPV view
     ├── visualize.py          # Manual WASD drive + live depth-camera windows
-    ├── assets/               # USD scene files (robot, track, walls)
-    │   ├── mushr_nano_v2.usd
-    │   ├── TRACK.usd         # Cone-track (visible to policy camera)
-    │   ├── WALLS.usd         # Boundary walls (termination only, invisible)
-    │   └── RAMPS.usd
+    ├── assets/
+    │   ├── Track/            # Blender sources for the track and its props
+    │   └── Export/           # USD the sim loads (+ textures/)
+    │       ├── mushr_nano_v2.usd
+    │       ├── Track.usdc    # Cone-track (visible to the depth cameras)
+    │       ├── Walls.usdc    # Boundary walls (termination only, invisible)
+    │       └── Assets_1..5.usdc  # Prop sets, cycled during training
     ├── logs/                 # Training outputs — excluded from git
     └── source/
-        └── tasks/
-            └── cone_track/
-                ├── __init__.py   # gym.register("ConeTrack", ...)
-                ├── env.py        # ConeTrackEnv + ConeTrackEnvCfg
-                └── agents/
-                    └── ppo_cfg.py  # ConeTrackPPORunnerCfg
+        └── cone_track/
+            ├── __init__.py       # gym.register("ConeTrack", ...)
+            ├── env.py            # ConeTrackEnv + ConeTrackEnvCfg
+            ├── ppo_cfg.py        # ConeTrackPPORunnerCfg
+            └── actor_critic.py   # policy network
 ```
 
 ---

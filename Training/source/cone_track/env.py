@@ -1,13 +1,26 @@
 """MuSHR nano v2 RC car — cone-track navigation environment (DirectRLEnv).
 
-Observation space:
-    [0:N]        flattened depth image from LEFT ArduCam TOF camera (+35° yaw), after crop.
-                 Normalized: 1.0 = object at 0 m (danger), 0.0 = object at depth_max_m (clear).
-    [N:2N]       flattened depth image from RIGHT ArduCam TOF camera (−35° yaw), same pipeline.
-    [2N]         average wheel surface speed ∈ [0, 1], normalized by max_velocity_m_s.
-                 Computed as mean(|joint_vel[all 4 throttle joints]|) × WHEEL_RADIUS / max_velocity_m_s.
-                 Only appended when include_wheel_vel=True.
-                 Matches real hardware: wheel encoders give rotation rate directly.
+This module holds BOTH halves of the task:
+    ConeTrackEnvCfg — every tunable number (camera, spawn, drivetrain, rewards).
+    ConeTrackEnv    — the simulation itself (scene, actuation, observations, rewards).
+PPO hyper-parameters live next door in ppo_cfg.py.
+
+Observation space (flat vector, laid out in this order):
+    [0:N]        flattened depth image from the LEFT ArduCam TOF camera (+27° yaw),
+                 after crop and downsample.  Normalized so 1.0 = object at 0 m
+                 (danger) and 0.0 = object at depth_max_m (clear).
+    [N:2N]       same for the RIGHT camera (−27° yaw).
+    [2N]         average wheel surface speed ∈ [0, 1], normalized by max_velocity_m_s
+                 (mean |joint_vel| over the 4 throttle joints × WHEEL_RADIUS).
+                 Only present when include_wheel_vel=True.  Matches real hardware:
+                 wheel encoders give rotation rate directly.
+    [2N+1: ]     the last prev_action_history_len (throttle, steer) commands,
+                 oldest first, newest last.  The newest pair is the command issued
+                 this step — the one the actuators apply next step, given
+                 action_delay_ms.  Omitted when prev_action_history_len = 0.
+    The trailing scalars are the "proprio tail"; their count MUST match
+    ConeTrackActorCriticCfg.num_proprio_obs, which is where the policy network
+    splits the vector to route them through their own encoder.
 
 Camera profile (ArduCam TOF sensor for Raspberry Pi):
     - Sensor: Time-of-Flight depth, 240×180 pixels at 30 fps
@@ -49,12 +62,13 @@ and stall_penalty_weight):
       slow_stop_grace_steps, charged a flat stall penalty
     - Robot tilt > 72° from vertical (up_z < 0.3)
 
-TUNING NOTES:
-    - All adjustable parameters are in ConeTrackEnvCfg in one place below.
-    - Spawn position: set preset_spawn_points in cfg.
-    - Camera crop: depth_crop_top_fraction, depth_crop_bottom_fraction.
-    - Drivetrain: drive_torque (acceleration), brake_torque_gain (braking strength),
-      max_velocity_m_s (no-load top speed), brake_release_omega, suspension_stiffness.
+Where to change what (everything below lives in ConeTrackEnvCfg):
+    - Spawn position / heading  : preset_spawn_points, spawn_yaw_jitter_rad
+    - Camera crop and noise     : depth_crop_*_fraction, depth_*_noise_*
+    - Acceleration / braking    : drive_torque, brake_torque_base, brake_torque_gain
+    - Top speed                 : max_velocity_m_s (also the reward normaliser)
+    - Grip / suspension         : ground_*_friction, suspension_stiffness
+    - Behaviour                 : the REWARD WEIGHTS section
 """
 
 from __future__ import annotations
@@ -62,45 +76,38 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Sequence
+from typing import Any, cast
 
 import isaaclab.sim as sim_utils
+import numpy as np
 import torch
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import Articulation, ArticulationCfg
 from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sensors import ContactSensor, ContactSensorCfg
-
-try:
-    from isaaclab.sensors import TiledCamera, TiledCameraCfg
-except Exception:  # pragma: no cover
-    from isaaclab.sensors import Camera as TiledCamera
-    from isaaclab.sensors import CameraCfg as TiledCameraCfg
+from isaaclab.sensors import ContactSensor, ContactSensorCfg, TiledCamera, TiledCameraCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.math import quat_from_euler_xyz
 
 # ---------------------------------------------------------------------------
-# Asset USD paths  (relative to this file → project root → assets/)
+# Asset USD paths — everything ships from Training/assets/Export, alongside the
+# textures/ folder the .usdc files reference relatively.
+#   this file → Training/source/cone_track/env.py, so ../.. is Training/
 # ---------------------------------------------------------------------------
-_ASSETS_DIR = os.path.normpath(
-    os.path.join(os.path.dirname(__file__), "../../../assets")
+_EXPORT_DIR = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "../..", "assets", "Export")
 )
-_REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "../../../../"))
-_EXPORT_DIR = os.path.join(_REPO_ROOT, "CAD", "Track", "Export")
 
-MUSHR_USD = os.path.join(_ASSETS_DIR, "mushr_nano_v2.usd")
+MUSHR_USD = os.path.join(_EXPORT_DIR, "mushr_nano_v2.usd")
 TRACK_USD = os.path.join(_EXPORT_DIR, "Track.usdc")
 WALL_USD = os.path.join(_EXPORT_DIR, "Walls.usdc")
 
-# Decorative asset sets — purely visual objects the depth cameras see.
+# Decorative asset sets — purely visual clutter the depth cameras see, cycled
+# during training so the policy never learns one fixed arrangement of scenery.
 # Index NUM_ASSET_SETS means "no decorations" (all sets hidden).
 ASSET_SET_USDS = [
-    os.path.join(_EXPORT_DIR, "Assets1.usdc"),
-    os.path.join(_EXPORT_DIR, "Assets2.usdc"),
-    os.path.join(_EXPORT_DIR, "Assets3.usdc"),
-    os.path.join(_EXPORT_DIR, "Assets4.usdc"),
-    os.path.join(_EXPORT_DIR, "Assets5.usdc"),
+    os.path.join(_EXPORT_DIR, f"Assets_{i}.usdc") for i in range(1, 6)
 ]
 NUM_ASSET_SETS = len(ASSET_SET_USDS)
 
@@ -165,13 +172,14 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
 
     Sections
     --------
-    CAMERA          — sensor resolution, FOV, depth range, crop, noise
-    SPAWN           — starting position, heading, and speed
-    SPAWN SPEED     — initial episode velocity range
-    DYNAMICS        — physics-based motor model, steering limit
+    CAMERA          — sensor resolution, FOV, depth range, crop, noise, downsampling
+    SPAWN           — starting position, heading, and post-reset grace period
+    DYNAMICS        — DC-motor drivetrain, grip, steering limit, action latency
     TERMINATION     — contact-force threshold, slow-speed detection
-    OBSERVATION     — optional wheel-speed channel
+    OBSERVATION     — the optional proprioceptive channels
     REWARD WEIGHTS  — all reward scale factors
+    SCENE DRESSING  — decorative asset sets the depth cameras can see
+    HARDWARE CONFIG — robot articulation and the two camera sensors
     """
 
     # ── Core env parameters ────────────────────────────────────────────────
@@ -241,7 +249,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
 
     # Depth range for normalization.  Readings > depth_max_m are clamped.
     # Must match autopilot.py MAX_DISTANCE / 1000.  ArduCam supports 2000 mm or 4000 mm only.
-    depth_max_m: float = 4.0
+    depth_max_m: float = 2.0
 
     # ── Policy image downsampling ──────────────────────────────────────────
     # After cropping the raw depth frame (240×≈40 at defaults) the image is
@@ -269,9 +277,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
         # (3.91, 3.31, -156.0),
         # (3.62, 1.97, -154.48),
         (0.0,  0.0, 0.0),
-        (0.0,  -5.5, 0.0),
-        (18.0,  0.0, 0.0),
-        (18.0,  -5.5, 0.0)
+        (0.0,  -5.5, 0.0)
         # (-5.46, 3.7, 0.0),
         # (-3.6, 4.7, -217.86),
         # (-5.0,  0.0, 180.0),
@@ -284,15 +290,6 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
 
     duplicate_with_flipped_yaw: bool = True  # if True, each (x, y, θ) spawns two episodes: one with +180deg rotation around z
     spawn_yaw_jitter_rad: float = 0.1  # ± heading noise applied in both modes
-
-    # ════════════════════════════════════════════════════════════════════════
-    # SPAWN SPEED — initial robot velocity at each episode reset
-    # ════════════════════════════════════════════════════════════════════════
-    spawn_vel_min_m_s: float = 0.0  # minimum spawn speed (m/s)
-    # Curriculum: spawn across a velocity range so the policy practises control at
-    # speed instead of over-sampling the slow start regime (which reinforces the
-    # cautious / slow-acceleration local optimum).  play.py forces this to 0.
-    spawn_vel_max_m_s: float = 0.0  # maximum spawn speed (m/s)
 
     # ════════════════════════════════════════════════════════════════════════
     # DYNAMICS — effort-controlled DC-motor drivetrain (AWD), tuned to real car
@@ -379,20 +376,31 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # divide by max_velocity_m_s, clamp to [0, 1].
     include_wheel_vel: bool = True
 
-    # Append the last action the policy issued (throttle, steer) to the observation.
+    # Append the last N (throttle, steer) commands the policy issued, oldest first,
+    # so the tail of the observation reads [a_{t-N+1} … a_t].  0 disables.
+    #
     # Not a nicety: action_delay_ms puts one policy step between a command and the
     # actuators, so without this the network cannot know what steering angle is
     # currently applied, and a memoryless MLP physically cannot produce smooth
-    # closed-loop control — it shows up as servo chatter and sliding.  Free on the
-    # real car: it is just the command you sent last tick.
-    include_prev_actions: bool = True
+    # closed-loop control — it shows up as servo chatter and sliding.
+    #
+    # Beyond the first entry, the history is the only temporal context the policy
+    # has: the actor is a plain MLP with no recurrence, and each depth frame is a
+    # snapshot, so a window of past commands is what lets it infer what its own
+    # inputs have been doing — whether it is mid-way through a steering sweep or
+    # holding a line, and whether it has been on the brakes for one step or five.
+    # At 30 Hz, 5 steps is ~167 ms of context, comfortably longer than the 33 ms
+    # actuator delay it has to compensate for.
+    #
+    # Free on the real car: these are just the commands already sent.  Changing this
+    # changes the observation width, so ConeTrackActorCriticCfg.num_proprio_obs must
+    # be updated to match (= include_wheel_vel + 2 × prev_action_history_len), and
+    # any exported policy must be fed the same layout on the Pi.
+    prev_action_history_len: int = 5
 
     # ════════════════════════════════════════════════════════════════════════
     # REWARD WEIGHTS
     # ════════════════════════════════════════════════════════════════════════
-    # Constant reward per step the agent stays alive (not crashed / stuck).
-    alive_weight: float = 0.0  # 0.01
-
     # ── Crash penalty ────────────────────────────────────────────────────────
     # One-off cost charged on the step a wall contact is latched (the same step the
     # episode terminates), scaled by how hard the car actually hit:
@@ -412,14 +420,12 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
 
     # ── Stall penalty ────────────────────────────────────────────────────────
     # Charged when the episode ends via the slow-stop rule.  MANDATORY companion to
-    # the crash penalty: without it, "stop moving" is a free exit.  The agent banks
-    # slow_stop_grace_steps × alive_weight (45 × 0.03 = 1.35) for doing nothing, then
-    # gets terminated at zero cost — so the moment crashing became expensive, sitting
-    # still at the spawn was the highest-return policy the agent could reach, and it
-    # took it.  Keep this strictly greater than that banked alive reward, otherwise
-    # passivity is profitable again:
-    #     stall return = slow_stop_grace_steps × alive_weight − stall_penalty_weight
-    # At the defaults: 1.35 − 3.0 = −1.65, i.e. clearly worse than trying to drive.
+    # the crash penalty: without it, "stop moving" is a FREE exit.  Standing still
+    # earns nothing, but it also risks nothing, and it ends the episode before any
+    # crash penalty can be charged — so the moment crashing became expensive,
+    # sitting at the spawn became the highest-return policy available, and the agent
+    # took it.  This makes that exit strictly worse than driving: a stalled episode
+    # returns -stall_penalty_weight, while even a clumsy lap banks distance reward.
     stall_penalty_weight: float = 3.0
 
     # Distance: rewards physical metres covered each step (v × dt).
@@ -507,7 +513,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # carrying 0.4 N generates no useful grip either way, and the earlier signal is
     # easier to act on.  Suppressed during spawn grace, when the car is still
     # dropping the 2 mm onto the ground and the sensor history is post-reset zeros.
-    wheel_lift_weight: float = 4.0
+    wheel_lift_weight: float = 3.0
     wheel_lift_exponent: float = 2.0
     wheel_ground_force_thresh_n: float = 0.5  # vertical load below this = unloaded
 
@@ -549,16 +555,17 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     lap_min_time_s: float = 5.0  # lower clamp (caps maximum reward per lap)
     lap_max_time_s: float = 30.0  # upper clamp (floors the reward for a crawl)
 
-    # How often to advance to the next asset set in the round-robin cycle (in policy steps).
-    # Set to num_steps_per_env / (NUM_ASSET_SETS * 2) so every set appears exactly twice
-    # per PPO iteration.  At num_steps_per_env=2000: 2000 / (5*2) = 200.
-    asset_randomize_every_n_steps: int = 200
-
-    # Hide every decorative asset set for the whole run (set index NUM_ASSET_SETS =
-    # "no decorations").  The sets are still loaded so RTX builds their BVHs at
-    # startup, but they stay invisible and the round-robin cycling is disabled, so
-    # the cameras only ever see the track and the (invisible) walls.
-    hide_all_assets: bool = True
+    # ════════════════════════════════════════════════════════════════════════
+    # SCENE DRESSING — decorative asset sets (visual only, no collision role)
+    # ════════════════════════════════════════════════════════════════════════
+    # Exactly one asset set is visible at a time; every this many policy steps the
+    # scene swaps to the next one in the round-robin, so over an iteration the
+    # policy sees the track dressed several different ways instead of memorising
+    # one fixed arrangement of scenery.
+    #
+    # Set to num_steps_per_env / (NUM_ASSET_SETS * 2) so every set appears exactly
+    # twice per PPO iteration.  At num_steps_per_env=1200: 1200 / (5*2) = 120.
+    asset_randomize_every_n_steps: int = 120
 
     # ════════════════════════════════════════════════════════════════════════
     # HARDWARE CONFIG  (robot articulation + camera sensor)
@@ -764,11 +771,12 @@ class ConeTrackEnv(DirectRLEnv):
         # Proprioceptive tail, appended after the two depth images.  Its width must
         # match ConeTrackActorCriticCfg.num_proprio_obs, which is the boundary the
         # policy network splits on to route these through their own encoder.
+        self._action_history_len = max(0, cfg.prev_action_history_len)
         extra_obs = 0
         if cfg.include_wheel_vel:
             extra_obs += 1  # scalar: avg wheel surface speed normalized to [0, 1]
-        if cfg.include_prev_actions:
-            extra_obs += 2  # last (throttle, steer) command issued
+        # 2 entries (throttle, steer) per remembered command
+        extra_obs += 2 * self._action_history_len
         cfg.observation_space = depth_obs_size * 2 + extra_obs  # left + right cameras
         self._num_proprio_obs = extra_obs
 
@@ -777,7 +785,8 @@ class ConeTrackEnv(DirectRLEnv):
             f"→ crop {cropped_w}×{cropped_h} "
             f"→ policy {self._policy_depth_w}×{self._policy_depth_h} "
             f"= {depth_obs_size} px  |  2 cameras  |  "
-            f"+{extra_obs} proprio  |  total obs = {cfg.observation_space}"
+            f"+{extra_obs} proprio ({self._action_history_len} action(s) of history)"
+            f"  |  total obs = {cfg.observation_space}"
         )
 
         super().__init__(cfg, render_mode, **kwargs)
@@ -806,7 +815,7 @@ class ConeTrackEnv(DirectRLEnv):
         self._steer_tan = torch.zeros(self.num_envs, device=self.device)
 
         # Precomputed tensor of all 4 driven wheel joint indices [rear_L, rear_R, front_L, front_R]
-        self._all_throttle_ids = torch.tensor(
+        self._all_throttle_ids: Any = torch.tensor(
             self._rear_throttle_ids + self._front_throttle_ids,
             dtype=torch.long,
             device=self.device,
@@ -837,9 +846,13 @@ class ConeTrackEnv(DirectRLEnv):
         # Steering LPF state
         self._filtered_steer = torch.zeros(self.num_envs, device=self.device)
 
-        # Last raw action (throttle, steer) the policy issued, fed back as an
-        # observation so the network knows what the actuators are applying.
-        self._prev_action = torch.zeros(self.num_envs, 2, device=self.device)
+        # Rolling history of the last _action_history_len raw (throttle, steer)
+        # commands, oldest at index 0 and newest at index -1.  Fed back as an
+        # observation so the network knows what the actuators are applying and what
+        # it has been asking for over the preceding few steps.
+        self._action_history = torch.zeros(
+            self.num_envs, self._action_history_len, 2, device=self.device
+        )
 
         # Last two raw steering/throttle commands (undelayed), kept for rate penalties.
         self._steer_cmd_curr = torch.zeros(self.num_envs, device=self.device)
@@ -938,9 +951,7 @@ class ConeTrackEnv(DirectRLEnv):
         # Consumed by _wall_normal_at to get the impact angle for the crash penalty.
         _wall_segs = self._extract_wall_segments_xy()
         if _wall_segs:
-            import numpy as _np
-
-            _seg_arr = torch.from_numpy(_np.asarray(_wall_segs, dtype=_np.float32)).to(
+            _seg_arr = torch.from_numpy(np.asarray(_wall_segs, dtype=np.float32)).to(
                 self.device
             )
             self._wall_seg_a = _seg_arr[:, 0, :].contiguous()  # [M, 2]
@@ -1011,15 +1022,16 @@ class ConeTrackEnv(DirectRLEnv):
                 mesh_collision = UsdPhysics.MeshCollisionAPI.Apply(prim)
                 mesh_collision.GetApproximationAttr().Set("convexHull")
 
-        for wall_path, collision_enabled in (("/World/Walls", True),):
-            wall_root = stage.GetPrimAtPath(wall_path)
-            if not wall_root.IsValid():
-                continue
+        # Walls are collision-only: exact ("none" approximation) triangle collision so
+        # contacts are reported against the true geometry, kinematic so they never move,
+        # and invisible so the depth cameras see the track rather than a boundary box.
+        wall_root = stage.GetPrimAtPath("/World/Walls")
+        if wall_root.IsValid():
             for prim in Usd.PrimRange(wall_root):
                 if not prim.IsA(UsdGeom.Mesh):
                     continue
                 wall_collision = UsdPhysics.CollisionAPI.Apply(prim)
-                wall_collision.GetCollisionEnabledAttr().Set(collision_enabled)
+                wall_collision.GetCollisionEnabledAttr().Set(True)
                 wall_mesh_collision = UsdPhysics.MeshCollisionAPI.Apply(prim)
                 wall_mesh_collision.GetApproximationAttr().Set("none")
             wall_rb = UsdPhysics.RigidBodyAPI.Apply(wall_root)
@@ -1082,8 +1094,6 @@ class ConeTrackEnv(DirectRLEnv):
         # Cone tip at camera sensor origin; base (wide end) along camera look direction.
         # Cloned to all envs automatically.  Toggle: cfg.show_camera_cones = True.
         if self.cfg.show_camera_cones:
-            import math as _math
-
             from pxr import Gf
 
             base_link_p = "/World/envs/env_0/Robot/mushr_nano/base_link"
@@ -1108,7 +1118,7 @@ class ConeTrackEnv(DirectRLEnv):
                 # Quaternion rotating cone's +Y onto fwd.
                 # cross((0,1,0), fwd) = (fwd_z, 0, -fwd_x); dot = fwd_y.
                 dot = fwd_y
-                cross_len = _math.sqrt(fwd_z**2 + fwd_x**2)
+                cross_len = math.sqrt(fwd_z**2 + fwd_x**2)
                 if cross_len < 1e-6:
                     orient = (
                         Gf.Quatf(1.0, 0.0, 0.0, 0.0)
@@ -1116,8 +1126,8 @@ class ConeTrackEnv(DirectRLEnv):
                         else Gf.Quatf(0.0, 1.0, 0.0, 0.0)
                     )
                 else:
-                    w_q = _math.sqrt(max(0.0, 0.5 * (1.0 + dot)))
-                    k = _math.sqrt(max(0.0, 0.5 * (1.0 - dot))) / cross_len
+                    w_q = math.sqrt(max(0.0, 0.5 * (1.0 + dot)))
+                    k = math.sqrt(max(0.0, 0.5 * (1.0 - dot))) / cross_len
                     orient = Gf.Quatf(w_q, k * fwd_z, 0.0, k * (-fwd_x))
 
                 cone_prim = UsdGeom.Cone.Define(
@@ -1280,21 +1290,18 @@ class ConeTrackEnv(DirectRLEnv):
         receive the command from delay_steps ticks ago.
         """
         # On the very first physics step all asset sets are still visible (RTX has
-        # already built every BVH during sim init). Now hide all but the active set —
-        # or every set when cfg.hide_all_assets is on (index NUM_ASSET_SETS = none).
+        # already built every BVH during sim init). Now hide all but the first set.
         if not self._assets_warmup_done:
-            self._set_active_assets(NUM_ASSET_SETS if self.cfg.hide_all_assets else 0)
+            self._set_active_assets(0)
             self._assets_warmup_done = True
 
         # Round-robin asset cycling — each set appears exactly twice per PPO iteration.
         # Sequence: 0,1,2,3,4,0,1,2,3,4,... advancing every asset_randomize_every_n_steps.
-        # Skipped entirely when all decorations are hidden.
-        if not self.cfg.hide_all_assets:
-            self._asset_step_counter += 1
-            if self._asset_step_counter >= self.cfg.asset_randomize_every_n_steps:
-                self._asset_step_counter = 0
-                self._asset_round_robin_idx += 1
-                self._set_active_assets(self._asset_round_robin_idx % NUM_ASSET_SETS)
+        self._asset_step_counter += 1
+        if self._asset_step_counter >= self.cfg.asset_randomize_every_n_steps:
+            self._asset_step_counter = 0
+            self._asset_round_robin_idx += 1
+            self._set_active_assets(self._asset_round_robin_idx % NUM_ASSET_SETS)
 
         raw = actions[:, :2].clamp(-1.0, 1.0)  # [N, 2]  — undelayed policy output
 
@@ -1359,8 +1366,11 @@ class ConeTrackEnv(DirectRLEnv):
         self._throttle_cmd_prev = self._throttle_cmd_curr
         self._throttle_cmd_curr = raw[:, 0]
 
-        # Fed back as an observation at the end of this step.
-        self._prev_action = raw.clone()
+        # Push into the action history FIFO; the newest entry is this step's command,
+        # which is what the actuators apply next step (action_delay_ms ≈ one tick).
+        if self._action_history_len > 0:
+            self._action_history = self._action_history.roll(-1, dims=1)
+            self._action_history[:, -1] = raw
 
     def _wall_normal_at(self, pos_xy: torch.Tensor) -> torch.Tensor | None:
         """Unit XY normal of the wall segment nearest to each of the given positions.
@@ -1372,7 +1382,7 @@ class ConeTrackEnv(DirectRLEnv):
 
         Returns [K, 2], or None if no wall geometry was extracted at startup.
         """
-        if self._wall_seg_a is None:
+        if self._wall_seg_a is None or self._wall_seg_b is None:
             return None
         a = self._wall_seg_a.unsqueeze(0)  # [1, M, 2]
         ab = (self._wall_seg_b - self._wall_seg_a).unsqueeze(0)  # [1, M, 2]
@@ -1577,11 +1587,12 @@ class ConeTrackEnv(DirectRLEnv):
                 wheel_omega_mean * WHEEL_RADIUS / self.cfg.max_velocity_m_s
             ).clamp(0.0, 1.0)
             parts.append(wheel_vel_norm.unsqueeze(-1))  # [N, 1]
-        if self.cfg.include_prev_actions:
-            # The action issued this step is what the actuators will apply next
-            # step (action_delay_ms ≈ one policy tick), so this tells the policy
-            # the control state it is about to be acting from.
-            parts.append(self._prev_action)  # [N, 2]
+        if self._action_history_len > 0:
+            # Flattened oldest-first as [thr_{t-N+1}, str_{t-N+1}, …, thr_t, str_t].
+            # The last pair is the command issued this step, i.e. the control state
+            # the policy is about to be acting from; the earlier pairs are the only
+            # temporal context a memoryless MLP gets.
+            parts.append(self._action_history.flatten(1))  # [N, 2 * N_hist]
 
         obs = torch.cat(parts, dim=-1)
         return {"policy": obs}
@@ -1692,7 +1703,9 @@ class ConeTrackEnv(DirectRLEnv):
         # this heavy.
         wheels_down = torch.zeros(self.num_envs, device=self.device)
         for link_name in WHEEL_LINKS:
-            forces = self._wall_contact_sensors[link_name].data.net_forces_w_history
+            forces = cast(
+                torch.Tensor, self._wall_contact_sensors[link_name].data.net_forces_w_history
+            )
             fz_peak = (
                 forces[..., 2].abs().reshape(self.num_envs, -1).amax(dim=1)
             )
@@ -1714,10 +1727,6 @@ class ConeTrackEnv(DirectRLEnv):
         # the readable trace; the mean count alone hides whether a rare 3-wheel event
         # or a constant 1-wheel one is driving it.
         lift_incidence = ((wheels_off > 0).float() * lift_active).mean()
-
-        r_alive = torch.full(
-            (self.num_envs,), self.cfg.alive_weight, device=self.device
-        )
 
         # ── Crash penalty ─────────────────────────────────────────────────────
         # Charged once, on the step the wall hit is latched — which is also the step
@@ -1866,7 +1875,6 @@ class ConeTrackEnv(DirectRLEnv):
             # These exist because the split between distance, slip and the smoothness
             # penalties is otherwise only recoverable by arithmetic on the total, which
             # is how slip_weight went unnoticed at 100x every other coefficient.
-            "Rew/alive": r_alive.mean().unsqueeze(0),
             "Rew/distance": r_distance.mean().unsqueeze(0),
             "Rew/lap": r_lap.mean().unsqueeze(0),
             "Rew/crash": r_crash.mean().unsqueeze(0),
@@ -1898,8 +1906,7 @@ class ConeTrackEnv(DirectRLEnv):
         }
 
         return (
-            r_alive
-            + r_crash
+            r_crash
             + r_stall
             + r_distance
             + r_steer_shape
@@ -1934,8 +1941,8 @@ class ConeTrackEnv(DirectRLEnv):
             lin_vel_b < (self.cfg.slow_stop_speed_fraction * self.cfg.max_velocity_m_s)
         ) & (self.episode_length_buf > self.cfg.slow_stop_grace_steps)
         # Handed to _get_rewards (which runs immediately after) to charge the stall
-        # penalty; without that cost, stalling out here is a free way to bank the
-        # alive reward while dodging all crash risk.
+        # penalty; without that cost, stalling out here is a free way to end the
+        # episode while dodging all crash risk.
         self._stalled = stopped
 
         terminated = wall_terminated | flipped | stopped
@@ -1948,7 +1955,7 @@ class ConeTrackEnv(DirectRLEnv):
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
         if env_ids is None:
-            env_ids = self.robot._ALL_INDICES
+            env_ids = cast(Sequence[int], self.robot._ALL_INDICES)
 
         super()._reset_idx(env_ids)
 
@@ -1956,11 +1963,6 @@ class ConeTrackEnv(DirectRLEnv):
         default_root_state = self.robot.data.default_root_state[env_ids].clone()
         default_root_state[:, :3] += self.scene.env_origins[env_ids]
 
-        speed_vec = (
-            torch.rand(n, device=self.device)
-            * (self.cfg.spawn_vel_max_m_s - self.cfg.spawn_vel_min_m_s)
-            + self.cfg.spawn_vel_min_m_s
-        )
         sz = 0.002  # just above ground — constant for all spawn modes
         env_ids_t = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
 
@@ -2001,9 +2003,8 @@ class ConeTrackEnv(DirectRLEnv):
         dq = quat_from_euler_xyz(zeros, zeros, yaw)
         default_root_state[:, 3:7] = dq
 
+        # Every episode starts from standstill (linear + angular velocity zeroed).
         default_root_state[:, 7:] = 0.0
-        default_root_state[:, 7] = speed_vec * torch.cos(yaw)
-        default_root_state[:, 8] = speed_vec * torch.sin(yaw)
 
         self.robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
@@ -2015,7 +2016,7 @@ class ConeTrackEnv(DirectRLEnv):
         self._throttle_cmd_curr[env_ids] = 0.0
         self._throttle_cmd_prev[env_ids] = 0.0
         self._action_delay_buf[env_ids] = 0.0  # clears latency FIFO
-        self._prev_action[env_ids] = 0.0
+        self._action_history[env_ids] = 0.0
 
         self._wall_touched[env_ids] = False
         self._crash_impact_speed[env_ids] = 0.0

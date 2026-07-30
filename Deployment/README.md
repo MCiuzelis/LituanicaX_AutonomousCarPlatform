@@ -103,12 +103,24 @@ All pin assignments and calibration live in `lituanicax_rc_car/common.py`:
 The policy observation is built from dual ToF cameras (Arducam, 240×180 raw, 2 m range):
 
 1. Orient frame (flip + optional vertical flip)
-2. Crop top 35% / bottom 30%
-3. Bilinear downsample to 120×32
+2. Low-confidence pixels → max range; crop top 35% / bottom 45% (180 → 36 rows)
+3. Bilinear downsample to 120×18 = 2160 values per camera
 4. Normalize: `1.0 - depth_m / 2.0` (1.0 = obstacle at 0 m, 0.0 = clear at 2 m)
-5. Concatenate left + right depth + action history (15 steps × 2) → 7710-dim observation
+5. Concatenate → **4331**-dim observation:
 
-This pipeline matches the training environment exactly (see `Training/source/tasks/cone_track/env.py`).
+```
+[ left depth 2160 | right depth 2160 | wheel speed 1 | action history 5×2 ]
+```
+
+The action history holds the last 5 raw `(throttle, steer)` commands, oldest
+first, and is zeroed whenever autopilot is disabled.
+
+Every number above must match `ConeTrackEnvCfg` in
+`Training/source/cone_track/env.py` — the policy is a fixed-width MLP, so a
+disagreement is either a startup shape error or, worse, a silently misread
+observation. The constants block at the top of
+`Python/lituanicax/modules/tof_camera.py` is the single place to change them,
+and `PolicyRunner.setup()` checks them against the loaded ONNX file at startup.
 
 ## Policy
 
