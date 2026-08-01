@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-ENCODER_HZ = 150.0
+# Encoder sampling rate.  This is also the rate the policy's wheel-velocity
+# low-pass filter runs at (PolicyRunner.update_wheel_velocity is the encoder's
+# per-sample hook), so changing it changes that filter's time constant:
+# tau = 1 / (ENCODER_HZ * WHEEL_VELOCITY_LPF_ALPHA).
+ENCODER_HZ = 300.0
 POLICY_HZ = 30
 TELEMETRY_HZ = 30
 DASHBOARD_HZ = 15

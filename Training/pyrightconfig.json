@@ -8,13 +8,17 @@
   // submodule source trees in extraPaths below is what fixes that.
   //
   // NOTE: open Training/ as the project root (this file is only picked up from
-  // the workspace root).  Anything under omni.* comes from Omniverse Kit, which
-  // injects its extension paths at runtime; those imports carry an explicit
-  // `# pyright: ignore[reportMissingImports]` at their import site.
+  // the workspace root).  Anything under omni.* / pxr.* comes from Omniverse Kit
+  // and OpenUSD, neither of which exists on disk for a type checker; the stubs in
+  // typings/ (pyright's default stubPath) are what resolve those imports.
   "venvPath": ".",
   "venv": ".venv",
   "extraPaths": [
     "source",
+    // train.py / play.py live inside the package but import cli_args as a bare
+    // sibling module (see the comment at their import site), which only resolves
+    // with their own directory on the path.
+    "source/cone_track",
     "IsaacLab/source/isaaclab",
     "IsaacLab/source/isaaclab_assets",
     "IsaacLab/source/isaaclab_rl",
@@ -24,7 +28,6 @@
     "**/__pycache__",
     ".venv",
     "IsaacLab",
-    "logs",
     "outputs"
   ],
   "typeCheckingMode": "basic",

@@ -1,6 +1,7 @@
-# Training logs and checkpoints — excluded from git (can be multi-GB)
-logs/
+# Training runs — one directory per run under Training/outputs/, can be multi-GB
 outputs/
+# any stray tool logs (Training/logs/ was the pre-outputs/ location)
+logs/
 Training/.venv/
 Deployment/.venv/
 Deployment/Ros2/log/

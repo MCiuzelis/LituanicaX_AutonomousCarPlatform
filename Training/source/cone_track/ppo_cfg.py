@@ -42,7 +42,9 @@ class ConeTrackPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env: int = 1200
     max_iterations: int = 1000
     save_interval: int = 10
-    experiment_name: str = "cone_track"  # → logs/rsl_rl/cone_track/<timestamp>/
+    # Run directories are outputs/<timestamp>/ regardless; this only names the run
+    # for the wandb/neptune loggers.
+    experiment_name: str = "cone_track"
 
     # Observation group mapping required by RslRlVecEnvWrapper
     obs_groups = {"policy": ["policy"], "critic": ["policy"]}

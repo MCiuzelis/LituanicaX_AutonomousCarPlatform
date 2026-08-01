@@ -41,7 +41,13 @@ from ..module import Module
 #   env.py prev_action_history_len → ACTION_HIST_LEN
 # ─────────────────────────────────────────────────────────────────────────────
 MAX_DISTANCE_MM = 2000
+MAX_DISTANCE_M = MAX_DISTANCE_MM / 1000.0  # == env.py depth_max_m
 CONF_THRESHOLD = 30
+# Sim convention for "nothing there": ConeTrackEnv._process_single_depth replaces
+# every non-finite depth with depth_max_m, and depth_invalid_pixel_prob sets its
+# dropouts to the same value.  So anything the sensor cannot measure — NaN, or a
+# pixel below CONF_THRESHOLD — must read as FAR here, never as near.
+INVALID_DEPTH_MM = MAX_DISTANCE_MM
 
 DEPTH_RAW_H = 180
 DEPTH_RAW_W = 240
@@ -101,12 +107,29 @@ def depth_to_jpeg(depth_buf: np.ndarray, conf_buf: np.ndarray, depth_range: floa
 
 
 def process_for_policy(depth_buf: np.ndarray, conf_buf: np.ndarray) -> np.ndarray:
-    depth_m = np.nan_to_num(depth_buf).astype(np.float32) / 1000.0
-    depth_m[conf_buf < CONF_THRESHOLD] = MAX_DISTANCE_MM / 1000.0
+    """Sensor frame → the 2160 depth values the policy expects for one camera.
+
+    Verified bit-exact against ConeTrackEnv._process_single_depth (noise off) on
+    in-range frames, which is why the step order below is not free to change:
+    clamp to [0.01, depth_max] happens BEFORE the resize, exactly as the sim
+    clamps before F.interpolate.  Clipping after the resize instead lets an
+    out-of-range pixel drag its in-range neighbour toward "far" when the two are
+    averaged by the 2:1 downsample.
+    """
+    # nan → far (see INVALID_DEPTH_MM): nan_to_num's default of 0 would report a
+    # dead pixel as an obstacle touching the lens.
+    depth_m = np.nan_to_num(
+        depth_buf,
+        nan=INVALID_DEPTH_MM,
+        posinf=INVALID_DEPTH_MM,
+        neginf=INVALID_DEPTH_MM,
+    ).astype(np.float32) / 1000.0
+    depth_m[conf_buf < CONF_THRESHOLD] = MAX_DISTANCE_M
 
     cropped = depth_m[CROP_TOP_ROWS : DEPTH_RAW_H - CROP_BOTTOM_ROWS, :]
-    resized = cv2.resize(cropped, (POLICY_W, POLICY_H), interpolation=cv2.INTER_LINEAR)
-    normalized = np.clip(1.0 - resized / (MAX_DISTANCE_MM / 1000.0), 0.0, 1.0)
+    clamped = np.clip(cropped, 0.01, MAX_DISTANCE_M)
+    resized = cv2.resize(clamped, (POLICY_W, POLICY_H), interpolation=cv2.INTER_LINEAR)
+    normalized = np.clip(1.0 - resized / MAX_DISTANCE_M, 0.0, 1.0)
     return normalized.flatten().astype(np.float32)
 
 

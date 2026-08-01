@@ -102,13 +102,13 @@ local_bin="${HOME}/.local/bin"
 mkdir -p "${local_bin}"
 PRIME_WRAPPER='if nvidia-smi -L 2>/dev/null | grep -qi intel; then export __NV_PRIME_RENDER_OFFLOAD=1; fi'
 
-for name in train play visualize; do
+for name in train play visualize acceleration_test; do
     cat > "${local_bin}/${name}" <<SCRIPT
 #!/bin/bash
 TRAINING_DIR="${script_dir}"
 ${PRIME_WRAPPER}
 cd "\$TRAINING_DIR"
-exec uv run python ${name}.py "\$@"
+exec uv run python source/cone_track/${name}.py "\$@"
 SCRIPT
     chmod +x "${local_bin}/${name}"
 done
@@ -125,4 +125,7 @@ echo "    train --num_envs 26 --headless   # train, with TensorBoard"
 echo "    play  --num_envs 1 --real-time   # run the latest checkpoint"
 echo "    play  --fpv                      # ... plus live depth windows"
 echo "    visualize                        # WASD drive + depth tuning"
+echo "    acceleration_test --headless     # drivetrain bench test"
+echo ""
+echo "  Every run writes one directory: outputs/<timestamp>/"
 echo "=============================="

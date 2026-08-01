@@ -22,8 +22,8 @@ Quit with Ctrl+C here or Q in any window.
 
 Usage:
     visualize                                  # helper installed by install.sh
-    uv run python visualize.py --crop_top 0.2 --crop_bottom 0.15
-    uv run python visualize.py --color_noise_prob 0.05 --edge_noise_sigma 0.08
+    uv run python source/cone_track/visualize.py --crop_top 0.2 --crop_bottom 0.15
+    uv run python source/cone_track/visualize.py --color_noise_prob 0.05 --edge_noise_sigma 0.08
 """
 
 import argparse

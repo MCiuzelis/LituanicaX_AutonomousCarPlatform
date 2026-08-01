@@ -5,9 +5,11 @@
 
 """Run a trained ConeTrack checkpoint in Isaac Sim (inference only).
 
-Loads the latest (or a named) checkpoint, exports it to TorchScript + ONNX next
-to the checkpoint, then drives the car with the policy until you quit.  The ONNX
-export is what Deployment/autopilot.py runs on the Raspberry Pi.
+Loads the latest (or a named) checkpoint from ``outputs/``, exports it to
+TorchScript + ONNX into ``exported/`` next to the checkpoint, then drives the car
+with the policy until you quit.  The ONNX export is what Deployment/autopilot.py
+runs on the Raspberry Pi.  Everything this writes — the export, any video, and
+Hydra's ``play.log`` — stays inside the run directory the checkpoint came from.
 
 Two viewing modes:
     default   the Isaac Sim viewport, following the car.
@@ -19,7 +21,7 @@ Walls are hidden here: they exist only to terminate training episodes.
 Usage:
     play --num_envs 4                          # helper installed by install.sh
     play --fpv --real-time
-    play --checkpoint logs/rsl_rl/cone_track/<run>/model_500.pt
+    play --checkpoint outputs/<run>/model_500.pt
     play --fpv --video                         # record the left depth stream
 """
 
@@ -27,15 +29,23 @@ import argparse
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 # Reduce PyTorch CUDA allocator fragmentation: returns unused blocks to the
 # system in smaller segments instead of holding giant cached arenas.
 # Must be set before any CUDA context is created (AppLauncher).
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+# Training runs live in Training/outputs/<timestamp>/ (see train.py).  Spelled out
+# here rather than imported from the package: importing cone_track pulls in torch
+# and rsl_rl, which must not happen before Isaac Sim has launched.
+OUTPUTS_DIR = Path(__file__).resolve().parents[2] / "outputs"
+
 from isaaclab.app import AppLauncher
 
 # local imports
+# Imported as a bare sibling module (this file's directory is sys.path[0]), NOT as
+# cone_track.cli_args, for the same reason.
 import cli_args  # isort: skip
 
 # add argparse arguments
@@ -127,8 +137,30 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 
+def _resolve_checkpoint() -> str:
+    """Find the checkpoint to play — before Hydra starts.
+
+    Resolved this early so Hydra can be pointed at the run directory the checkpoint
+    came from, instead of creating a directory of its own next to the training runs.
+    The trade-off is that only the CLI flags are visible here: pick a run with
+    ``--checkpoint`` / ``--load_run``, not with a Hydra ``agent.load_run=`` override.
+    """
+    if not args_cli.checkpoint:
+        return get_checkpoint_path(str(OUTPUTS_DIR), args_cli.load_run or ".*", "model_.*.pt")
+
+    ckpt = args_cli.checkpoint
+    if not os.path.isabs(ckpt) and not os.path.isfile(ckpt):
+        # The play alias cds to Training/; if the user gave a path relative to the
+        # project root (e.g. Training/outputs/<run>/model_500.pt) try resolving it
+        # one directory up so both forms work without needing an absolute path.
+        candidate = os.path.join(OUTPUTS_DIR.parent.parent, ckpt)
+        if os.path.isfile(candidate):
+            ckpt = candidate
+    return retrieve_file_path(ckpt)
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
-def main(env_cfg: ConeTrackEnvCfg, agent_cfg: ConeTrackPPORunnerCfg):
+def main(env_cfg: ConeTrackEnvCfg, agent_cfg: ConeTrackPPORunnerCfg, resume_path: str):
     """Load a checkpoint, export it, and run it in closed loop."""
     # override configurations with non-hydra CLI arguments (mutates agent_cfg in place)
     cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
@@ -139,23 +171,7 @@ def main(env_cfg: ConeTrackEnvCfg, agent_cfg: ConeTrackPPORunnerCfg):
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
 
-    # specify directory for logging experiments (absolute path, matches train.py)
-    log_root_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "rsl_rl", agent_cfg.experiment_name)
-    print(f"[INFO] Loading experiment from directory: {log_root_path}")
-    if args_cli.checkpoint:
-        ckpt = args_cli.checkpoint
-        if not os.path.isabs(ckpt) and not os.path.isfile(ckpt):
-            # The play alias cds to Training/ before running; if the user gave a path
-            # relative to the project root (e.g. Training/logs/...) try resolving it
-            # one directory up so both forms work without needing an absolute path.
-            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            candidate = os.path.join(project_root, ckpt)
-            if os.path.isfile(candidate):
-                ckpt = candidate
-        resume_path = retrieve_file_path(ckpt)
-    else:
-        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
-
+    # the run directory the checkpoint came from — everything below writes into it
     log_dir = os.path.dirname(resume_path)
 
     # set the log directory for the environment (works for all environment types)
@@ -319,7 +335,15 @@ def main(env_cfg: ConeTrackEnvCfg, agent_cfg: ConeTrackPPORunnerCfg):
 
 
 if __name__ == "__main__":
+    _resume_path = _resolve_checkpoint()
+    # Point Hydra at the run directory being played: it writes play.log there and,
+    # with output_subdir disabled, leaves the run's own .hydra/ record untouched.
+    sys.argv += [
+        f"hydra.run.dir={os.path.dirname(_resume_path)}",
+        "hydra.job.name=play",
+        "hydra.output_subdir=null",
+    ]
     # run the main function (hydra_task_config injects env_cfg / agent_cfg)
-    main()  # pyright: ignore[reportCallIssue]
+    main(_resume_path)  # pyright: ignore[reportCallIssue]
     # close sim app
     simulation_app.close()

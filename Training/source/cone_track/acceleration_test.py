@@ -7,12 +7,12 @@ distance travelled, and how far the wheels rotated — the gap between the last 
 is tyre slip.
 
 This is the loop for matching the sim drivetrain to the measurements in
-real_car_acceleration_log.txt: run it, compare, then adjust drive_torque /
+Training/real_car_acceleration_log.txt: run it, compare, then adjust drive_torque /
 brake_torque_base / brake_torque_gain / ground_*_friction in env.py.
 
 Usage:
-    uv run python acceleration_test.py --headless
-    uv run python acceleration_test.py --headless --accel_throttle 0.5 --brake_power 0.5
+    uv run python source/cone_track/acceleration_test.py --headless
+    uv run python source/cone_track/acceleration_test.py --headless --accel_throttle 0.5 --brake_power 0.5
 """
 
 import argparse

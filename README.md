@@ -21,9 +21,6 @@ Policy trained in NVIDIA Isaac Sim 5.1 / Isaac Lab (PPO); deployed on a Raspberr
 │   └── PCB/                  # KiCAD schematic + layout for driver board
 │
 └── Training/                 # Isaac Sim RL training pipeline
-    ├── train.py              # Entry point — launches Isaac Sim, runs PPO
-    ├── play.py               # Loads a checkpoint, runs inference + FPV view
-    ├── visualize.py          # Manual WASD drive + live depth-camera windows
     ├── assets/
     │   ├── Track/            # Blender sources for the track and its props
     │   └── Export/           # USD the sim loads (+ textures/)
@@ -31,13 +28,18 @@ Policy trained in NVIDIA Isaac Sim 5.1 / Isaac Lab (PPO); deployed on a Raspberr
     │       ├── Track.usdc    # Cone-track (visible to the depth cameras)
     │       ├── Walls.usdc    # Boundary walls (termination only, invisible)
     │       └── Assets_1..5.usdc  # Prop sets, cycled during training
-    ├── logs/                 # Training outputs — excluded from git
+    ├── outputs/              # One directory per run — excluded from git
     └── source/
         └── cone_track/
-            ├── __init__.py       # gym.register("ConeTrack", ...)
-            ├── env.py            # ConeTrackEnv + ConeTrackEnvCfg
-            ├── ppo_cfg.py        # ConeTrackPPORunnerCfg
-            └── actor_critic.py   # policy network
+            ├── __init__.py           # gym.register("ConeTrack", ...)
+            ├── env.py                # ConeTrackEnv + ConeTrackEnvCfg
+            ├── ppo_cfg.py            # ConeTrackPPORunnerCfg
+            ├── actor_critic.py       # Policy network
+            ├── train.py              # Entry point — launches Isaac Sim, runs PPO
+            ├── play.py               # Loads a checkpoint, runs inference + FPV view
+            ├── visualize.py          # Manual WASD drive + live depth-camera windows
+            ├── acceleration_test.py  # Drivetrain bench test
+            └── cli_args.py           # Shared RSL-RL CLI arguments
 ```
 
 ---
@@ -83,13 +85,14 @@ See `Training/README.md` for details.
 
 ## Terminal Shortcuts
 
-Three shortcuts are installed to `~/.local/bin` so you can run training commands from any directory:
+Four shortcuts are installed to `~/.local/bin` so you can run training commands from any directory:
 
 | Command | Equivalent |
 |---|---|
-| `train [args]` | `cd Training && uv run python train.py [args]` |
-| `play [args]` | `cd Training && uv run python play.py [args]` |
-| `visualize [args]` | `cd Training && uv run python visualize.py [args]` |
+| `train [args]` | `cd Training && uv run python source/cone_track/train.py [args]` |
+| `play [args]` | `cd Training && uv run python source/cone_track/play.py [args]` |
+| `visualize [args]` | `cd Training && uv run python source/cone_track/visualize.py [args]` |
+| `acceleration_test [args]` | `cd Training && uv run python source/cone_track/acceleration_test.py [args]` |
 
 `~/.local/bin` must be on your `PATH` (it is by default on Ubuntu 24.04).  
 Changes take effect in new terminal sessions (or run `source ~/.bashrc`).
@@ -110,14 +113,15 @@ train --task ConeTrack \
     --run_name my_experiment
 ```
 
-Checkpoints are saved every 20 iterations to:
+Every run writes a single directory — checkpoints, TensorBoard events, resolved
+configs, and the exported policy all land in:
 ```
-Training/logs/rsl_rl/cone_track/<YYYY-MM-DD_HH-MM-SS>_<run_name>/
+Training/outputs/<YYYY-MM-DD_HH-MM-SS>[_<run_name>]/
 ```
 
-Monitor training:
+Monitor training (`train` opens this for you automatically):
 ```bash
-cd Training && uv run tensorboard --logdir logs/rsl_rl/cone_track/
+cd Training && uv run tensorboard --logdir outputs/
 ```
 
 ---
@@ -130,7 +134,7 @@ play --task ConeTrack --num_envs 1
 
 # Load a specific checkpoint
 play --task ConeTrack --num_envs 1 \
-    --checkpoint Training/logs/rsl_rl/cone_track/<run>/model_1000.pt
+    --checkpoint Training/outputs/<run>/model_1000.pt
 
 # First-person depth-camera view (requires $DISPLAY)
 play --task ConeTrack --num_envs 1 --fpv

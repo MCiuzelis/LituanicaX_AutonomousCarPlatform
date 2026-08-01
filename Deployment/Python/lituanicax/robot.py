@@ -19,7 +19,7 @@ import threading
 from dataclasses import dataclass
 from typing import Dict, List
 
-from .config import DASHBOARD_HZ, POLICY_HZ, TELEMETRY_HZ
+from .config import DASHBOARD_HZ, ENCODER_HZ, POLICY_HZ, TELEMETRY_HZ
 from .logging_utils import get_logger
 from .module import Module
 from .modules.acceleration_test import AccelerationTest
@@ -74,7 +74,7 @@ class RobotSettings:
     telemetry_hz: float = TELEMETRY_HZ
 
     # --- encoder ---
-    encoder_hz: float = 300.0
+    encoder_hz: float = ENCODER_HZ
 
     # --- dashboard ---
     host: str = "0.0.0.0"
