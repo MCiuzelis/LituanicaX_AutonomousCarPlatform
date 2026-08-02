@@ -10,10 +10,17 @@ TOP_LEVEL_PACKAGE_SRC="${REPO_ROOT}/LituanicaX_RC_Car"
 PACKAGE_DST="${WORKSPACE_DIR}/src/LituanicaX_RC_Car"
 VENV_DIR="${SCRIPT_DIR}/.venv"
 
-if [ ! -f "${ROS_SETUP}" ]; then
-    echo "ROS underlay not found at ${ROS_SETUP}"
-    echo "Set ROS_UNDERLAY=/path/to/ros2_jazzy or build ROS 2 first."
-    exit 1
+# The ROS workspace is optional: Deployment/Python runs the same stack on the
+# venv alone. Only build it when an underlay is actually present, so a
+# Python-only Pi can still install. SKIP_ROS=1 forces the Python-only path.
+BUILD_ROS=1
+if [ "${SKIP_ROS:-0}" = "1" ]; then
+    BUILD_ROS=0
+    echo "SKIP_ROS=1: installing the Python stack only."
+elif [ ! -f "${ROS_SETUP}" ]; then
+    BUILD_ROS=0
+    echo "No ROS underlay at ${ROS_SETUP} — installing the Python stack only."
+    echo "Set ROS_UNDERLAY=/path/to/ros2_jazzy if you also want the ROS workspace."
 fi
 
 if [ -d "${TOP_LEVEL_PACKAGE_SRC}" ]; then
@@ -22,12 +29,13 @@ else
     PACKAGE_SRC="${PACKAGE_DST}"
 fi
 
-if [ ! -d "${PACKAGE_SRC}" ]; then
-    echo "Package source not found at ${TOP_LEVEL_PACKAGE_SRC} or ${PACKAGE_DST}"
-    exit 1
+if [ "${BUILD_ROS}" = "1" ]; then
+    if [ ! -d "${PACKAGE_SRC}" ]; then
+        echo "Package source not found at ${TOP_LEVEL_PACKAGE_SRC} or ${PACKAGE_DST}"
+        exit 1
+    fi
+    echo "Using ROS underlay: ${ROS_UNDERLAY}"
 fi
-
-echo "Using ROS underlay: ${ROS_UNDERLAY}"
 
 if ! command -v uv &>/dev/null; then
     echo "uv not found, installing..."
@@ -78,38 +86,71 @@ sudo apt install -y \
 echo "Creating Python runtime venv at ${VENV_DIR}..."
 uv venv "${VENV_DIR}"
 
+# The venv is created without system site-packages, so every import the stack
+# makes has to come from this list — the python3-* APT packages above are not
+# visible from inside it. rpi-lgpio supplies RPi.GPIO (drive) and pulls in
+# lgpio; spidev is the ADC (monitoring); smbus2 is the AS5600 encoder.
 echo "Installing Python runtime packages into the venv..."
 uv pip install --python "${VENV_DIR}/bin/python" \
     ArducamDepthCamera \
     aiohttp \
     opencv-python \
     "numpy<2.0.0" \
-    onnxruntime
+    onnxruntime \
+    rpi-lgpio \
+    spidev \
+    smbus2
 
-if [ "$(readlink -f "${PACKAGE_SRC}")" != "$(readlink -f "${PACKAGE_DST}")" ]; then
-    echo "Synchronizing ROS package into ${PACKAGE_DST}..."
-    mkdir -p "${WORKSPACE_DIR}/src"
-    rsync -a --delete \
-        --exclude "__pycache__/" \
-        --exclude "*.egg-info/" \
-        "${PACKAGE_SRC}/" \
-        "${PACKAGE_DST}/"
-else
-    echo "Using existing ROS package at ${PACKAGE_DST}"
+echo "Verifying the venv can import everything the Python stack needs..."
+"${VENV_DIR}/bin/python" - <<'PYCHECK'
+import importlib, sys
+missing = []
+for name in ("numpy", "cv2", "aiohttp", "onnxruntime", "ArducamDepthCamera",
+             "RPi.GPIO", "spidev", "smbus2", "lgpio"):
+    try:
+        importlib.import_module(name)
+    except Exception as exc:
+        missing.append(f"{name}: {type(exc).__name__}: {exc}")
+if missing:
+    print("Venv is incomplete:")
+    for line in missing:
+        print("  " + line)
+    sys.exit(1)
+print("All runtime imports OK.")
+PYCHECK
+
+if [ "${BUILD_ROS}" = "1" ]; then
+    if [ "$(readlink -f "${PACKAGE_SRC}")" != "$(readlink -f "${PACKAGE_DST}")" ]; then
+        echo "Synchronizing ROS package into ${PACKAGE_DST}..."
+        mkdir -p "${WORKSPACE_DIR}/src"
+        rsync -a --delete \
+            --exclude "__pycache__/" \
+            --exclude "*.egg-info/" \
+            "${PACKAGE_SRC}/" \
+            "${PACKAGE_DST}/"
+    else
+        echo "Using existing ROS package at ${PACKAGE_DST}"
+    fi
+
+    echo "Building deployment ROS workspace..."
+    (
+        set +u
+        source "${ROS_SETUP}"
+        set -u
+        cd "${WORKSPACE_DIR}"
+        colcon build --symlink-install
+    )
 fi
-
-echo "Building deployment ROS workspace..."
-(
-    set +u
-    source "${ROS_SETUP}"
-    set -u
-    cd "${WORKSPACE_DIR}"
-    colcon build --symlink-install
-)
 
 echo
 echo "Done."
-echo "Use the deployment workspace with:"
-echo "  source ${ROS_SETUP}"
-echo "  source ${WORKSPACE_DIR}/install/setup.bash"
-echo "  ros2 launch lituanicax_rc_car ros_autopilot.launch.py"
+echo "Run the Python stack (no ROS, no sourcing):"
+echo "  ${SCRIPT_DIR}/Python/run"
+
+if [ "${BUILD_ROS}" = "1" ]; then
+    echo
+    echo "Or use the ROS workspace with:"
+    echo "  source ${ROS_SETUP}"
+    echo "  source ${WORKSPACE_DIR}/install/setup.bash"
+    echo "  ros2 launch lituanicax_rc_car ros_autopilot.launch.py"
+fi

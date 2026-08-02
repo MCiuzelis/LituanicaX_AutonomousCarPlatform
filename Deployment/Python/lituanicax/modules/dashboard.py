@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -27,6 +28,9 @@ HTML_PATH = Path(__file__).resolve().parents[1] / "dashboard.html"
 ALPHA_BATTERY = 0.3
 ALPHA_CPU = 0.2
 ALPHA_TEMP = 0.025
+
+#: How long a min/peak reading stays latched on the dashboard.
+HOLD_SEC = 3.0
 
 
 def get_local_ip() -> str:
@@ -61,9 +65,12 @@ class Dashboard(Module):
         self.ws_clients: set[web.WebSocketResponse] = set()
         self.telemetry = {
             "throttle": 0.0,
+            "duty": 0.0,
             "steer": 0.0,
             "battery": 0.0,
+            "battery_min": 0.0,
             "current": 0.0,
+            "current_peak": 0.0,
             "velocity": 0.0,
             "distance": 0.0,
             "active": False,
@@ -75,6 +82,8 @@ class Dashboard(Module):
         self._filtered_battery = 0.0
         self._filtered_cpu_usage = 0.0
         self._filtered_cpu_temp = 0.0
+        self._battery_min_hold = (float("inf"), 0.0)  # (value, monotonic time)
+        self._current_peak_hold = (0.0, 0.0)
 
     # --- server lifecycle ---
 
@@ -142,7 +151,9 @@ class Dashboard(Module):
                 self.telemetry.update(
                     {
                         "battery": self._filtered_battery,
+                        "battery_min": self._hold_min(monitoring.battery_min),
                         "current": monitoring.motor_current,
+                        "current_peak": self._hold_peak(monitoring.motor_current_peak),
                         "velocity": monitoring.linear_velocity,
                         "distance": monitoring.distance_travelled,
                         "cpu_usage": self._filtered_cpu_usage,
@@ -154,9 +165,31 @@ class Dashboard(Module):
 
             if drive is not None:
                 self.telemetry.update(
-                    {"throttle": drive.last_throttle, "steer": drive.last_steer}
+                    {
+                        "throttle": drive.last_throttle,
+                        "duty": drive.last_duty_fraction,
+                        "steer": drive.last_steer,
+                    }
                 )
             self.telemetry["active"] = self.robot.autopilot_enabled
+
+    def _hold_min(self, value: float) -> float:
+        """Worst battery sample of the last `HOLD_SEC`, so a few-ms dip is readable
+        on a 15 Hz display instead of vanishing between frames."""
+        held, since = self._battery_min_hold
+        now = time.monotonic()
+        if value < held or now - since > HOLD_SEC:
+            held, since = value, now
+        self._battery_min_hold = (held, since)
+        return held
+
+    def _hold_peak(self, value: float) -> float:
+        held, since = self._current_peak_hold
+        now = time.monotonic()
+        if value > held or now - since > HOLD_SEC:
+            held, since = value, now
+        self._current_peak_hold = (held, since)
+        return held
 
     async def _broadcast_telemetry(self) -> None:
         interval = 1.0 / self.stream_fps

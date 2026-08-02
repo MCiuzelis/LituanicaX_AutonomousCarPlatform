@@ -1,0 +1,27 @@
+[INFO] [1785688498.866149426] [2708.555275151] [robot]: Starting modules: tof_camera_left, tof_camera_right, recorder, encoder, monitoring, drive, policy_runner, dashboard
+[INFO] [1785688498.866276264] [2708.555401206] [tof_camera_left]: Starting left ToF camera: CSI index=8, vertical_flip=False
+[INFO] [1785688498.871651649] [2708.560785490] [tof_camera_right]: Starting right ToF camera: CSI index=0, vertical_flip=False
+[INFO] [1785688498.888715506] [2708.577850468] [recorder]: Recording to /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Python/Logs/run_20260802_163458 (~13.5 MB/s, budget 2147 MB ≈ 159 s of frames)
+[INFO] [1785688498.891000748] [2708.580130789] [encoder]: Encoder initialized (rate=300.0 Hz)
+[INFO] [1785688498.891779900] [2708.580907155] [monitoring]: Monitoring initialized (undervoltage<5.00 V, overcurrent>100.00 A)
+[INFO] [1785688498.897071600] [2708.586196718] [drive]: Drive initialized
+[INFO] [1785688498.988221407] [2708.677348966] [policy_runner]: Policy loaded from /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Python/lituanicax/policy.onnx; obs=4331, target=30.0 Hz
+[INFO] [1785688498.995646715] [2708.684771424] [dashboard]: Dashboard open at http://192.168.88.100:8080
+[INFO] [1785688501.086120844] [2710.775246268] [dashboard]: Dashboard client connected: 192.168.88.175
+[WARNING] [1785688501.729086637] [2711.418217863] [recorder]: Recorder queue full — dropped 1 records so far (disk cannot keep up; the log stays consistent, just sparser)
+[WARNING] [1785688503.300229788] [2712.989381398] [drive]: Drive output blocked: no command for 0.26 s
+[WARNING] [1785688503.300807238] [2712.989936765] [recorder]: Recorder queue full — dropped 32 records so far (disk cannot keep up; the log stays consistent, just sparser)
+[WARNING] [1785688503.301290989] [2712.990417207] [drive]: Drive output blocked: no command for 1.57 s
+[INFO] [1785688503.307345629] [2712.996470562] [drive]: Drive output restored
+[WARNING] [1785688516.801187277] [2726.490312475] [recorder]: Recorder queue full — dropped 33 records so far (disk cannot keep up; the log stays consistent, just sparser)
+[WARNING] [1785688528.847096682] [2738.536227572] [recorder]: Recorder queue full — dropped 64 records so far (disk cannot keep up; the log stays consistent, just sparser)
+[WARNING] [1785688528.847496033] [2738.536631162] [drive]: Drive output blocked: no command for 0.26 s
+[WARNING] [1785688528.847740173] [2738.536868772] [recorder]: Recorder queue full — dropped 65 records so far (disk cannot keep up; the log stays consistent, just sparser)
+[WARNING] [1785688528.850302219] [2738.539432405] [drive]: Drive output blocked: no command for 11.05 s
+[INFO] [1785688528.857498169] [2738.546624180] [drive]: Drive output restored
+[WARNING] [1785688529.847069263] [2739.536194624] [recorder]: Recorder queue full — dropped 89 records so far (disk cannot keep up; the log stays consistent, just sparser)
+[WARNING] [1785688534.451347351] [2744.140472585] [recorder]: Recorder queue full — dropped 96 records so far (disk cannot keep up; the log stays consistent, just sparser)
+[INFO] [1785688539.163895130] [2748.853021233] [dashboard]: Dashboard client disconnected: 192.168.88.175
+[INFO] [1785688539.325692415] [2749.014820547] [drive]: Drive stopped
+[INFO] [1785688539.336439133] [2749.025564616] [recorder]: Recorded 831 policy steps, 1475 frames, 325 MB to /home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Deployment/Python/Logs/run_20260802_163458
+[INFO] [1785688539.435426712] [2749.124552357] [robot]: All modules stopped

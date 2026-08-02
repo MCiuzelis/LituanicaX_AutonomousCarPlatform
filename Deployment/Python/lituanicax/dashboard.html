@@ -172,7 +172,8 @@ ws.onmessage = ({ data }) => {
   if (msg.type !== 'telemetry') return;
 
   const tp = Math.max(0, Math.min(100, msg.throttle * 100)).toFixed(1);
-  tval.textContent = msg.throttle.toFixed(3);
+  // requested vs. the signed duty actually left on the motor PWM
+  tval.textContent = msg.throttle.toFixed(3) + '  (pwm ' + msg.duty.toFixed(3) + ')';
   tbar.style.width = tp + '%';
   tbar.style.marginLeft = '0';
   tbar.style.background = msg.throttle > 0.05 ? '#4af' : '#555';
@@ -189,12 +190,15 @@ ws.onmessage = ({ data }) => {
   sbar.style.background = Math.abs(sv) > 0.05 ? '#fa4' : '#555';
 
   const bv = msg.battery;
-  bval.textContent = bv.toFixed(2) + ' V';
+  // The 3 s min-hold is the number that matters: the motor driver shuts down on
+  // the instantaneous sag, not on this averaged value.
+  const bmin = msg.battery_min;
+  bval.textContent = bv.toFixed(2) + ' V  (min ' + bmin.toFixed(2) + ')';
   bbar.style.width = Math.min(100, (bv / 10.0) * 100).toFixed(1) + '%';
-  bbar.style.background = bv < 6.0 ? '#f64' : bv < 7.0 ? '#fa4' : '#4f4';
+  bbar.style.background = bmin < 6.2 ? '#f64' : bv < 7.0 ? '#fa4' : '#4f4';
 
   const cv = msg.current;
-  cval.textContent = cv.toFixed(3) + ' A';
+  cval.textContent = cv.toFixed(2) + ' A  (pk ' + msg.current_peak.toFixed(1) + ')';
   cbar.style.width = Math.min(100, (cv / 5.0) * 100).toFixed(1) + '%';
   cbar.style.background = msg.overcurrent ? '#f64' : '#fa4';
 

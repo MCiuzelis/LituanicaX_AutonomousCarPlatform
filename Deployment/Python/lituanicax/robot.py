@@ -28,12 +28,14 @@ from .modules.drive import Drive
 from .modules.encoder import Encoder
 from .modules.monitoring import Monitoring
 from .modules.policy_runner import PolicyRunner
+from .modules.recorder import DEFAULT_MAX_MB, Recorder
 from .modules.screenshot_grabber import ScreenshotGrabber
 from .modules.tof_camera import TofCamera
 
 #: Everything that can be switched on or off, in start-up order.
 MODULE_NAMES = (
     "tof_cameras",
+    "recorder",
     "encoder",
     "monitoring",
     "drive",
@@ -50,6 +52,7 @@ class RobotSettings:
 
     # --- module switches ---
     tof_cameras: bool = True
+    recorder: bool = False
     encoder: bool = True
     monitoring: bool = True
     drive: bool = True
@@ -81,6 +84,10 @@ class RobotSettings:
     port: int = 8080
     stream_fps: float = 15.0
 
+    # --- recorder (--log) ---
+    log_dir: str = ""
+    log_max_mb: float = DEFAULT_MAX_MB
+
     def enabled_modules(self) -> List[str]:
         return [name for name in MODULE_NAMES if getattr(self, name)]
 
@@ -92,6 +99,7 @@ class Robot:
 
         self.autopilot_enabled = False
         self.cameras: Dict[str, TofCamera] = {}
+        self.recorder: Recorder | None = None
         self.encoder: Encoder | None = None
         self.monitoring: Monitoring | None = None
         self.drive: Drive | None = None
@@ -115,6 +123,19 @@ class Robot:
             for side in settings.camera_sides:
                 self.cameras[side] = TofCamera(side=side, preview_hz=settings.preview_hz)
             self.modules.extend(self.cameras.values())
+
+        if settings.recorder:
+            # Second in start order and therefore second-to-last to stop: it is
+            # up before anything it logs, and drains after they have gone quiet.
+            # It stays behind the cameras so their fork does not inherit the
+            # writer thread's open blob files.
+            self.recorder = Recorder(
+                robot=self,
+                log_dir=settings.log_dir,
+                max_mb=settings.log_max_mb,
+                rate_hz=settings.telemetry_hz,
+            )
+            self.modules.append(self.recorder)
 
         if settings.encoder:
             self.encoder = Encoder(rate_hz=settings.encoder_hz)
@@ -142,6 +163,7 @@ class Robot:
                 rate_hz=settings.policy_hz,
                 camera_timeout_sec=settings.camera_timeout_sec,
                 onnx_threads=settings.onnx_threads,
+                recorder=self.recorder,
             )
             self.modules.append(self.policy)
 

@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
 # Launch the vanilla-Python deployment stack (no ROS, no colcon).
 #
-#   Deployment/Python/run                                # everything on
+#   Deployment/Python/run                                # everything on, recorded
+#   Deployment/Python/run --no-log                       # ...without recording
 #   Deployment/Python/run --disable-tof --disable-policy  # bench test
 #   Deployment/Python/run --enable-accel-test --disable policy
+#
+# --log is passed by default so every run leaves a full record in
+# Deployment/Logs/run_<timestamp>/ (ToF frames, policy inputs/outputs, dashboard
+# numbers, console). It costs ~13 MB/s of card writes off the control path; pass
+# --no-log to turn it off.
 set -euo pipefail
 
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -24,4 +30,4 @@ else
 fi
 
 cd "${SCRIPT_DIR}"
-exec "${PYTHON}" -m lituanicax.main "$@"
+exec "${PYTHON}" -m lituanicax.main --log "$@"

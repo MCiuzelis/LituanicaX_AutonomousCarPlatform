@@ -19,6 +19,10 @@ import RPi.GPIO as GPIO
 
 from ..config import (
     COMMAND_TIMEOUT_SEC,
+    CURRENT_LIMIT_A,
+    CURRENT_LIMIT_ATTACK_PER_SEC,
+    CURRENT_LIMIT_FLOOR,
+    CURRENT_LIMIT_RECOVER_PER_SEC,
     MAX_THROTTLE,
     MONITORING_TIMEOUT_SEC,
     MOTOR_DIRECTION,
@@ -37,6 +41,7 @@ from ..config import (
     SERVO_PWM_CHANNEL,
     SERVO_PWM_FREQ,
     TELEMETRY_HZ,
+    THROTTLE_SLEW_UP_PER_SEC,
 )
 from ..module import Module
 from .monitoring import Monitoring
@@ -107,6 +112,20 @@ class Drive(Module):
         self.last_throttle = 0.0
         self.last_steer = 0.0
         self.last_command_time = 0.0
+        #: Duty fraction actually written to the motor PWM, signed by direction.
+        #: `last_throttle` is what was *requested*; this is what the hardware was
+        #: left holding.  If they ever disagree, the fault is in this module; if
+        #: they agree while the car sits still, the fault is downstream of the Pi.
+        self.last_duty_fraction = 0.0
+        self._blocked_reasons: list[str] = []
+
+        self.motor_current_peak = 0.0
+        #: Throttle after slew limiting — the ramp's internal state.
+        self._ramped_throttle = 0.0
+        #: Duty ceiling the current limiter is currently imposing, 0..1.
+        self._current_scale = 1.0
+        self._last_apply_time = 0.0
+        self._limiter_engaged = False
 
         self.motor_pwm: SysfsHardwarePWM | None = None
         self.servo_pwm: SysfsHardwarePWM | None = None
@@ -140,7 +159,12 @@ class Drive(Module):
         """Watchdog tick: cut output when commands stop or safety trips."""
         with self._lock:
             self._refresh_monitoring()
-            command_stale = time.monotonic() - self.last_command_time > self.command_timeout_sec
+            command_age = time.monotonic() - self.last_command_time
+            command_stale = command_age > self.command_timeout_sec
+            reasons = self._blocking_reasons()
+            if command_stale and self.enabled:
+                reasons.append(f"no command for {command_age:.2f} s")
+            self._note_gate(reasons)
             if command_stale or not self._can_drive():
                 self._apply(0.0, 0.0)
 
@@ -171,6 +195,7 @@ class Drive(Module):
         with self._lock:
             self.last_command_time = time.monotonic()
             self._refresh_monitoring()
+            self._note_gate(self._blocking_reasons())
             if self._can_drive():
                 self._apply(throttle, steer)
             else:
@@ -196,6 +221,7 @@ class Drive(Module):
         self.undervoltage = self.monitoring.undervoltage
         self.overcurrent = self.monitoring.overcurrent
         self.linear_velocity = self.monitoring.linear_velocity
+        self.motor_current_peak = self.monitoring.motor_current_peak
 
     def _monitoring_is_fresh(self) -> bool:
         if self.monitoring is None:
@@ -210,13 +236,94 @@ class Drive(Module):
             and not self.overcurrent
         )
 
+    def _blocking_reasons(self) -> list[str]:
+        """Every safety condition currently withholding drive, named."""
+        reasons: list[str] = []
+        if not self.enabled:
+            return reasons  # not a fault; the operator simply is not holding SPACE
+        if self.monitoring is None:
+            reasons.append("no monitoring module")
+        elif not self._monitoring_is_fresh():
+            age = time.monotonic() - self.monitoring.last_update_time
+            reasons.append(f"monitoring stale ({age:.2f} s)")
+        if self.undervoltage:
+            battery = self.monitoring.battery_voltage if self.monitoring else 0.0
+            reasons.append(f"undervoltage ({battery:.2f} V)")
+        if self.overcurrent:
+            current = self.monitoring.motor_current if self.monitoring else 0.0
+            reasons.append(f"overcurrent ({current:.1f} A)")
+        return reasons
+
+    def _note_gate(self, reasons: list[str]) -> None:
+        """Log only the edges, so the console shows why drive came and went."""
+        if reasons and reasons != self._blocked_reasons:
+            self.log.warning(f"Drive output blocked: {'; '.join(reasons)}")
+        elif self._blocked_reasons and not reasons:
+            self.log.info("Drive output restored")
+        self._blocked_reasons = reasons
+
     def _apply(self, throttle: float, steer: float) -> None:
         if throttle < 0.0 and self.linear_velocity <= 0.01:
             throttle = 0.0
+
+        dt = self._tick_delta()
+        # `last_throttle` stays the *requested* value so the dashboard keeps
+        # reporting what the policy asked for; the limiters only shape what
+        # reaches the motor, which `last_duty_fraction` records.
         self.last_throttle = throttle
         self.last_steer = steer
-        self._set_throttle(throttle)
+        self._set_throttle(self._current_limited(self._slew_limited(throttle, dt), dt))
         self._set_steering(steer)
+
+    def _tick_delta(self) -> float:
+        """Seconds since the previous _apply, 0 on the first call or after a gap."""
+        now = time.monotonic()
+        previous, self._last_apply_time = self._last_apply_time, now
+        if previous <= 0.0:
+            return 0.0
+        dt = now - previous
+        # A long gap means the loop stalled; ramp from rest rather than
+        # granting one huge step's worth of slew.
+        return dt if 0.0 < dt <= 0.5 else 0.0
+
+    def _slew_limited(self, throttle: float, dt: float) -> float:
+        """Rate-limit rising magnitude only; anything toward zero passes straight
+        through so braking and safety stops are never delayed."""
+        current = self._ramped_throttle
+        toward_zero = throttle * current >= 0.0 and abs(throttle) <= abs(current)
+        if toward_zero:
+            self._ramped_throttle = throttle
+        else:
+            step = THROTTLE_SLEW_UP_PER_SEC * dt
+            delta = max(-step, min(step, throttle - current))
+            self._ramped_throttle = current + delta
+        return self._ramped_throttle
+
+    def _current_limited(self, throttle: float, dt: float) -> float:
+        """Shrink the duty ceiling while the measured peak is over the limit,
+        and let it recover once the load drops."""
+        peak = self.motor_current_peak
+        scale = self._current_scale
+
+        if peak > CURRENT_LIMIT_A:
+            # Where the ceiling needs to end up, then approach it at a bounded
+            # rate rather than in one jump.
+            target = max(CURRENT_LIMIT_FLOOR, scale * (CURRENT_LIMIT_A / peak))
+            scale = max(target, scale - CURRENT_LIMIT_ATTACK_PER_SEC * dt)
+            if not self._limiter_engaged:
+                self._limiter_engaged = True
+                self.log.warning(
+                    f"Current limiter engaged: peak {peak:.1f} A over "
+                    f"{CURRENT_LIMIT_A:.1f} A limit — backing the duty off"
+                )
+        else:
+            scale = min(1.0, scale + CURRENT_LIMIT_RECOVER_PER_SEC * dt)
+            if self._limiter_engaged and scale >= 1.0:
+                self._limiter_engaged = False
+                self.log.info("Current limiter released")
+
+        self._current_scale = scale
+        return throttle * scale
 
     # --- actuators ---
 
@@ -234,6 +341,7 @@ class Drive(Module):
         GPIO.output(PIN_INA, GPIO.HIGH if value >= 0 else GPIO.LOW)
         GPIO.output(PIN_INB, GPIO.HIGH if value < 0 else GPIO.LOW)
         self.motor_pwm.set_duty_fraction(abs(value))
+        self.last_duty_fraction = value
 
     @staticmethod
     def _steering_pulse_ns(value: float) -> int:

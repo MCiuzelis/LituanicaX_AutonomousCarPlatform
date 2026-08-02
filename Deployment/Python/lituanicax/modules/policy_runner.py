@@ -73,12 +73,16 @@ class PolicyRunner(Module):
         rate_hz: float = POLICY_HZ,
         camera_timeout_sec: float = 0.5,
         onnx_threads: int = 1,
+        recorder=None,
     ) -> None:
         super().__init__("policy_runner", rate_hz)
 
         self.left_camera = left_camera
         self.right_camera = right_camera
         self.drive = drive
+        #: Optional Recorder (`--log`). Every tick is handed to it whole, so the
+        #: images, the observation and the resulting command stay one record.
+        self.recorder = recorder
         self.policy_path = discover_policy_path(policy_path)
         self.camera_timeout_sec = float(camera_timeout_sec)
         # Small MLPs suffer from huge thread spin-wait overhead if > 1
@@ -93,6 +97,7 @@ class PolicyRunner(Module):
         self.input_name = ""
         self.output_name = ""
         self._wheel_vel_filtered = 0.0
+        self._last_tick_time = 0.0
 
     def setup(self) -> None:
         if not self.policy_path.exists():
@@ -144,25 +149,37 @@ class PolicyRunner(Module):
         self.wheel_vel_norm = self._wheel_vel_filtered
 
     def update(self) -> None:
+        tick_time = time.monotonic()
         left = self._fresh_frame(self.left_camera)
         right = self._fresh_frame(self.right_camera)
 
         if not self.enabled or left is None or right is None:
             self.action_history[:] = 0.0
+            history = self.action_history
             self._send(0.0, 0.0, 0.0)
+            self._record(
+                tick_time,
+                left,
+                right,
+                history,
+                obs=None,
+                infer_ms=None,
+                skipped="autopilot disabled" if not self.enabled else "no fresh frame",
+            )
             return
 
-        left_obs = process_for_policy(*left)
-        right_obs = process_for_policy(*right)
+        left_obs = process_for_policy(left[0], left[1])
+        right_obs = process_for_policy(right[0], right[1])
 
         # Layout must match ConeTrackEnv._get_observations exactly:
         # [depth_left | depth_right | wheel_vel | action history oldest→newest].
         wheel_vel_arr = np.array([self.wheel_vel_norm], dtype=np.float32)
-        obs = np.concatenate(
-            [left_obs, right_obs, wheel_vel_arr, self.action_history]
-        )[np.newaxis, :]
+        history = self.action_history
+        obs = np.concatenate([left_obs, right_obs, wheel_vel_arr, history])[np.newaxis, :]
 
+        inference_start = time.monotonic()
         action = self.session.run([self.output_name], {self.input_name: obs})[0].clip(-1.0, 1.0)[0]
+        infer_ms = (time.monotonic() - inference_start) * 1000.0
         throttle_raw = float(action[0])
         steer = float(action[1])
         throttle_motor = throttle_raw if throttle_raw >= 0 else throttle_raw * BRAKE_MAGNITUDE
@@ -170,27 +187,79 @@ class PolicyRunner(Module):
         # Push this tick's raw command onto the history FIFO, newest last — the sim
         # does the same in _pre_physics_step, so the next observation carries it as
         # the final pair.  Note it is the RAW policy output that is remembered, not
-        # the brake-scaled value handed to the motor.
+        # the brake-scaled value handed to the motor.  `np.roll` returns a new
+        # array, so `history` still holds what this tick was given.
         self.action_history = np.roll(self.action_history, -2)
         self.action_history[-2] = throttle_raw
         self.action_history[-1] = steer
 
         self._send(throttle_motor, steer, throttle_raw)
+        self._record(tick_time, left, right, history, obs[0], infer_ms, None)
 
     # --- internals ---
 
     def _fresh_frame(self, camera: TofCamera | None):
-        """(depth, confidence) if the camera has a recent frame, else None."""
+        """(depth, confidence, frame time, frame id) if recent, else None."""
         if camera is None:
             return None
-        depth, confidence, frame_time = camera.snapshot()
+        depth, confidence, frame_time, frame_id = camera.snapshot_with_id()
         if depth is None or confidence is None:
             return None
         if time.monotonic() - frame_time > self.camera_timeout_sec:
             return None
-        return depth, confidence
+        return depth, confidence, frame_time, frame_id
 
     def _send(self, throttle_motor: float, steer: float, throttle_raw: float) -> None:
         self.last_action = (throttle_motor, steer, throttle_raw)
         if self.drive is not None:
             self.drive.command(throttle_motor, steer)
+
+    def _record(self, tick_time, left, right, history, obs, infer_ms, skipped) -> None:
+        """Hand this tick — frames, observation, action, and what the drive did
+        with it — to the recorder as one record. No-op without `--log`."""
+        if self.recorder is None:
+            return
+
+        throttle_motor, steer, throttle_raw = self.last_action
+        row = {
+            "t": tick_time,
+            "t_wall": tick_time + self.recorder.clock_offset,
+            "dt": tick_time - self._last_tick_time if self._last_tick_time else None,
+            "enabled": self.enabled,
+            "skipped": skipped,
+            "wheel_vel_norm": self.wheel_vel_norm,
+            "action_history_in": [float(value) for value in history],
+            "action_throttle_raw": throttle_raw,
+            "action_steer": steer,
+            "action_throttle_motor": throttle_motor,
+            "infer_ms": infer_ms,
+            "tick_ms": (time.monotonic() - tick_time) * 1000.0,
+        }
+        self._last_tick_time = tick_time
+
+        frames = {}
+        for side, frame in (("left", left), ("right", right)):
+            # Always present, so every row has the same columns: null means the
+            # camera had nothing fresh and the policy commanded zero.
+            row[f"{side}_frame_id"] = None
+            row[f"{side}_frame_t"] = None
+            row[f"{side}_frame_age_ms"] = None
+            row[f"{side}_image_index"] = None
+            if frame is not None:
+                depth, confidence, frame_time, frame_id = frame
+                row[f"{side}_frame_id"] = frame_id
+                row[f"{side}_frame_t"] = frame_time
+                row[f"{side}_frame_age_ms"] = (tick_time - frame_time) * 1000.0
+                frames[side] = (frame_id, frame_time, depth, confidence)
+
+        if self.drive is not None:
+            row.update(
+                {
+                    "drive_enabled": self.drive.enabled,
+                    "drive_throttle": self.drive.last_throttle,
+                    "drive_steer": self.drive.last_steer,
+                    "drive_duty": self.drive.last_duty_fraction,
+                }
+            )
+
+        self.recorder.log_policy_step(row, frames, obs)

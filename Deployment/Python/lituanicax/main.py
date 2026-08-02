@@ -3,6 +3,7 @@
     python -m lituanicax.main                                # everything on
     python -m lituanicax.main --disable-tof --disable-policy # bench test
     python -m lituanicax.main --disable policy --enable acceleration_test
+    python -m lituanicax.main --log                          # record the run
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import logging
 import sys
 
 from .logging_utils import configure, get_logger
+from .modules.recorder import DEFAULT_MAX_MB
 from .robot import MODULE_NAMES, Robot, RobotSettings
 
 
@@ -56,6 +58,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--policy-path", default=None, help="Override the ONNX policy file")
     parser.add_argument("--debug", action="store_true", help="Verbose logging")
 
+    # --- flight recorder ---
+    parser.add_argument(
+        "--log",
+        action="store_true",
+        help="Record the whole run to Deployment/Logs/run_<timestamp>/: full ToF "
+        "frames, policy observations and actions, and every dashboard number, "
+        "all keyed on one monotonic clock. Same as --enable recorder.",
+    )
+    parser.add_argument(
+        "--no-log",
+        action="store_true",
+        help="Cancel --log (the run script passes --log, so this turns it back off).",
+    )
+    parser.add_argument("--log-dir", default=None, help="Write the run into this directory instead")
+    parser.add_argument(
+        "--log-max-mb",
+        type=float,
+        default=None,
+        help="Stop writing frames/observations after this many MB "
+        f"(default {DEFAULT_MAX_MB:.0f}; scalar rows always continue)",
+    )
+
     return parser.parse_args(argv)
 
 
@@ -70,6 +94,12 @@ def settings_from_args(args: argparse.Namespace) -> RobotSettings:
         settings.acceleration_test = True
     if args.enable_screenshot:
         settings.screenshot_grabber = True
+    # --no-log wins, so `run` can pass --log unconditionally and still be
+    # overridden on the command line: `Deployment/Python/run --no-log`.
+    if args.log and not args.no_log:
+        settings.recorder = True
+    if args.no_log:
+        settings.recorder = False
 
     for name in args.disable:
         setattr(settings, name, False)
@@ -82,6 +112,10 @@ def settings_from_args(args: argparse.Namespace) -> RobotSettings:
         settings.port = args.port
     if args.policy_path is not None:
         settings.policy_path = args.policy_path
+    if args.log_dir is not None:
+        settings.log_dir = args.log_dir
+    if args.log_max_mb is not None:
+        settings.log_max_mb = args.log_max_mb
 
     return settings
 

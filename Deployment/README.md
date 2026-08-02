@@ -62,8 +62,13 @@ Open the dashboard at `http://<raspberry-pi-ip>:8080`.
 To run the same stack without ROS (no colcon build, no sourcing):
 
 ```bash
-Deployment/Python/run
+Deployment/Python/run            # records the run to Deployment/Logs/
+Deployment/Python/run --no-log   # without recording
 ```
+
+Each recorded run holds the full ToF frames, the policy's inputs and outputs and
+every dashboard number, all keyed on one clock — see
+[`Python/README.md`](Python/README.md#logging-a-run---log).
 
 ## ROS Nodes
 
