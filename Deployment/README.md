@@ -62,12 +62,15 @@ Open the dashboard at `http://<raspberry-pi-ip>:8080`.
 To run the same stack without ROS (no colcon build, no sourcing):
 
 ```bash
-Deployment/Python/run            # records the run to Deployment/Logs/
-Deployment/Python/run --no-log   # without recording
+Deployment/Python/run                                       # records the run to Deployment/Logs/
+Deployment/Python/run --no-log                              # without recording
+Deployment/Python/run --disable-policy --enable-skid-test   # a calibration run, always recorded
 ```
 
 Each recorded run holds the full ToF frames, the policy's inputs and outputs and
-every dashboard number, all keyed on one clock — see
+every dashboard number, all keyed on one clock. The calibration tests turn
+recording on themselves and add a 300 Hz trace of the manoeuvre plus their
+results as numbers — see
 [`Python/README.md`](Python/README.md#logging-a-run---log).
 
 ## ROS Nodes

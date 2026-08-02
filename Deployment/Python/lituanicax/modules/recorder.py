@@ -1,12 +1,15 @@
 """Flight recorder: writes everything the stack sees and decides to disk.
 
-Enabled with `--log` (the `run` script passes it by default).  One directory per
-run under `Deployment/Logs/`, holding
+Enabled with `--log` (the `run` script passes it by default, and either
+calibration test turns it on by itself).  One directory per run under
+`Deployment/Logs/`, holding
 
     meta.json         run constants: clocks, config snapshot, obs layout, files
     policy.jsonl      one row per policy tick: inputs, outputs, what drive did
     telemetry.jsonl   one row per telemetry tick: every number the dashboard shows
     frames.jsonl      one row per stored ToF frame: index -> timestamp, camera
+    test.jsonl        one row per calibration-test tick (300 Hz), when one runs
+    events.jsonl      test phase changes and final results, machine-readable
     obs.bin           float32 [n_steps, OBS_DIM] — the exact vectors fed to ONNX
     tof_<side>_depth.bin / tof_<side>_conf.bin   raw sensor frames, fixed-size
     console.log       the console stream, with both clocks on every line
@@ -149,6 +152,8 @@ class Recorder(Module):
 
         self.steps = 0  # policy ticks submitted (not necessarily written)
         self.ticks = 0  # telemetry rows submitted
+        self.test_ticks = 0  # calibration-test rows submitted
+        self.events = 0  # test phase changes and results submitted
         self.dropped = 0  # items the queue had no room for
         self.bytes_written = 0
 
@@ -173,7 +178,10 @@ class Recorder(Module):
         return requested
 
     def setup(self) -> None:
-        for name in ("policy", "telemetry", "frames"):
+        names = ["policy", "telemetry", "frames"]
+        if self._tests():
+            names += ["test", "events"]
+        for name in names:
             self._text_files[name] = open(self.run_dir / f"{name}.jsonl", "w", buffering=1 << 16)
         self._blob_files["obs"] = open(self.run_dir / "obs.bin", "wb", buffering=1 << 16)
         for side in self.robot.cameras:
@@ -218,6 +226,34 @@ class Recorder(Module):
         )
 
     # --- producers ---
+
+    def _tests(self) -> list:
+        """The calibration tests in this run, if any. They drive the car directly
+        and are the reason most logged runs exist, so they get their own streams."""
+        return [
+            test
+            for test in (self.robot.acceleration_test, self.robot.skid_pad_test)
+            if test is not None
+        ]
+
+    def log_test_tick(self, row: dict) -> None:
+        """One row per calibration-test tick (300 Hz, ten times the telemetry rate).
+
+        The encoder samples at 300 Hz too, so this is the full-resolution record of
+        the accel/brake ramp and the settled circle — sampling it at the 30 Hz
+        telemetry rate throws away most of a braking event.
+        """
+        self.test_ticks += 1
+        self._submit({"file": "test", "row": row, "frames": {}, "obs": None})
+
+    def log_event(self, row: dict) -> None:
+        """A test phase change or its final result.
+
+        A handful of rows per run, and the whole point of the run, so this one
+        waits for room in the queue rather than being dropped like a sample.
+        """
+        self.events += 1
+        self._submit({"file": "events", "row": row, "frames": {}, "obs": None}, wait_s=1.0)
 
     def log_policy_step(self, row: dict, frames: dict, obs: np.ndarray | None) -> None:
         """Called by PolicyRunner once per tick, before it returns.
@@ -311,6 +347,12 @@ class Recorder(Module):
             row[f"camera_{side}_frames"] = frame_count
             row[f"camera_{side}_age"] = now - frame_t if frame_t else None
 
+        for test in self._tests():
+            # Which phase the test was in, so telemetry.jsonl can be sliced into
+            # the accel / brake / settle / measure windows without replaying the
+            # state machine from console.log.
+            row.update(test.telemetry())
+
         dashboard = self.robot.dashboard
         if dashboard is not None:
             # Verbatim copy of the websocket payload, so a row holds exactly what
@@ -319,9 +361,12 @@ class Recorder(Module):
                 row[f"dash_{key}"] = value
         return row
 
-    def _submit(self, item: dict) -> None:
+    def _submit(self, item: dict, wait_s: float = 0.0) -> None:
         try:
-            self._queue.put_nowait(item)
+            if wait_s > 0.0:
+                self._queue.put(item, timeout=wait_s)
+            else:
+                self._queue.put_nowait(item)
         except queue.Full:
             self.dropped += 1
             now = time.monotonic()
@@ -358,8 +403,8 @@ class Recorder(Module):
         if row is not None and obs is not None:
             row["obs_index"] = self._store_obs(obs)
 
-        if row is not None:
-            handle = self._text_files[item["file"]]
+        handle = self._text_files.get(item["file"])
+        if row is not None and handle is not None:
             handle.write(json.dumps(row, default=_json_default) + "\n")
 
     def _store_frame(self, side: str, frame_id: int, frame_t: float, depth, conf) -> int | None:
@@ -463,6 +508,9 @@ class Recorder(Module):
                 "recorder": self.rate_hz,
             },
             "policy_path": str(self.robot.policy.policy_path) if self.robot.policy else "",
+            # The hardcoded constants a calibration test was run with. Without
+            # these a swept THROTTLE makes every run in Logs/ look alike.
+            "tests": {test.name: test.parameters() for test in self._tests()},
             "observation": {
                 "dim": OBS_DIM,
                 "layout": [
@@ -500,6 +548,8 @@ class Recorder(Module):
             "duration_sec": time.monotonic() - self.t0_mono,
             "policy_steps": self.steps,
             "telemetry_ticks": self.ticks,
+            "test_ticks": self.test_ticks,
+            "test_events": self.events,
             "frames_stored": self._frame_count,
             "obs_stored": self._obs_count,
             "records_dropped": self.dropped,
@@ -513,6 +563,7 @@ class Recorder(Module):
 
     def _write_readme(self) -> None:
         sides = sorted(self.robot.cameras) or ["left", "right"]
+        tests = self._tests()
         (self.run_dir / "README.md").write_text(
             README_TEMPLATE.format(
                 schema=SCHEMA_VERSION,
@@ -521,6 +572,12 @@ class Recorder(Module):
                 depth_w=DEPTH_RAW_W,
                 side=sides[0],
                 sides=", ".join(sides),
+                test_files=(
+                    TEST_FILES_TEMPLATE.format(hz=int(tests[0].rate_hz)) if tests else ""
+                ),
+                test_section=(
+                    TEST_SECTION_TEMPLATE.format(name=tests[0].name) if tests else ""
+                ),
             )
         )
 
@@ -546,7 +603,7 @@ row carries the same two clocks:
 | `meta.json` | run | clocks, enabled modules, full `config.py` snapshot, obs layout |
 | `policy.jsonl` | policy tick (30 Hz) | `step`, `t`, `{side}_image_index`, `obs_index`, `action_*`, `drive_*` |
 | `telemetry.jsonl` | telemetry tick (30 Hz) | `t`, battery/current/CPU/encoder, `drive_*`, `dash_*` |
-| `frames.jsonl` | stored ToF frame | `index`, `side`, `frame_id`, `t` (capture time) |
+| `frames.jsonl` | stored ToF frame | `index`, `side`, `frame_id`, `t` (capture time) |{test_files}
 | `obs.bin` | policy tick | float32 `[n, {obs_dim}]`, row `n` = `obs_index` |
 | `tof_<side>_depth.bin` | stored frame | float32 `[n, {depth_h}, {depth_w}]`, mm |
 | `tof_<side>_conf.bin` | stored frame | uint8 `[n, {depth_h}, {depth_w}]` |
@@ -554,7 +611,7 @@ row carries the same two clocks:
 | `summary.json` | run | counts, bytes, dropped records |
 
 Cameras: {sides}.
-
+{test_section}
 ## Which image produced which action
 
 `policy.jsonl` names the record it used — no timestamp matching required:
@@ -598,4 +655,38 @@ filtered); the unprefixed fields next to them are the unfiltered module state.
 `process_for_policy(depth, conf)` in `modules/tof_camera.py` turns a raw frame
 into the `depth_left` / `depth_right` slices of `obs.bin`, using the crop rows
 and constants recorded in `meta.json`.
+"""
+
+#: Extra rows in the file table above, only for a run that had a test in it.
+TEST_FILES_TEMPLATE = """
+| `test.jsonl` | calibration-test tick ({hz} Hz) | `test_state`, `test_velocity`, `test_distance`, `test_throttle_cmd`, `test_steer_cmd` |
+| `events.jsonl` | phase change / result | `event`, `test`, plus the numbers that phase produced |"""
+
+#: Extra section, same condition.
+TEST_SECTION_TEMPLATE = """
+## The calibration test in this run
+
+`{name}` drove the car here, not the policy. Its constants are in
+`meta.json["tests"]`; the result it printed to `console.log` is also in
+`events.jsonl` as machine-readable numbers:
+
+```python
+events = [json.loads(line) for line in open("events.jsonl")]
+result = next(e for e in events if e["event"] == "finished")
+```
+
+`test.jsonl` is the full-resolution trace behind that result — one row per
+300 Hz tick, so a braking event is ~1200 samples rather than the ~120 that
+`telemetry.jsonl` would give it. Slice it by `test_state` to get each phase:
+
+```python
+rows  = [json.loads(line) for line in open("test.jsonl")]
+brake = [r for r in rows if r["test_state"] == "BRAKING"]
+decel = (brake[0]["test_velocity"] - brake[-1]["test_velocity"]) / (
+    brake[-1]["t"] - brake[0]["t"])
+```
+
+`telemetry.jsonl` carries the same `test_*` fields at 30 Hz, next to the
+battery, current and drive state — that is where to look for the voltage sag or
+the current limiter engaging under the phase you are measuring.
 """

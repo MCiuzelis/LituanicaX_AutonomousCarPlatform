@@ -32,6 +32,13 @@ makes the laps countable.
 Sweep THROTTLE across runs: the radius growing with speed IS the understeer
 gradient, and it is what tells you whether the gap to the sim is steering
 geometry (radius constant, just too big) or grip (radius growing with speed).
+
+Enabling it turns the recorder on (see `main.settings_from_args`), so every run
+in the sweep leaves a full record in `Deployment/Logs/run_<timestamp>/`: this
+module's own 300 Hz trace in `test.jsonl`, the THROTTLE it was run with in
+`meta.json["tests"]`, the result in `events.jsonl`, and everything else the car
+measures — battery, current, CPU, encoder, drive state, ToF frames — alongside.
+Comparing two runs in the sweep is then a matter of reading two directories.
 """
 
 from __future__ import annotations
@@ -92,6 +99,8 @@ class SkidPadTest(Module):
         self.measure_start_time = 0.0
         self.measure_duration = 0.0
         self.brake_start_time = 0.0
+        self.throttle_cmd = 0.0
+        self.steer_cmd = 0.0
         self._module_start_time = 0.0
 
     def setup(self) -> None:
@@ -110,15 +119,81 @@ class SkidPadTest(Module):
     def shutdown(self) -> None:
         if self.state not in ("IDLE", "DONE"):
             self.log.warning("Stopped mid-test")
-        self.drive.command(0.0, 0.0)
+            self._event("stopped_mid_test", state=self.state)
+        self._command(0.0, 0.0)
         self.robot.set_autopilot_enabled(False)
+
+    # --- recording ---
+
+    def parameters(self) -> dict:
+        """The hardcoded constants this run was made with, for `meta.json`. THROTTLE
+        is the one that gets swept, and the one a later run has to be compared at."""
+        return {
+            "steer": self.STEER,
+            "throttle": self.THROTTLE,
+            "settle_s": self.SETTLE_S,
+            "measure_s": self.MEASURE_S,
+            "brake_throttle": self.BRAKE_THROTTLE,
+            "velocity_epsilon": self.VELOCITY_EPSILON,
+            "brake_timeout_s": self.BRAKE_TIMEOUT_S,
+            "startup_delay_s": self.STARTUP_DELAY_S,
+            "tick_hz": self.TICK_HZ,
+            "wheelbase_m": REAL_WHEELBASE_M,
+        }
+
+    def telemetry(self) -> dict:
+        """What the test is doing right now: goes into every `test.jsonl` row and
+        every `telemetry.jsonl` row, so either file can be sliced by phase — the
+        MEASURING window is the only part of the run the radius comes from."""
+        row = {
+            "test": self.name,
+            "test_state": self.state,
+            "test_throttle_cmd": self.throttle_cmd,
+            "test_steer_cmd": self.steer_cmd,
+            "test_peak_velocity": self.peak_velocity,
+            "test_elapsed": (
+                time.monotonic() - self.turn_start_time if self.turn_start_time else 0.0
+            ),
+        }
+        if self.monitoring is not None:
+            row["test_velocity"] = self.monitoring.linear_velocity
+            row["test_distance"] = self.monitoring.distance_travelled - self.start_distance
+        return row
+
+    def _command(self, throttle: float, steer: float) -> None:
+        """Every command goes through here so the recorded row says what the test
+        asked for, next to what `Drive` actually did with it after the ramp and
+        the current limiter."""
+        self.throttle_cmd = throttle
+        self.steer_cmd = steer
+        self.drive.command(throttle, steer)
+
+    def _record_tick(self) -> None:
+        recorder = self.robot.recorder
+        if recorder is None:
+            return
+        row = {"t": time.monotonic(), "t_wall": time.time()}
+        row.update(self.telemetry())
+        recorder.log_test_tick(row)
+
+    def _event(self, kind: str, **fields) -> None:
+        recorder = self.robot.recorder
+        if recorder is None:
+            return
+        row = {"t": time.monotonic(), "t_wall": time.time(), "test": self.name, "event": kind}
+        row.update(fields)
+        recorder.log_event(row)
 
     # --- state machine ---
 
     def update(self) -> None:
         if self.state == "DONE":
             return
+        self._step()
+        # After the step, so the transition into DONE lands in the file too.
+        self._record_tick()
 
+    def _step(self) -> None:
         if self.state == "IDLE":
             if time.monotonic() - self._module_start_time >= self.STARTUP_DELAY_S:
                 self._begin_test()
@@ -126,6 +201,11 @@ class SkidPadTest(Module):
 
         if time.monotonic() - self.monitoring.last_update_time > self.MONITORING_TIMEOUT_S:
             self.log.error("Monitoring data stale — aborting test")
+            self._event(
+                "monitoring_stale",
+                state=self.state,
+                monitoring_age=time.monotonic() - self.monitoring.last_update_time,
+            )
             self._finish(aborted=True)
             return
 
@@ -142,16 +222,17 @@ class SkidPadTest(Module):
         self.start_distance = self.monitoring.distance_travelled
         self.turn_start_time = time.monotonic()
         self.peak_velocity = 0.0
-        self.drive.command(self.THROTTLE, self.STEER)
+        self._command(self.THROTTLE, self.STEER)
         self.log.info(
             f"Test started — steer={self.STEER}, throttle={self.THROTTLE}; "
             f"settling for {self.SETTLE_S}s"
         )
+        self._event("started", start_distance=self.start_distance, **self.parameters())
 
     def _hold(self) -> None:
         """Same command every tick: the drive's command timeout is what stops the
         car if this thread dies, so the hold has to be re-asserted, not set once."""
-        self.drive.command(self.THROTTLE, self.STEER)
+        self._command(self.THROTTLE, self.STEER)
         self.peak_velocity = max(self.peak_velocity, self.monitoring.linear_velocity)
 
     def _settling(self) -> None:
@@ -166,6 +247,11 @@ class SkidPadTest(Module):
                 f"Settled at {self.monitoring.linear_velocity:.2f} m/s — "
                 f"measuring for {self.MEASURE_S}s (start counting laps now)"
             )
+            self._event(
+                "settled",
+                velocity=self.monitoring.linear_velocity,
+                settle_distance=self.settle_end_distance - self.start_distance,
+            )
 
     def _measuring(self) -> None:
         self._hold()
@@ -177,7 +263,7 @@ class SkidPadTest(Module):
             self._begin_braking()
 
     def _braking(self) -> None:
-        self.drive.command(self.BRAKE_THROTTLE, 0.0)
+        self._command(self.BRAKE_THROTTLE, 0.0)
         if abs(self.monitoring.linear_velocity) <= self.VELOCITY_EPSILON:
             self._finish(aborted=False)
         elif time.monotonic() - self.brake_start_time >= self.BRAKE_TIMEOUT_S:
@@ -185,17 +271,48 @@ class SkidPadTest(Module):
                 f"Still reading {self.monitoring.linear_velocity:.2f} m/s after "
                 f"{self.BRAKE_TIMEOUT_S:.1f}s of braking — releasing anyway"
             )
+            self._event("brake_timeout", velocity=self.monitoring.linear_velocity)
             self._finish(aborted=False)
 
     def _begin_braking(self) -> None:
         self.state = "BRAKING"
         self.brake_start_time = time.monotonic()
-        self.drive.command(self.BRAKE_THROTTLE, 0.0)
+        self._command(self.BRAKE_THROTTLE, 0.0)
         self.log.info("Braking...")
+        self._event(
+            "measured",
+            measured_distance=self.measure_end_distance - self.settle_end_distance,
+            measure_duration=self.measure_duration,
+            velocity_samples=self.velocity_samples,
+        )
+
+    def _lap_table(self, measured_distance: float, mean_velocity: float) -> list[dict]:
+        """The steady-state circle for each lap count that is physically plausible.
+
+        No gyro on this car, so laps cannot be counted on-board — the distance is
+        real, the number of times it went round is not. Every candidate goes into
+        the log; the operator picks the row matching the laps they watched.
+        """
+        rows = []
+        for laps in range(1, 9):
+            radius = measured_distance / (2.0 * math.pi * laps)
+            if radius < 0.15 or radius > 20.0:
+                continue
+            curvature = 1.0 / radius
+            rows.append(
+                {
+                    "laps": laps,
+                    "radius_m": radius,
+                    "curvature_1_m": curvature,
+                    "delta_max_deg": math.degrees(math.atan(curvature * REAL_WHEELBASE_M)),
+                    "lateral_g": (mean_velocity**2) / radius / 9.81,
+                }
+            )
+        return rows
 
     def _finish(self, aborted: bool) -> None:
         self.state = "DONE"
-        self.drive.command(0.0, 0.0)
+        self._command(0.0, 0.0)
         self.robot.set_autopilot_enabled(False)
 
         total_distance = self.monitoring.distance_travelled - self.start_distance
@@ -216,26 +333,36 @@ class SkidPadTest(Module):
         self.log.info(f"  Measured duration:  {self.measure_duration:.2f} s")
         self.log.info(f"  Total distance:     {total_distance:.3f} m  (incl. settling)")
 
-        if aborted or measured_distance <= 0.0:
+        candidates = (
+            [] if aborted or measured_distance <= 0.0
+            else self._lap_table(measured_distance, mean_velocity)
+        )
+        sim_curvature = math.tan(0.488) / 0.224
+
+        # The same numbers the lines above print, in a form a script can read.
+        self._event(
+            "finished",
+            aborted=aborted,
+            peak_velocity=self.peak_velocity,
+            mean_velocity=mean_velocity,
+            measured_distance=measured_distance,
+            measure_duration=self.measure_duration,
+            total_distance=total_distance,
+            sim_curvature_1_m=sim_curvature,
+            lap_candidates=candidates,
+        )
+
+        if not candidates:
             return
 
-        # No gyro on this car, so laps cannot be counted on-board — the distance is
-        # real, the number of times it went round is not. Print the radius for each
-        # plausible lap count and let the operator pick the one they watched.
         self.log.info("  Laps counted in the measured window -> steady-state circle:")
         self.log.info("     laps   radius     curvature   implied delta_max")
-        for laps in range(1, 9):
-            radius = measured_distance / (2.0 * math.pi * laps)
-            if radius < 0.15 or radius > 20.0:
-                continue
-            curvature = 1.0 / radius
-            delta = math.degrees(math.atan(curvature * REAL_WHEELBASE_M))
-            lat_g = (mean_velocity**2) / radius / 9.81 if radius > 0 else 0.0
+        for row in candidates:
             self.log.info(
-                f"      {laps:2d}    {radius:5.2f} m   {curvature:5.2f} 1/m    "
-                f"{delta:5.1f} deg   ({lat_g:.2f} g lateral)"
+                f"      {row['laps']:2d}    {row['radius_m']:5.2f} m   "
+                f"{row['curvature_1_m']:5.2f} 1/m    {row['delta_max_deg']:5.1f} deg   "
+                f"({row['lateral_g']:.2f} g lateral)"
             )
-        sim_curvature = math.tan(0.488) / 0.224
         self.log.info(
             f"  Sim for comparison: {sim_curvature:.2f} 1/m "
             f"(radius {1.0 / sim_curvature:.2f} m) at max_steer_rad=0.488, wheelbase 0.224 m"

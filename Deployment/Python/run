@@ -9,7 +9,8 @@
 # --log is passed by default so every run leaves a full record in
 # Deployment/Logs/run_<timestamp>/ (ToF frames, policy inputs/outputs, dashboard
 # numbers, console). It costs ~13 MB/s of card writes off the control path; pass
-# --no-log to turn it off.
+# --no-log to turn it off. The calibration tests turn it back on for themselves
+# unless --no-log is given, and add their own 300 Hz trace and results.
 set -euo pipefail
 
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"

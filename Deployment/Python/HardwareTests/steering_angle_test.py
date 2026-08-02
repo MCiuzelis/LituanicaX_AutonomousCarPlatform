@@ -8,9 +8,17 @@ line, and the line it can plan is bounded by tan(delta)/wheelbase.  Recovering t
 yaw rate from the depth-camera image flow in a logged run put the real car at
 1.1-1.7 1/m of curvature at steer = 1.0, against the sim's 2.37 1/m — a minimum
 turn radius 40-100 % larger than the one the policy learned to use.  That is
-consistent with SERVO_AMPLITUDE = 0.35 giving something near 21 deg rather than 28.
+and the obvious suspect was SERVO_AMPLITUDE = 0.35 not reaching 28 deg.
 
-An image-flow estimate is an estimate.  This script replaces it with a protractor.
+An image-flow estimate is an estimate.  This script replaced it with a protractor, and
+the protractor said the suspect was innocent (2026-08-02):
+
+    200 us -> 16.0 deg    250 us -> 18.4 deg    300 us -> 23.5 deg    350 us -> 29.0 deg
+
+A full-lock command at SERVO_AMPLITUDE = 0.35 is 350 us, so delta_max is 28-29 deg — the
+geometry was right all along.  The car only PULLS 1.1-1.7 1/m out of a kinematic 2.90,
+which makes the gap tyre slip, not linkage.  Re-run this after any change to the servo
+horn, the linkage, or SERVO_AMPLITUDE; use the skid pad for the grip half of the story.
 
 It drives the servo through the EXACT mapping `Drive._set_throttle`'s sibling
 `Drive._steering_pulse_ns` uses — same SERVO_DIRECTION, SERVO_AMPLITUDE,

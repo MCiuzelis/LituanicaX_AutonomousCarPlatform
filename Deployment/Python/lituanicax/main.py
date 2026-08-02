@@ -4,6 +4,10 @@
     python -m lituanicax.main --disable-tof --disable-policy # bench test
     python -m lituanicax.main --disable policy --enable acceleration_test
     python -m lituanicax.main --log                          # record the run
+
+A calibration test (`acceleration_test`, `skid_pad_test`) turns the recorder on
+by itself, so its numbers always land in `Deployment/Logs/run_<timestamp>/`
+whether or not `--log` was passed.
 """
 
 from __future__ import annotations
@@ -67,12 +71,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Record the whole run to Deployment/Logs/run_<timestamp>/: full ToF "
         "frames, policy observations and actions, and every dashboard number, "
-        "all keyed on one monotonic clock. Same as --enable recorder.",
+        "all keyed on one monotonic clock. Same as --enable recorder. Implied by "
+        "the calibration tests.",
     )
     parser.add_argument(
         "--no-log",
         action="store_true",
-        help="Cancel --log (the run script passes --log, so this turns it back off).",
+        help="Cancel --log (the run script and the calibration tests turn it on, "
+        "so this turns it back off).",
     )
     parser.add_argument("--log-dir", default=None, help="Write the run into this directory instead")
     parser.add_argument(
@@ -99,17 +105,23 @@ def settings_from_args(args: argparse.Namespace) -> RobotSettings:
         settings.skid_pad_test = True
     if args.enable_screenshot:
         settings.screenshot_grabber = True
-    # --no-log wins, so `run` can pass --log unconditionally and still be
-    # overridden on the command line: `Deployment/Python/run --no-log`.
-    if args.log and not args.no_log:
-        settings.recorder = True
-    if args.no_log:
-        settings.recorder = False
 
     for name in args.disable:
         setattr(settings, name, False)
     for name in args.enable:
         setattr(settings, name, True)
+
+    # A calibration test exists to produce numbers, and a number nobody can go
+    # back and check is worth very little — so enabling one turns the recorder
+    # on exactly the way --log does, however the module was switched on.
+    # --no-log (and an explicit `--disable recorder`) still wins, so `run` can
+    # pass --log unconditionally and stay overridable on the command line:
+    # `Deployment/Python/run --no-log`.
+    log_off = args.no_log or "recorder" in args.disable
+    if (args.log or settings.acceleration_test or settings.skid_pad_test) and not log_off:
+        settings.recorder = True
+    if log_off:
+        settings.recorder = False
 
     if args.host is not None:
         settings.host = args.host

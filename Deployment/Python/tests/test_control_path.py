@@ -15,6 +15,9 @@ the track:
 Runs off-hardware on the stubs; unlike test_stack.py it needs neither
 onnxruntime nor Python 3.13's SharedMemory(track=), so it runs anywhere.
 """
+import json
+import math
+import shutil
 import sys
 import threading
 import time
@@ -47,7 +50,7 @@ drive_mod.Drive._pinctrl_set = staticmethod(lambda *a: None)
 from lituanicax import config  # noqa: E402
 from lituanicax.modules.drive import Drive  # noqa: E402
 from lituanicax.modules.policy_runner import PolicyRunner  # noqa: E402
-from lituanicax.modules.skid_pad_test import SkidPadTest  # noqa: E402
+from lituanicax.modules.skid_pad_test import REAL_WHEELBASE_M, SkidPadTest  # noqa: E402
 from lituanicax.robot import Robot, RobotSettings  # noqa: E402
 
 failures = []
@@ -219,10 +222,14 @@ SkidPadTest.SETTLE_S = 0.4
 SkidPadTest.MEASURE_S = 0.6
 SkidPadTest.BRAKE_TIMEOUT_S = 1.0
 
+RUN_DIR = TESTS_DIR / "skidrun"
+shutil.rmtree(RUN_DIR, ignore_errors=True)
+
 robot = Robot(RobotSettings(tof_cameras=False, policy=False, dashboard=False,
-                            skid_pad_test=True))
+                            skid_pad_test=True, recorder=True, log_dir=str(RUN_DIR)))
 check("skid pad module wiring",
-      [m.name for m in robot.modules] == ["encoder", "monitoring", "drive", "skid_pad_test"],
+      [m.name for m in robot.modules] == ["recorder", "encoder", "monitoring", "drive",
+                                          "skid_pad_test"],
       str([m.name for m in robot.modules]))
 robot.start()
 
@@ -241,6 +248,67 @@ check("skid pad held full steer", max(steers, default=0) >= SkidPadTest.STEER - 
       f"peak steer={max(steers, default=0):.2f}")
 check("skid pad released autopilot", not robot.autopilot_enabled)
 robot.stop()
+
+# --- 6. the run is measured, not just watched -----------------------------
+# The whole point of a skid pad run is a number, and the number is useless if
+# the trace behind it is gone. Enabling the test enables the recorder (in
+# `main.settings_from_args`), and these are the files that have to survive.
+rows = [json.loads(line) for line in (RUN_DIR / "test.jsonl").read_text().splitlines()]
+events = [json.loads(line) for line in (RUN_DIR / "events.jsonl").read_text().splitlines()]
+meta = json.loads((RUN_DIR / "meta.json").read_text())
+telemetry = [json.loads(line)
+             for line in (RUN_DIR / "telemetry.jsonl").read_text().splitlines()]
+
+logged_states = {row["test_state"] for row in rows}
+check("test.jsonl covers every phase",
+      {"SETTLING", "MEASURING", "BRAKING", "DONE"} <= logged_states, str(sorted(logged_states)))
+measuring = [row for row in rows if row["test_state"] == "MEASURING"]
+check("test.jsonl runs at the test's own rate, not the telemetry rate",
+      len(measuring) > 0.5 * SkidPadTest.MEASURE_S * SkidPadTest.TICK_HZ,
+      f"{len(measuring)} rows over a {SkidPadTest.MEASURE_S}s window at "
+      f"{SkidPadTest.TICK_HZ} Hz")
+check("test rows carry the command and what the encoder read",
+      all({"test_throttle_cmd", "test_steer_cmd", "test_velocity", "test_distance", "t"}
+          <= set(row) for row in rows)
+      and all(row["test_steer_cmd"] == SkidPadTest.STEER for row in measuring),
+      str(sorted(measuring[0])) if measuring else "no rows")
+check("test rows are monotonic in the run's one clock",
+      all(b["t"] >= a["t"] for a, b in zip(rows, rows[1:]))
+      and rows[0]["t"] >= meta["started_mono"])
+
+kinds = [event["event"] for event in events]
+check("every phase change is an event, in order",
+      [kind for kind in kinds if kind in ("started", "settled", "measured", "finished")]
+      == ["started", "settled", "measured", "finished"], str(kinds))
+result = events[-1]
+check("the result is in the log, not only the console",
+      result["event"] == "finished" and not result["aborted"]
+      and result["measured_distance"] > 0
+      and abs(result["measure_duration"] - SkidPadTest.MEASURE_S) < 0.05
+      and {"mean_velocity", "peak_velocity", "total_distance", "lap_candidates"} <= set(result),
+      f"{result['measured_distance']:.2f} m over {result['measure_duration']:.2f} s")
+
+# The stub's 0.6 s window covers 0.17 m, which has no plausible lap count at all
+# (every radius is under the 0.15 m floor) — so check the table on a real one.
+candidates = robot.skid_pad_test._lap_table(measured_distance=12.0, mean_velocity=1.9)
+check("lap table inverts distance into the number the sim is matched against",
+      candidates and all(
+          abs(row["radius_m"] * 2 * math.pi * row["laps"] - 12.0) < 1e-9
+          and abs(row["radius_m"] * row["curvature_1_m"] - 1.0) < 1e-9
+          and abs(math.tan(math.radians(row["delta_max_deg"]))
+                  - row["curvature_1_m"] * REAL_WHEELBASE_M) < 1e-9
+          for row in candidates),
+      f"{len(candidates)} lap counts, radii "
+      f"{[round(row['radius_m'], 2) for row in candidates]}")
+check("meta records the constants the run was swept at",
+      meta["tests"]["skid_pad_test"]["throttle"] == SkidPadTest.THROTTLE
+      and meta["tests"]["skid_pad_test"]["steer"] == SkidPadTest.STEER,
+      str(meta["tests"]))
+check("telemetry rows carry the phase next to battery and current",
+      any(row.get("test_state") == "MEASURING" and "battery_v" in row and "current_a" in row
+          for row in telemetry),
+      str(sorted({row.get("test_state") for row in telemetry})))
+shutil.rmtree(RUN_DIR, ignore_errors=True)
 
 print()
 print("FAILURES:", failures if failures else "none")

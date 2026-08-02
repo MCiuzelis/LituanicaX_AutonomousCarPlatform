@@ -48,7 +48,7 @@ Deployment/Python/run --disable dashboard --port 9090
 | `--enable/--disable screenshot_grabber` | `--enable-screenshot` | off |
 | `--enable/--disable acceleration_test` | `--enable-accel-test` | off |
 | `--enable/--disable skid_pad_test` | `--enable-skid-test` | off |
-| `--enable/--disable recorder` | `--log` / `--no-log` | on via `run` |
+| `--enable/--disable recorder` | `--log` / `--no-log` | on via `run`, and via either test |
 
 In code it is the same thing:
 
@@ -60,7 +60,8 @@ Robot(RobotSettings(policy=False, acceleration_test=True)).run()
 
 The calibration tests take over the drive, so disable the policy when you run one
 (`--disable-policy --enable-accel-test`); `Robot` warns if more than one thing
-that commands the drive is enabled.
+that commands the drive is enabled. Enabling either test also turns the recorder
+on, `--log` or not — see [Logging a run](#logging-a-run---log).
 
 ## Matching the car to the sim
 
@@ -92,6 +93,26 @@ that grows with speed is the understeer gradient, and it separates a steering-
 geometry mismatch (radius too big but constant) from a grip mismatch (radius
 growing), which are two very different edits to `env.py`.
 
+Every run of either test is recorded whether or not you asked for it. A run you
+have to repeat because the numbers only reached the terminal costs a battery
+charge and a clear floor, so `--enable-accel-test` and `--enable-skid-test` imply
+`--log` (`--no-log` still overrides). On top of the usual files each run gets:
+
+| File | Holds |
+|------|-------|
+| `test.jsonl` | one row per test tick — **300 Hz**, the rate the encoder itself samples at, so a braking event is ~1200 samples and not the ~120 `telemetry.jsonl` would give it. `test_state`, `test_velocity`, `test_distance`, and the throttle/steer the test asked for next to what `Drive` did with it |
+| `events.jsonl` | every phase change and the final result as numbers, not console text — including the whole lap-count table for the skid pad |
+| `meta.json["tests"]` | the hardcoded constants the run was made with, which is what makes a `THROTTLE` sweep comparable after the fact |
+
+`telemetry.jsonl` carries the same `test_*` fields at 30 Hz next to battery,
+current, CPU and drive state, so "was the current limiter engaged during the
+window I am measuring" is one file away.
+
+```python
+result = next(e for e in events if e["event"] == "finished")   # events.jsonl
+brake  = [r for r in rows if r["test_state"] == "BRAKING"]     # test.jsonl
+```
+
 ## Throttle and brake scaling
 
 `MAX_THROTTLE` and `BRAKE_MAGNITUDE` sit on opposite sides of zero and must never
@@ -119,8 +140,9 @@ is the only protection — a real backstop that never engaged in that run (peak
 
 ## Logging a run (`--log`)
 
-`run` passes `--log` by default, so every run leaves a complete record in
-`Deployment/Logs/run_<timestamp>/` — full ToF frames, the exact observation
+`run` passes `--log` by default — and either calibration test turns it on by
+itself — so every run leaves a complete record in
+`Deployment/Logs/run_<timestamp>/`: full ToF frames, the exact observation
 vectors handed to ONNX, the actions that came back, what the drive did with
 them, and every number the dashboard shows. `run --no-log` turns it off;
 `--log-dir DIR` and `--log-max-mb N` (default 2048, also clamped to 80 % of the
@@ -132,6 +154,8 @@ free space) change where it goes and how much it may write.
 | `policy.jsonl` | policy tick | `step`, `t`, `<side>_image_index`, `obs_index`, `action_*`, `drive_*`, `infer_ms` |
 | `telemetry.jsonl` | telemetry tick | battery/current/CPU/encoder/drive state, plus `dash_*` — the websocket payload verbatim |
 | `frames.jsonl` | stored ToF frame | `index`, `side`, `frame_id`, `t` (capture time) |
+| `test.jsonl` | calibration-test tick (300 Hz) | `test_state`, `test_velocity`, `test_distance`, `test_throttle_cmd`, `test_steer_cmd` — only when a test ran |
+| `events.jsonl` | test phase change / result | `event`, `test`, and the numbers that phase produced — only when a test ran |
 | `obs.bin` | policy tick | float32 `[n, 4331]` |
 | `tof_<side>_depth.bin` / `_conf.bin` | stored frame | float32 / uint8 `[n, 180, 240]` |
 | `console.log` | log line | `[LEVEL] [t_wall] [t] [module]: message`, subprocesses included |
@@ -192,10 +216,10 @@ Deployment/Logs/run_<timestamp>/   # written by --log, git-ignored
 | `Encoder` | `encoder_node` | 300 Hz | AS5600 over I²C | velocity, distance |
 | `Monitoring` | `monitoring_node` | 30 Hz | SPI ADC, `/proc` | battery, current, CPU, fault flags |
 | `Dashboard` | `dashboard_node` | 15 Hz | whole robot | HTTP/WebSocket/MJPEG on :8080 |
-| `AccelerationTest` | `acceleration_test_node` | 300 Hz | monitoring | `Drive.command()` |
-| `SkidPadTest` | — (new) | 300 Hz | monitoring | `Drive.command()` |
+| `AccelerationTest` | `acceleration_test_node` | 300 Hz | monitoring | `Drive.command()`, `test.jsonl` + `events.jsonl` |
+| `SkidPadTest` | — (new) | 300 Hz | monitoring | `Drive.command()`, `test.jsonl` + `events.jsonl` |
 | `ScreenshotGrabber` | `screenshot_grabber` | 1 Hz | both cameras | PNGs in `Deployment/Screenshots` |
-| `Recorder` | — (new) | 30 Hz + policy ticks | whole robot | a run directory in `Deployment/Logs` |
+| `Recorder` | — (new) | 30 Hz + policy and test ticks | whole robot | a run directory in `Deployment/Logs` |
 
 ### Why the policy tick is frame-driven
 
@@ -282,12 +306,13 @@ server) override `run()` instead of `update()`.
 
 `tests/` runs the whole stack with stubbed GPIO, SPI, I²C and Arducam SDK, so it
 works on a laptop. It exercises real ONNX inference, the dashboard, the safety
-gate and the acceleration test.
+gate, and both calibration tests down to the run directory each one leaves.
 
 ```bash
 cd Deployment/Python/tests
 python test_stack.py                              # full stack, 20 checks
-FAKE_ENCODER_STOP_AFTER=3 python test_modules.py  # module switches, 14 checks
+FAKE_ENCODER_STOP_AFTER=3 python test_modules.py  # module switches, 19 checks
+python test_control_path.py                       # duty path + skid pad, 31 checks
 python test_logging.py                            # --log run directory, 27 checks
 ```
 

@@ -47,13 +47,12 @@ Actuation (Ackermann / AWD, effort-controlled DC motor):
       throttle and zero speed, scaling down linearly with duty.  Braking is an
       independent, throttle-graded reverse torque.  Wheel slip occurs naturally when the
       commanded torque exceeds the PhysX contact-friction limit (μ·N).
-    - Front wheel steer receives position target = tan(steer · max_steer_rad).
-      NOTE: front_*_wheel_steer are plain PhysicsRevoluteJoints, so Isaac Lab reads that
-      target as RADIANS — the tan() is an extra nonlinearity, not a joint convention, and
-      the docstring here used to claim otherwise.  It is kept only because max_steer_rad
-      is calibrated around it (see the steering block below); at the current 0.256 rad it
-      costs 2 %, but at the old 0.488 it silently applied 30.4° where the comments all
-      said 28°.  If you ever drop the tan(), set max_steer_rad = 0.262 to compensate.
+    - Front wheel steer receives position target (rad) = steer · max_steer_rad.
+      This was tan(steer · max_steer_rad) until 2026-08-02, described as matching a
+      "tan-convention" in mushr_nano_v2.usd — but the steer joints are plain
+      PhysicsRevoluteJoints fed the same value on both sides (parallel steering, no
+      Ackermann linkage), so Isaac Lab applied that tangent as an angle and the sim
+      steered 30.4° while every comment said 28°.
     - No rise-rate ramp is modelled here on purpose: the car's
       THROTTLE_SLEW_UP_PER_SEC limiter is being made switchable on the deployment side
       (config.THROTTLE_SLEW_ENABLED) so that the commanded duty reaches the motor
@@ -489,29 +488,29 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     #               74 mm diameter, which scaled the wheelbase along with them: 296.5 mm ×
     #               0.755 = 224 mm.  The real car's wheelbase is 187 mm.  wheelbase_m below
     #               re-spaces the axles at load time (see _apply_wheelbase).
-    #   max_steer   Measured on the real car (2026-08-02 run, yaw rate recovered from
-    #               depth-image optical flow, fitted as κ = k·steer): κ at steer=1.0 is
-    #               1.1–1.7 1/m, i.e. a minimum turn radius of 0.6–0.9 m.  The sim was
-    #               pulling 2.4–2.6 1/m (R ≈ 0.4 m) — it could draw a line the real car
-    #               physically cannot follow, which is the single biggest reason the policy
-    #               understeers into cones on the track.
+    #   max_steer   MEASURED WITH A PROTRACTOR (2026-08-02, HardwareTests/steering_angle_test
+    #               with the wheels off the ground).  Pulse offset → road-wheel angle:
+    #                   200 µs → 16.0°   250 µs → 18.4°   300 µs → 23.5°   350 µs → 29.0°
+    #               At the deployed SERVO_AMPLITUDE = 0.35 a full-lock command is 350 µs, so
+    #               δ_max ≈ 28–29°.  The linkage is very close to linear in between (a linear
+    #               steer→angle map is within ~2° everywhere, which is protractor noise), so
+    #               the sim's linear mapping needs no correction curve.
     #
-    # Taking the mid-estimate κ = 1.4 1/m at L = 0.187 m:  δ = atan(1.4 × 0.187) = 0.256 rad
-    # = 14.7°.  Note _pre_physics_step drives the steer joints with tan(steer·max_steer_rad)
-    # — an extra nonlinearity, NOT a joint convention: front_*_wheel_steer are plain
-    # PhysicsRevoluteJoints and Isaac Lab reads the target as radians — so the applied angle
-    # is
-    # tan(0.256) = 0.262 rad = 15.0° and the realised κ = tan(0.262)/0.187 = 1.43 1/m.  At
-    # angles this small the tan-convention only shifts things by 2 %; it mattered at the old
-    # 0.488 rad, where it silently turned "28°" into 30.4°.
+    # δ_max = 28.5° = 0.497 rad at L = 0.187 m gives a KINEMATIC κ of 2.90 1/m (R = 0.34 m).
     #
-    # ⚠  UPDATE THIS from the real measurement.  Deployment/Python now ships a
-    #    steering_angle_test that parks the wheels at steer = ±1: measure the road-wheel
-    #    angle with a protractor and set max_steer_rad = atan(tan(δ_measured)) ≈ δ_measured
-    #    (in radians).  If the servo throw is raised (SERVO_AMPLITUDE), raise this to match
-    #    and retrain — do not leave the two out of step.
+    # ⚠  Do NOT tune this down to match the curvature the car is observed to pull on track.
+    #    Optical flow on the logged run put the ACHIEVED κ at only 1.1–1.7 1/m — 38–59 % of
+    #    kinematic — but that is understeer, not geometry: the front tyres are sliding.  (It
+    #    is also a lower bound: the policy swings the steering at several Hz and the yaw
+    #    response is low-passed by the 100 ms actuation lag, so a regression of instantaneous
+    #    yaw on the command under-reads the steady-state gain.)  The distinction matters
+    #    because the two have opposite speed dependence — understeer grows with v²/R while a
+    #    steering-angle cap does not — so capping the angle would make the sim unable to turn
+    #    at parking speed, where the real car pulls very nearly its full kinematic radius.
+    #    The tyre/friction model above is what reproduces the sliding; this number is pure
+    #    geometry.  Tune ground_*_friction against the skid-pad measurement, not this.
     wheelbase_m: float = 0.187  # real car, measured.  0.0 → leave the USD spacing alone
-    max_steer_rad: float = 0.256  # ≈15° max front-wheel steer angle → κ ≈ 1.43 1/m
+    max_steer_rad: float = 0.497  # 28.5° measured at SERVO_AMPLITUDE 0.35 → kinematic κ 2.90 1/m
 
     # Action latency simulation — all actuator commands are delayed by this many
     # milliseconds before reaching the wheels/steering.  At 30 Hz each step ≈ 33 ms,
@@ -992,7 +991,7 @@ class ConeTrackEnv(DirectRLEnv):
         )
 
         # Ackermann command buffers
-        self._steer_tan = torch.zeros(self.num_envs, device=self.device)
+        self._steer_angle = torch.zeros(self.num_envs, device=self.device)
 
         # Precomputed tensor of all 4 driven wheel joint indices [rear_L, rear_R, front_L, front_R]
         self._all_throttle_ids: Any = torch.tensor(
@@ -1069,11 +1068,12 @@ class ConeTrackEnv(DirectRLEnv):
             f"(real car: 5.95·duty, from real_car_acceleration_log.txt)"
         )
 
-        # Steering: report the CURVATURE, since that is what the vehicle actually does and
-        # it is the quantity that was measured on the real car (κ = 1.1–1.7 1/m at
-        # steer=1.0, i.e. R = 0.6–0.9 m).  _pre_physics_step applies tan(steer·max_steer)
-        # to the joints, so the realised angle is tan(max_steer_rad) and κ = tan(that)/L.
-        _applied_steer = math.tan(cfg.max_steer_rad)
+        # Steering: report the KINEMATIC CURVATURE, since κ = tan(δ)/L is what the vehicle
+        # actually does and neither δ nor L means anything without the other.  Compare
+        # against the real car's 2.90 1/m kinematic (28.5° protractor-measured at L=187 mm).
+        # The curvature the car PULLS on track is lower — 1.1–1.7 1/m by optical flow — but
+        # that gap is tyre slip and belongs to ground_*_friction, not here.
+        _applied_steer = cfg.max_steer_rad
         _wheelbase = cfg.wheelbase_m if cfg.wheelbase_m > 0.0 else NATIVE_WHEELBASE_M
         _kappa = math.tan(_applied_steer) / _wheelbase
         print(
@@ -1778,9 +1778,16 @@ class ConeTrackEnv(DirectRLEnv):
         )
 
         # Steering: direct passthrough, no LPF (matches real hardware — no filter on servo)
+        #
+        # The joint target is the road-wheel angle in RADIANS.  This used to be
+        # tan(steer·max_steer_rad), justified in the comments as "the tan-convention of
+        # mushr_nano_v2.usd" — but front_*_wheel_steer are plain PhysicsRevoluteJoints and
+        # both get the same value (parallel steering, not an Ackermann linkage), so Isaac
+        # Lab applied that tangent as an angle.  At max_steer_rad = 0.488 that quietly
+        # steered 30.4° where every comment in this file said 28°.  The tan() is gone and
+        # max_steer_rad now means exactly what it says.
         self._filtered_steer = delayed[:, 1]
-        steer_ang = self._filtered_steer * self.cfg.max_steer_rad
-        self._steer_tan = torch.tan(steer_ang)
+        self._steer_angle = self._filtered_steer * self.cfg.max_steer_rad
 
         # Track the last two RAW (undelayed) steering/throttle commands for rate penalties.
         self._steer_cmd_prev = self._steer_cmd_curr
@@ -1892,7 +1899,7 @@ class ConeTrackEnv(DirectRLEnv):
             wheel_torque, joint_ids=self._all_throttle_ids
         )
 
-        steer_positions = self._steer_tan.unsqueeze(-1).expand(-1, 2).clone()
+        steer_positions = self._steer_angle.unsqueeze(-1).expand(-1, 2).clone()
         steer_positions[wall_mask] = 0.0
         self.robot.set_joint_position_target(steer_positions, joint_ids=self._steer_ids)
 

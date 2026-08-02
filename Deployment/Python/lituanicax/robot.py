@@ -229,6 +229,16 @@ class Robot:
                 f"{' and '.join(drivers)} are all enabled — they will fight over the drive"
             )
 
+        # `main.py` turns the recorder on with either test, so this only fires for
+        # a Robot built in code. Worth saying out loud: the test prints its result
+        # once and then the run is over.
+        tests = [name for name in ("acceleration_test", "skid_pad_test") if getattr(settings, name)]
+        if tests and not settings.recorder:
+            self.log.warning(
+                f"{' and '.join(tests)} running without the recorder — nothing but the "
+                "console output will survive this run (set RobotSettings.recorder=True)"
+            )
+
     # --- autopilot gate (the old /autopilot/enabled topic) ---
 
     def set_autopilot_enabled(self, enabled: bool) -> None:

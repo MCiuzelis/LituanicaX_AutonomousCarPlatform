@@ -1,4 +1,6 @@
 """Tests the module switches and the acceleration test state machine."""
+import json
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -93,12 +95,28 @@ AccelerationTest.STARTUP_DELAY_S = 0.5
 AccelerationTest.ACCEL_TIMEOUT_S = 1.5
 AccelerationTest.TARGET_VELOCITY_M_S = 45
 
+# The test brings the recorder with it: a calibration run whose numbers only
+# reach the console is a run that has to be repeated. `test_logging.py` checks
+# what it writes; here it only has to be present and out of the way.
+RUN_DIR = TESTS_DIR / "accelrun"
+shutil.rmtree(RUN_DIR, ignore_errors=True)
+
+check("accel test implies --log",
+      settings_from_args(parse_args(["--enable-accel-test"])).recorder)
+check("skid test implies --log",
+      settings_from_args(parse_args(["--enable", "skid_pad_test"])).recorder)
+check("--no-log still wins over an implied one",
+      not settings_from_args(parse_args(["--enable-skid-test", "--no-log"])).recorder)
+check("--disable recorder still wins over an implied one",
+      not settings_from_args(parse_args(["--enable-skid-test",
+                                         "--disable", "recorder"])).recorder)
+
 s = settings_from_args(parse_args(
     ["--disable", "tof_cameras", "--disable", "dashboard", "--disable-policy",
-     "--enable-accel-test"]))
+     "--enable-accel-test", "--log-dir", str(RUN_DIR)]))
 robot = Robot(s)
 check("accel test config", [m.name for m in robot.modules] ==
-      ["encoder", "monitoring", "drive", "acceleration_test"],
+      ["recorder", "encoder", "monitoring", "drive", "acceleration_test"],
       str([m.name for m in robot.modules]))
 robot.start()
 
@@ -118,6 +136,15 @@ check("accel throttle applied", max(throttles, default=0) > 0.4,
       f"peak throttle={max(throttles, default=0):.2f}")
 check("accel test disabled autopilot at end", not robot.autopilot_enabled)
 robot.stop()
+
+result = next(
+    (json.loads(line) for line in (RUN_DIR / "events.jsonl").read_text().splitlines()
+     if json.loads(line)["event"] == "finished"), None)
+check("accel result recorded, not just printed",
+      result is not None and not result["aborted"] and result["accel_distance"] > 0
+      and result["total_distance"] >= result["accel_distance"],
+      str(result))
+shutil.rmtree(RUN_DIR, ignore_errors=True)
 
 print()
 print("FAILURES:", failures if failures else "none")
