@@ -3,7 +3,7 @@ outputs/
 # any stray tool logs (Training/logs/ was the pre-outputs/ location)
 logs/
 # `Deployment/Python/run --log` run directories: full ToF frames, GB per run
-# Deployment/Logs/
+Deployment/Python/Logs/
 Training/.venv/
 Deployment/.venv/
 Deployment/Ros2/log/
