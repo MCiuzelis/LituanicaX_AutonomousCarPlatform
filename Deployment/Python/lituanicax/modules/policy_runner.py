@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -29,6 +30,18 @@ from .tof_camera import (
 
 MAX_WHEEL_VELOCITY_M_S = 6.7
 WHEEL_VELOCITY_LPF_ALPHA = 0.1
+
+#: How long to wait for both cameras before ticking anyway, as a multiple of the
+#: nominal policy period.  The fallback exists so a dead or stalled camera cannot
+#: wedge the loop: the tick still runs, `update()` takes its "no fresh frame"
+#: branch and commands zero, and the drive watchdog keeps being fed.
+FRAME_WAIT_TIMEOUT_PERIODS = 1.5
+#: Never start a tick sooner than this fraction of the nominal period after the
+#: last one.  The ToF sensors are hardware-locked near 30 fps so this should
+#: never bite, but the policy was trained at 30 Hz *with an action history* —
+#: running the loop faster would quietly shorten the temporal context the network
+#: reads, which is a behavioural change, not a speed-up.
+MIN_TICK_INTERVAL_PERIODS = 0.8
 
 
 @contextmanager
@@ -74,12 +87,20 @@ class PolicyRunner(Module):
         camera_timeout_sec: float = 0.5,
         onnx_threads: int = 1,
         recorder=None,
+        frame_signal: threading.Event | None = None,
     ) -> None:
         super().__init__("policy_runner", rate_hz)
 
         self.left_camera = left_camera
         self.right_camera = right_camera
         self.drive = drive
+        #: Shared with both cameras: set whenever either delivers a depth frame.
+        #: When present, `run()` ticks on frame arrival instead of on a timer.
+        #: None restores the plain fixed-rate `Module.run()` loop.
+        self.frame_signal = frame_signal
+        #: Frame counter of the newest frame each camera had at the last tick, so
+        #: the loop can tell "a new frame arrived" from "the event was left set".
+        self._consumed_frames = {"left": -1, "right": -1}
         #: Optional Recorder (`--log`). Every tick is handed to it whole, so the
         #: images, the observation and the resulting command stay one record.
         self.recorder = recorder
@@ -139,6 +160,92 @@ class PolicyRunner(Module):
             self.wheel_vel_norm = 0.0
             self._wheel_vel_filtered = 0.0
 
+    def run(self) -> None:
+        """Tick when the cameras have both delivered, not when a timer says so.
+
+        The free-running 30 Hz timer this replaces was measurably costing the
+        control loop: with the two sensors free-running near 29.33 Hz and the
+        loop at 30 Hz, the frames the policy read were on average 23.2 ms (left)
+        and 14.3 ms (right) old at inference time — both very steady (std
+        1.4 ms), i.e. the loop had settled into a fixed, arbitrary phase against
+        the sensors and was simply reading late.  Waiting for the SECOND of the
+        two arrivals instead puts inference right behind the newer frame and
+        leaves the older one only the inter-sensor skew (~9 ms) stale, cutting
+        the mean age from ~18.8 ms to ~4.5 ms.  That is ~14 ms off a loop whose
+        measured command-to-yaw latency is 100 ms against the 33 ms the policy
+        was trained with.
+
+        Falls back to `Module.run()`'s fixed-rate loop when there is no signal to
+        wait on (no cameras, or constructed without `frame_signal`).
+        """
+        if self.frame_signal is None or self.left_camera is None or self.right_camera is None:
+            super().run()
+            return
+
+        period = 1.0 / self.rate_hz
+        timeout = FRAME_WAIT_TIMEOUT_PERIODS * period
+        min_interval = MIN_TICK_INTERVAL_PERIODS * period
+        last_tick = 0.0
+
+        while not self.stopping:
+            self._wait_for_frames(timeout)
+            if self.stopping:
+                break
+
+            since_last = time.monotonic() - last_tick
+            if since_last < min_interval:
+                self.sleep(min_interval - since_last)
+                if self.stopping:
+                    break
+            last_tick = time.monotonic()
+
+            self._mark_frames_consumed()
+            try:
+                self.update()
+            except Exception as exc:
+                self.log.error(f"update() failed: {exc}", exc_info=True)
+
+    def _wait_for_frames(self, timeout: float) -> None:
+        """Block until both cameras hold a frame newer than the last tick's.
+
+        Returns early on timeout so a stalled camera degrades the loop to a timed
+        tick rather than stopping it.  The event is cleared BEFORE the condition
+        is tested: a frame landing in the gap between the test and the wait
+        leaves the event set, so `wait()` returns immediately instead of missing
+        the wakeup.
+        """
+        deadline = time.monotonic() + timeout
+        while not self.stopping:
+            self.frame_signal.clear()
+            if self._both_cameras_advanced():
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return
+            self.frame_signal.wait(remaining)
+
+    def _both_cameras_advanced(self) -> bool:
+        """True once every camera holds a frame newer than the last tick's.
+
+        Deliberately free of side effects: the counters are only advanced by
+        `_mark_frames_consumed()` at tick time.  Marking a camera as seen the
+        moment it delivers would make it compare equal on the next pass through
+        the wait loop, and the condition could then never be satisfied by two
+        sensors that arrive at different times — which is the entire case this
+        exists to handle.
+        """
+        for side, camera in (("left", self.left_camera), ("right", self.right_camera)):
+            if camera is None:
+                continue
+            if camera.frame_count == self._consumed_frames[side]:
+                return False
+        return True
+
+    def _mark_frames_consumed(self) -> None:
+        for side, camera in (("left", self.left_camera), ("right", self.right_camera)):
+            if camera is not None:
+                self._consumed_frames[side] = camera.frame_count
+
     def update_wheel_velocity(self, linear_velocity: float) -> None:
         """Called by the encoder for every sample it takes (see Encoder.on_sample)."""
         raw = max(0.0, min(1.0, linear_velocity / MAX_WHEEL_VELOCITY_M_S))
@@ -182,6 +289,10 @@ class PolicyRunner(Module):
         infer_ms = (time.monotonic() - inference_start) * 1000.0
         throttle_raw = float(action[0])
         steer = float(action[1])
+        # The one and only place the brake is scaled. BRAKE_MAGNITUDE mirrors the
+        # sim's brake_throttle_scale, so this line reproduces the actuator model
+        # the policy was trained against; `Drive` now leaves the negative side
+        # alone rather than scaling it a second time by MAX_THROTTLE.
         throttle_motor = throttle_raw if throttle_raw >= 0 else throttle_raw * BRAKE_MAGNITUDE
 
         # Push this tick's raw command onto the history FIFO, newest last — the sim

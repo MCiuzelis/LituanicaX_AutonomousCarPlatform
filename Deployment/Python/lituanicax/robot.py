@@ -30,6 +30,7 @@ from .modules.monitoring import Monitoring
 from .modules.policy_runner import PolicyRunner
 from .modules.recorder import DEFAULT_MAX_MB, Recorder
 from .modules.screenshot_grabber import ScreenshotGrabber
+from .modules.skid_pad_test import SkidPadTest
 from .modules.tof_camera import TofCamera
 
 #: Everything that can be switched on or off, in start-up order.
@@ -43,6 +44,7 @@ MODULE_NAMES = (
     "dashboard",
     "screenshot_grabber",
     "acceleration_test",
+    "skid_pad_test",
 )
 
 
@@ -60,6 +62,7 @@ class RobotSettings:
     dashboard: bool = True
     screenshot_grabber: bool = False
     acceleration_test: bool = False
+    skid_pad_test: bool = False
 
     # --- camera ---
     camera_sides: tuple = ("left", "right")
@@ -107,10 +110,15 @@ class Robot:
         self.dashboard: Dashboard | None = None
         self.screenshot_grabber: ScreenshotGrabber | None = None
         self.acceleration_test: AccelerationTest | None = None
+        self.skid_pad_test: SkidPadTest | None = None
 
         self.modules: List[Module] = []
         self._started: List[Module] = []
         self._shutdown_event = threading.Event()
+        #: Raised by whichever ToF camera has just published a depth frame, waited
+        #: on by PolicyRunner so inference runs on frame arrival rather than on a
+        #: timer that drifts into an arbitrary phase against the sensors.
+        self._frame_signal = threading.Event()
 
         self._build()
 
@@ -121,7 +129,11 @@ class Robot:
 
         if settings.tof_cameras:
             for side in settings.camera_sides:
-                self.cameras[side] = TofCamera(side=side, preview_hz=settings.preview_hz)
+                self.cameras[side] = TofCamera(
+                    side=side,
+                    preview_hz=settings.preview_hz,
+                    frame_event=self._frame_signal,
+                )
             self.modules.extend(self.cameras.values())
 
         if settings.recorder:
@@ -164,6 +176,9 @@ class Robot:
                 camera_timeout_sec=settings.camera_timeout_sec,
                 onnx_threads=settings.onnx_threads,
                 recorder=self.recorder,
+                # None when the cameras are off, which drops PolicyRunner back to
+                # its plain fixed-rate loop.
+                frame_signal=self._frame_signal if self.cameras else None,
             )
             self.modules.append(self.policy)
 
@@ -196,9 +211,22 @@ class Robot:
             )
             self.modules.append(self.acceleration_test)
 
-        if settings.acceleration_test and settings.policy:
+        if settings.skid_pad_test:
+            self.skid_pad_test = SkidPadTest(
+                robot=self, drive=self.drive, monitoring=self.monitoring
+            )
+            self.modules.append(self.skid_pad_test)
+
+        # Every one of these commands the drive directly and unconditionally, so
+        # any two of them running together means whichever wrote last wins.
+        drivers = [
+            name
+            for name in ("policy", "acceleration_test", "skid_pad_test")
+            if getattr(settings, name)
+        ]
+        if len(drivers) > 1:
             self.log.warning(
-                "Policy and acceleration test are both enabled — they will fight over the drive"
+                f"{' and '.join(drivers)} are all enabled — they will fight over the drive"
             )
 
     # --- autopilot gate (the old /autopilot/enabled topic) ---

@@ -31,6 +31,7 @@ from ..config import (
     MOTOR_PWM_FREQ,
     PIN_INA,
     PIN_INB,
+    SAFETY_BRAKE_MAGNITUDE,
     SERVO_AMPLITUDE,
     SERVO_CENTER_US,
     SERVO_DIRECTION,
@@ -41,6 +42,7 @@ from ..config import (
     SERVO_PWM_CHANNEL,
     SERVO_PWM_FREQ,
     TELEMETRY_HZ,
+    THROTTLE_SLEW_ENABLED,
     THROTTLE_SLEW_UP_PER_SEC,
 )
 from ..module import Module
@@ -206,8 +208,11 @@ class Drive(Module):
             self.enabled = bool(enabled)
             if not self.enabled:
                 # Brake request; _apply() turns it into a coast once stopped.
+                # Explicit magnitude: this used to be -1.0 leaning on
+                # MAX_THROTTLE to scale it down to a 0.4 duty, which stopped
+                # being true once MAX_THROTTLE became forward-only.
                 self._refresh_monitoring()
-                self._apply(-1.0, 0.0)
+                self._apply(-SAFETY_BRAKE_MAGNITUDE, 0.0)
 
     @property
     def safety_blocked(self) -> bool:
@@ -288,7 +293,17 @@ class Drive(Module):
 
     def _slew_limited(self, throttle: float, dt: float) -> float:
         """Rate-limit rising magnitude only; anything toward zero passes straight
-        through so braking and safety stops are never delayed."""
+        through so braking and safety stops are never delayed.
+
+        Disabled wholesale by THROTTLE_SLEW_ENABLED — see the note there on how
+        much of the policy's command the ramp was absorbing.  The ramp state is
+        still tracked when it is off, so flipping the flag at runtime cannot
+        make the limiter resume from a stale value.
+        """
+        if not THROTTLE_SLEW_ENABLED:
+            self._ramped_throttle = throttle
+            return throttle
+
         current = self._ramped_throttle
         toward_zero = throttle * current >= 0.0 and abs(throttle) <= abs(current)
         if toward_zero:
@@ -332,10 +347,23 @@ class Drive(Module):
         subprocess.run(["pinctrl", "set", str(pin), *args], check=True)
 
     def _set_throttle(self, value: float) -> None:
+        """Signed command in [-1, 1] -> H-bridge direction + PWM duty.
+
+        MAX_THROTTLE is a ceiling on FORWARD duty only.  Braking is already
+        scaled by BRAKE_MAGNITUDE in `PolicyRunner` (mirroring the sim's
+        `brake_throttle_scale`), so applying MAX_THROTTLE here as well used to
+        scale the brake twice: at MAX_THROTTLE = 0.4 the policy's hardest brake
+        came out as a 0.16 duty worth ~5.4 m/s^2, against the 12.9 m/s^2 the
+        policy learned to expect.  Anything that reaches this method already
+        carries its own magnitude — a calibration test's -0.5 means a 0.5 duty,
+        which is what the braking numbers in real_car_acceleration_log.txt were
+        measured at.
+        """
         if self.motor_pwm is None:
             return
         value = max(-1.0, min(1.0, value))
-        value *= max(0.0, min(1.0, MAX_THROTTLE))
+        if value > 0.0:
+            value *= max(0.0, min(1.0, MAX_THROTTLE))
         value *= MOTOR_DIRECTION
 
         GPIO.output(PIN_INA, GPIO.HIGH if value >= 0 else GPIO.LOW)

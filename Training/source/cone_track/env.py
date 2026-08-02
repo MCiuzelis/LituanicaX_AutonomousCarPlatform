@@ -29,8 +29,11 @@ Camera profile (ArduCam TOF sensor for Raspberry Pi):
     - Policy runs at 30 Hz, synced with camera (sim 120 Hz, decimation=4)
 
 Action space (2):
-    [0]  throttle command in [-1, 1] — forward-only (the car never reverses):
-           (0, 1]  → DRIVE  torque = drive_torque × (1 − ω/(throttle·ω_noload))  (DC curve)
+    [0]  throttle command in [-1, 1] — forward-only (the car never reverses).  It is a
+         PWM DUTY command, exactly what the deployed car writes to the motor driver:
+           (0, 1]  → DRIVE  torque = drive_torque × (throttle − ω/ω_noload_full)
+                     — a real brushed-DC torque-speed line: STALL TORQUE SCALES WITH
+                     DUTY, and the zero-torque speed is throttle × max_velocity_m_s.
             0      → COAST  (zero torque, free roll)
            [-1, 0) → BRAKE  torque = −(brake_torque_base + brake_torque_gain × level),
                      level = |throttle| × brake_throttle_scale (policy −1 = the slip
@@ -39,12 +42,22 @@ Action space (2):
     [1]  steering command in [-1, 1]  → scaled to [-max_steer_rad, +max_steer_rad]
 
 Actuation (Ackermann / AWD, effort-controlled DC motor):
-    - All 4 wheels receive a torque (Nm) via set_joint_effort_target.  Drive follows a
-      DC torque-speed curve (tops out at the no-load speed max_velocity_m_s); braking is
-      an independent, throttle-graded reverse torque.  Wheel slip occurs naturally when
-      the commanded torque exceeds the PhysX contact-friction limit (μ·N).
-    - Front wheel steer receives position target (rad) = tan(steering_angle)
-      (tan-convention matches the joint representation in mushr_nano_v2.usd)
+    - All 4 wheels receive a torque (Nm) via set_joint_effort_target.  Drive follows the
+      brushed-DC torque-speed line T = k(V_duty − k_e·ω): full drive_torque only at full
+      throttle and zero speed, scaling down linearly with duty.  Braking is an
+      independent, throttle-graded reverse torque.  Wheel slip occurs naturally when the
+      commanded torque exceeds the PhysX contact-friction limit (μ·N).
+    - Front wheel steer receives position target = tan(steer · max_steer_rad).
+      NOTE: front_*_wheel_steer are plain PhysicsRevoluteJoints, so Isaac Lab reads that
+      target as RADIANS — the tan() is an extra nonlinearity, not a joint convention, and
+      the docstring here used to claim otherwise.  It is kept only because max_steer_rad
+      is calibrated around it (see the steering block below); at the current 0.256 rad it
+      costs 2 %, but at the old 0.488 it silently applied 30.4° where the comments all
+      said 28°.  If you ever drop the tan(), set max_steer_rad = 0.262 to compensate.
+    - No rise-rate ramp is modelled here on purpose: the car's
+      THROTTLE_SLEW_UP_PER_SEC limiter is being made switchable on the deployment side
+      (config.THROTTLE_SLEW_ENABLED) so that the commanded duty reaches the motor
+      unshaped, which is what this model assumes.
 
 Why depth camera vs RGB cone mask:
     The depth camera gives the policy direct metric information about wall and obstacle
@@ -116,7 +129,18 @@ NUM_ASSET_SETS = len(ASSET_SET_USDS)
 # These match mushr_nano_v2.usd geometry and are NOT user-adjustable without
 # also modifying the robot USD.
 # ---------------------------------------------------------------------------
-WHEEL_RADIUS = 0.037  # m  (82 mm diameter wheels)
+WHEEL_RADIUS = 0.037  # m  (74 mm diameter wheels, after ROBOT_SCALE)
+
+# Uniform spawn scale applied to mushr_nano_v2.usd.  Chosen so the USD's 97.6 mm wheels
+# come out at the real car's 74 mm: 0.0488 m radius × 0.755 = 0.0368 m ≈ WHEEL_RADIUS.
+ROBOT_SCALE = 0.755
+
+# Axle spacing authored in the USD, before and after that scale.  The suspension joints
+# put the front axle at x = +0.1385 and the rear at x = −0.158 in base_link's frame.
+# Matching the wheels by scaling the whole robot necessarily scaled the wheelbase too,
+# which is why it lands at 224 mm against the real car's 187 mm — see cfg.wheelbase_m.
+USD_WHEELBASE_M = 0.1385 + 0.158  # 0.2965 m, unscaled
+NATIVE_WHEELBASE_M = USD_WHEELBASE_M * ROBOT_SCALE  # 0.2239 m as spawned
 
 TRACK_SCALE = 0.85
 
@@ -220,7 +244,67 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # TOF output.  Affected pixels are set to depth_max_m (treated as far/safe by the
     # policy, matching the real camera's low-confidence masking behaviour).
     # Visible as black dots in both windows of visualize.py.  Set to 0.0 to disable.
+    # NOTE: this is the small iid floor only.  The dropout that actually dominates the
+    # real sensor is structured, not iid — see the CONFIDENCE MODEL below.
     depth_invalid_pixel_prob: float = 0.006
+
+    # ── ToF CONFIDENCE MODEL — the dominant real-sensor effect ───────────────────────────
+    # [2026-08-02 sim2real fix]  Measured on the car: 79 % (left) / 69 % (right) of the
+    # pixels inside the policy crop band fail the deployment's CONF_THRESHOLD=30 and are
+    # forced to "far" by process_for_policy() in Deployment/.../modules/tof_camera.py.
+    # The sim was dropping 0.6 % iid + 0.5 % speckle.  The policy therefore trained on a
+    # dense depth image and is flown on a sparse one.
+    #
+    # The dropout is not random — it is signal-to-noise.  A ToF pixel returns usable phase
+    # only if the reflected power clears the noise floor, and that power goes as
+    #     P ∝ ρ · cos(incidence) / range²
+    # so the two things that kill a pixel are DISTANCE and GRAZING INCIDENCE.  Both are
+    # visible in the log:
+    #
+    #   • Range.  Confidence pass rate by measured distance inside the band (left/right):
+    #       0.0-0.3 m  4%/12%   0.3-0.6 m  27%/50%   0.6-0.9 m  38%/50%
+    #       0.9-1.2 m 35%/35%   1.2-1.5 m  34%/21%   1.5-1.8 m  12%/11%
+    #     (the 0-0.3 m bucket is not real geometry — it is the dropouts themselves, which
+    #     the sensor reports as 0 mm; 20 % of the band reads exactly 0.)  From 0.75 m out
+    #     the fall-off is clean inverse-square: 0.50 → 0.115 over a 2.2× range increase is
+    #     a factor 4.35 against the 4.84 that 1/r² predicts.
+    #   • Incidence.  The real floor simply vanishes past ~1 m: the camera sits 65 mm up
+    #     and sees the ground at 2-3°, so cos(incidence) ≈ 0.03 and nothing comes back.
+    #     The sim renders that same floor as a crisp depth ramp — its bottom crop row
+    #     averages 0.433 where the real ones average 0.145 (left) / 0.292 (right).  That
+    #     ramp is the strongest and most consistent feature in the sim image and it does
+    #     not exist on the car.
+    #
+    # Implementation (_apply_confidence_dropout): cos(incidence) is recovered from the
+    # image-space depth gradient — one pixel turns the view ray by 1/f_px rad, so for a
+    # locally planar surface tan(incidence) = |∇d| · f_px / d — and the pixel survives with
+    #     p = clamp(max_pass · min(1, gain · cos(inc)^exponent / d²), floor, max_pass)
+    # Survivors keep their depth; the rest are set to depth_max_m, exactly as the car does.
+    #
+    # TUNING.  Set depth_conf_report_every_n_steps > 0 and read the printout: it gives the
+    # invalid fraction over the band, the fraction among IN-RANGE pixels (the meaningful
+    # one — pixels already beyond depth_max_m read "far" either way), and the per-row
+    # profile to line up against the real ones quoted in the printout.  Raise
+    # depth_conf_gain_m2 to keep more pixels, lower it to keep fewer.
+    depth_conf_enable: bool = True
+    # Fitted at cos(inc)=1 against the pass-vs-range curve above.  gain/d² saturates for
+    # d ≲ 0.87 m, then the model gives 0.354 at 1.05 m, 0.214 at 1.35 m and 0.143 at
+    # 1.65 m, against measured 0.35/0.35, 0.34/0.21 and 0.12/0.11 (left/right).
+    depth_conf_gain_m2: float = 0.75
+    # Ceiling on the pass rate — the real sensor never returns a fully dense frame even at
+    # point-blank range on a good surface (best measured bucket was ~0.50).
+    depth_conf_max_pass: float = 0.52
+    # Exponent on cos(incidence).  1.0 = Lambertian.  Raising it culls grazing surfaces
+    # harder (and thins the near floor below the crop band, which the real sensor still
+    # sees at 0.2-0.5 m); lowering it lets the sim's ground ramp survive into the band,
+    # which is the specific artefact this whole model exists to remove.
+    depth_conf_incidence_exponent: float = 1.0
+    # Floor so no pixel is deterministically dead — the real sensor occasionally returns
+    # a reading off a surface that should give nothing.
+    depth_conf_floor_pass: float = 0.02
+    # Counted in dropout calls, i.e. two per policy step (one per camera), so the printout
+    # alternates left/right.  0 disables the diagnostic entirely (the default for training).
+    depth_conf_report_every_n_steps: int = 0
 
     # Random-depth (coloured) speckle: each pixel is set to a uniform random depth in
     # [0, depth_max_m] with this probability.  Models stray reflections and multi-path
@@ -258,6 +342,23 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # policy_depth_height < 0 → auto-compute from cropped aspect ratio.
     policy_depth_width: int = 120
     policy_depth_height: int = -1
+
+    # ── Camera extrinsic randomisation ───────────────────────────────────────────────────
+    # [2026-08-02 sim2real fix]  The sim mounts both cameras at exactly 65.5 mm with zero
+    # pitch (base_link 71.5 mm − 6.0 mm offset, after the 0.755 spawn scale).  Fitting the
+    # ground plane in the real frames gives left 79 mm @ 1.15° nose-down and right 63.5 mm
+    # @ 1.32° nose-down — the two cameras are neither level nor equal to each other, and
+    # the chassis adds its own pitch on top.  At this mounting height 1° moves the horizon
+    # by 3.7 rows of the 36-row crop band, so a fixed-perfect calibration is a real gap.
+    # Resampled per environment on every reset; set either to 0.0 to pin that axis.
+    camera_pitch_jitter_deg: float = 1.5  # ± about the vehicle's lateral axis, + = nose-down
+    camera_height_jitter_m: float = 0.010  # ± along the vehicle's vertical axis, in WORLD metres
+    # The measured 8.9 ms skew between the two cameras' capture instants is deliberately
+    # NOT modelled: RTX renders every sensor once per render_interval, so both TiledCameras
+    # necessarily sample the same sim instant, and there is no phase offset to give them.
+    # Representing it would need render_interval=2 (60 Hz rendering, ~2× the sensor cost)
+    # plus per-sensor update phases.  At 100 °/s yaw it is 0.9° of view difference, well
+    # inside the pitch jitter above, so it is left as a known unmodelled term.
 
     # ════════════════════════════════════════════════════════════════════════
     # SPAWN — initial robot position, heading, and speed
@@ -297,11 +398,26 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     # Each step the policy throttle ∈ [-1, 1] is turned into a per-wheel TORQUE
     # (applied via set_joint_effort_target).  Three zones — forward-only:
     #
-    #   throttle > 0  DRIVE: T = drive_torque · clamp(1 − ω/ω_noload(throttle), 0, 1)
-    #                 where ω_noload(throttle) = throttle · max_velocity_m_s / r.
-    #                 A DC-motor torque-speed curve: full drive_torque at standstill,
-    #                 tapering to 0 at the (throttle-scaled) no-load speed.  So full
-    #                 throttle tops out at max_velocity_m_s; half throttle at half that.
+    #   throttle > 0  DRIVE: T = drive_torque · clamp(throttle − ω/ω_noload_full, 0, 1)
+    #                 where ω_noload_full = max_velocity_m_s / r is FIXED (full throttle).
+    #                 This is the brushed-DC torque-speed line T = k_t(V·duty − k_e·ω)/R:
+    #                 stall torque is PROPORTIONAL TO DUTY, and the line still crosses
+    #                 zero torque at throttle · max_velocity_m_s, so top speed per
+    #                 throttle level is unchanged.
+    #
+    #                 [2026-08-02 sim2real fix]  The old form was
+    #                     T = drive_torque · clamp(1 − ω/(throttle·ω_noload_full), 0, 1)
+    #                 which handed out the FULL stall torque at any throttle > 0, so the
+    #                 sim accelerated just as hard at throttle 0.4 as at 1.0 (5.79 m/s²
+    #                 either way) while the real car managed 2.38 m/s² at duty 0.4.
+    #                 Replaying the logged commands from the 2026-08-02 track run through
+    #                 the old model gave a mean +2.65 m/s² where the car measured +0.07.
+    #                 The corrected line reproduces the measured response at every duty:
+    #                     real  a₀ = 5.95·duty m/s²   (from real_car_acceleration_log.txt,
+    #                                                  v(t) = 6.7·duty·(1 − e^(−t/1.126 s)))
+    #                     sim   a₀ = 4·drive_torque·u / r / m
+    #                             = 4·0.068·u / 0.037 / 1.27 = 5.79·u m/s²
+    #                 — a 3 % match across the whole throttle range instead of at one point.
     #   throttle = 0  COAST: T = 0 (free roll; ground/contact losses only).
     #   throttle < 0  BRAKE: T = −brake_torque_gain · |throttle|, opposing rotation,
     #                 faded to 0 below brake_release_omega so the car can never be
@@ -334,20 +450,84 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
         0.4  # |throttle|=1 → braking level 0.4 (the slip ceiling)
     )
     brake_release_omega: float = 2.0  # wheel speed (rad/s ≈ 0.07 m/s) below which braking fades to coast → no reverse
-    # Tyre–ground friction (sets traction / wheel-slip onset).  Combined with the bound wheel-rubber
-    # material (μ=1.0, "multiply") these are the effective μ.  Tuned so the car grips up to ≈|0.3|
-    # braking and only slips under the hardest braking (−0.5), matching the real car.
-    ground_static_friction: float = 2.0  # static μ (grip before slip); traction ≈ μ·m·g
-    ground_dynamic_friction: float = 1.6  # sliding μ (once a wheel breaks traction)
+    # ── Tyre–ground friction (sets traction / wheel-slip onset) ──────────────────────────
+    # These combine with the bound wheel-rubber material (μ=1.0) under PhysX's "multiply"
+    # rule, and because MULTIPLY outranks the rubber material's default AVERAGE in PhysX's
+    # combine-mode precedence, the pair mode is MULTIPLY and the EFFECTIVE μ is simply
+    # ground_μ × 1.0 = ground_μ.  So the number written here is the μ the tyres actually get.
+    #
+    # [2026-08-02 sim2real fix]  These were 2.0 / 1.6 — an effective μ of 2.0, i.e. a car
+    # that can corner at ~2 g and put down any torque the motor can make.  The real car,
+    # measured from the track run by differentiating the depth-image yaw rate, never
+    # exceeded 0.63 g lateral (0.34 g mean) and was visibly sliding while doing it.  The
+    # policy was therefore learning corner entry speeds that do not exist on the real
+    # floor.  0.95 / 0.80 is rubber on a smooth indoor floor and puts the grip ceiling at
+    # ~0.95 g, just above what the car was measured doing.
+    #
+    # ⚠  RE-VALIDATE THE DRIVETRAIN AFTER CHANGING THESE.  drive_torque and the brake
+    #    terms were fitted when traction was effectively infinite; at μ≈0.95 the tyres
+    #    now limit hard braking and standing starts, so the numbers below no longer
+    #    reproduce the real car by construction.  Run
+    #        uv run python source/cone_track/acceleration_test.py --headless
+    #    and compare against Training/real_car_acceleration_log.txt:
+    #        accel  0 → 4.7 m/s in 1.36 s over 3.45 m   (throttle 1.0)
+    #        brake  from ~4.6 m/s: 2.61 m @ duty 0.1, 1.77 m @ 0.2,
+    #                              1.35 m @ 0.3, 0.86 m @ 0.5 (0.5 visibly slipped)
+    #    Expect the brake distances to grow first; if they do, the friction is now the
+    #    binding constraint rather than brake_torque_gain, which is the intended physics.
+    ground_static_friction: float = 0.95  # static μ (grip before slip); traction ≈ μ·m·g
+    ground_dynamic_friction: float = 0.80  # sliding μ (once a wheel breaks traction)
     suspension_stiffness: float = (
         1e6  # suspension-joint lock stiffness (rigid; stops energy-sapping travel)
     )
-    max_steer_rad: float = 0.488  # ≈28° max front-wheel steer angle
+
+    # ── Steering geometry ────────────────────────────────────────────────────────────────
+    # What the vehicle actually does is set by the CURVATURE it can pull, κ = tan(δ)/L, so
+    # max_steer_rad only means something alongside the wheelbase.  Both were wrong:
+    #
+    #   wheelbase   The MuSHR USD is spawned at scale 0.755 to bring its wheels to the real
+    #               74 mm diameter, which scaled the wheelbase along with them: 296.5 mm ×
+    #               0.755 = 224 mm.  The real car's wheelbase is 187 mm.  wheelbase_m below
+    #               re-spaces the axles at load time (see _apply_wheelbase).
+    #   max_steer   Measured on the real car (2026-08-02 run, yaw rate recovered from
+    #               depth-image optical flow, fitted as κ = k·steer): κ at steer=1.0 is
+    #               1.1–1.7 1/m, i.e. a minimum turn radius of 0.6–0.9 m.  The sim was
+    #               pulling 2.4–2.6 1/m (R ≈ 0.4 m) — it could draw a line the real car
+    #               physically cannot follow, which is the single biggest reason the policy
+    #               understeers into cones on the track.
+    #
+    # Taking the mid-estimate κ = 1.4 1/m at L = 0.187 m:  δ = atan(1.4 × 0.187) = 0.256 rad
+    # = 14.7°.  Note _pre_physics_step drives the steer joints with tan(steer·max_steer_rad)
+    # — an extra nonlinearity, NOT a joint convention: front_*_wheel_steer are plain
+    # PhysicsRevoluteJoints and Isaac Lab reads the target as radians — so the applied angle
+    # is
+    # tan(0.256) = 0.262 rad = 15.0° and the realised κ = tan(0.262)/0.187 = 1.43 1/m.  At
+    # angles this small the tan-convention only shifts things by 2 %; it mattered at the old
+    # 0.488 rad, where it silently turned "28°" into 30.4°.
+    #
+    # ⚠  UPDATE THIS from the real measurement.  Deployment/Python now ships a
+    #    steering_angle_test that parks the wheels at steer = ±1: measure the road-wheel
+    #    angle with a protractor and set max_steer_rad = atan(tan(δ_measured)) ≈ δ_measured
+    #    (in radians).  If the servo throw is raised (SERVO_AMPLITUDE), raise this to match
+    #    and retrain — do not leave the two out of step.
+    wheelbase_m: float = 0.187  # real car, measured.  0.0 → leave the USD spacing alone
+    max_steer_rad: float = 0.256  # ≈15° max front-wheel steer angle → κ ≈ 1.43 1/m
 
     # Action latency simulation — all actuator commands are delayed by this many
     # milliseconds before reaching the wheels/steering.  At 30 Hz each step ≈ 33 ms,
     # so 100 ms ≈ 3 policy steps.  Set to 0.0 to disable.
-    action_delay_ms: float = 33.0
+    #
+    # [2026-08-02 sim2real fix]  Was 33.0 (one policy step).  Measured on the real car by
+    # correlating the steering command against the yaw rate recovered from depth-image
+    # optical flow: the correlation is ~0 at zero lag and peaks sharply at 3 policy steps,
+    # 100 ms (|corr| 0.61).  That is the STEERING loop — camera exposure and readout
+    # (23 ms / 14 ms of frame age at inference for left / right), 4 ms of tick, the 50 Hz
+    # servo PWM update, and the servo's own mechanical response.  The throttle path was
+    # not separately identifiable from the log (the encoder's own filter and the
+    # drivetrain time constant dominate it), so a single delay is applied to both
+    # channels; if the throttle path is later measured and differs materially, split
+    # _action_delay_buf into two FIFOs rather than compromising between them.
+    action_delay_ms: float = 100.0
 
     # ════════════════════════════════════════════════════════════════════════
     # TERMINATION THRESHOLDS
@@ -575,7 +755,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
         prim_path="/World/envs/env_.*/Robot",
         spawn=sim_utils.UsdFileCfg(
             usd_path=MUSHR_USD,
-            scale=(0.755, 0.755, 0.755),
+            scale=(ROBOT_SCALE, ROBOT_SCALE, ROBOT_SCALE),
             activate_contact_sensors=True,
             # NOTE: no MassPropertiesCfg here.  A blanket mass=X override stamps the SAME
             # mass onto every one of the 17 rigid bodies (→ 17× too heavy: 21.6 kg for a
@@ -875,11 +1055,31 @@ class ConeTrackEnv(DirectRLEnv):
         )
 
         # No-load wheel speed (rad/s) at full throttle — drive torque rolls off to 0 here.
+        # Fixed (NOT throttle-scaled): the torque-speed LINE pivots about this point while
+        # its stall end scales with duty, which is how a PWM-driven brushed motor behaves.
         self._omega_noload_full = cfg.max_velocity_m_s / WHEEL_RADIUS
+        _a0_full = 4.0 * cfg.drive_torque / WHEEL_RADIUS / cfg.car_mass_kg
         print(
             f"[ConeTrackEnv] Drivetrain: effort-controlled DC motor — "
             f"no-load {cfg.max_velocity_m_s:.2f} m/s ({self._omega_noload_full:.1f} rad/s/wheel), "
             f"drive_torque {cfg.drive_torque:.3f} Nm/wheel, brake_gain {cfg.brake_torque_gain:.3f} Nm/wheel/|u|"
+        )
+        print(
+            f"[ConeTrackEnv]   standing-start accel = {_a0_full:.2f}·throttle m/s² "
+            f"(real car: 5.95·duty, from real_car_acceleration_log.txt)"
+        )
+
+        # Steering: report the CURVATURE, since that is what the vehicle actually does and
+        # it is the quantity that was measured on the real car (κ = 1.1–1.7 1/m at
+        # steer=1.0, i.e. R = 0.6–0.9 m).  _pre_physics_step applies tan(steer·max_steer)
+        # to the joints, so the realised angle is tan(max_steer_rad) and κ = tan(that)/L.
+        _applied_steer = math.tan(cfg.max_steer_rad)
+        _wheelbase = cfg.wheelbase_m if cfg.wheelbase_m > 0.0 else NATIVE_WHEELBASE_M
+        _kappa = math.tan(_applied_steer) / _wheelbase
+        print(
+            f"[ConeTrackEnv] Steering: max_steer {cfg.max_steer_rad:.3f} rad "
+            f"→ applied {math.degrees(_applied_steer):.1f}° at wheelbase {_wheelbase * 1000:.0f} mm "
+            f"→ curvature {_kappa:.2f} 1/m (min turn radius {1.0 / _kappa:.2f} m)"
         )
         # Lap-tracking state.
         # _lap_state: 0 = inside the start circle (lap timer running, awaiting departure),
@@ -945,6 +1145,25 @@ class ConeTrackEnv(DirectRLEnv):
             self.num_envs, _cam_flat, device=self.device
         )
         self._last_camera_update_step = -1
+        # Counts calls into the confidence dropout so the diagnostic can be throttled.
+        self._conf_report_counter = 0
+        # Base camera extrinsics, captured before any jitter is written over them, so the
+        # jitter is always applied relative to the nominal mount rather than compounding.
+        self._camera_base_offsets = {
+            "camera_left": (
+                tuple(cfg.camera_left_cfg.offset.pos),
+                tuple(cfg.camera_left_cfg.offset.rot),
+            ),
+            "camera_right": (
+                tuple(cfg.camera_right_cfg.offset.pos),
+                tuple(cfg.camera_right_cfg.offset.rot),
+            ),
+        }
+        # Latched False after the first failure so a USD write path that does not work on
+        # this Isaac version degrades to "no jitter" instead of spamming every reset.
+        self._camera_jitter_ok = (
+            cfg.camera_pitch_jitter_deg > 0.0 or cfg.camera_height_jitter_m > 0.0
+        )
 
         # 2D wall footprint, read once from the same /World/Walls mesh used for
         # termination (visibility / collision untouched) and cached on-device.
@@ -1005,6 +1224,10 @@ class ConeTrackEnv(DirectRLEnv):
         from pxr import Usd, UsdGeom, UsdPhysics, UsdShade
 
         stage = omni.usd.get_context().get_stage()
+
+        # Re-space the axles to the real car's wheelbase before anything else touches the
+        # robot, so every downstream consumer (collision setup, cloning) sees final geometry.
+        self._apply_wheelbase(stage)
 
         wheel_link_names = {
             "front_left_wheel_link",
@@ -1176,6 +1399,203 @@ class ConeTrackEnv(DirectRLEnv):
         light_cfg.func("/World/Light", light_cfg)
 
     # ------------------------------------------------------------------
+    # Camera extrinsics
+    # ------------------------------------------------------------------
+
+    def _randomize_camera_extrinsics(self, env_ids) -> None:
+        """Give each env a slightly different camera mount, resampled on reset.
+
+        The sim's cameras are perfect: both at 65.5 mm, both exactly level, identical to
+        each other in every environment.  The real pair is not — fitting the ground plane
+        in the recorded frames puts the left at 79 mm / 1.15° nose-down and the right at
+        63.5 mm / 1.32° nose-down, and the chassis pitches on top of that.  1° moves the
+        horizon 3.7 rows of a 36-row crop band, so training on a perfect mount teaches the
+        policy to trust a row index that means something different on the car.
+
+        Implemented by rewriting the camera prims' local xform ops — the same attributes
+        TiledCameraCfg.OffsetCfg writes at spawn — so nothing downstream has to know: both
+        the renderer and Camera._update_poses read the prim transform every frame.
+
+        Positions are authored in the robot's UNSCALED frame (ROBOT_SCALE is applied above
+        them in the hierarchy), so a world-metre height jitter is divided by ROBOT_SCALE
+        on the way in.  Pitch is pre-multiplied, i.e. applied in the vehicle frame about
+        its lateral axis, which is where a mounting or chassis-attitude error actually
+        lives — the same place the cfg's yaw term is applied.
+        """
+        if not self._camera_jitter_ok:
+            return
+        try:
+            import omni.usd
+            from pxr import Gf, UsdGeom
+            from isaaclab.utils.math import (
+                convert_camera_frame_orientation_convention,
+            )
+
+            stage = omni.usd.get_context().get_stage()
+            pitch_max = math.radians(self.cfg.camera_pitch_jitter_deg)
+            height_max = self.cfg.camera_height_jitter_m / ROBOT_SCALE
+
+            for env_id in (int(i) for i in env_ids):
+                for cam_name, (base_pos, base_rot) in self._camera_base_offsets.items():
+                    prim = stage.GetPrimAtPath(
+                        f"/World/envs/env_{env_id}/Robot/mushr_nano/base_link/{cam_name}"
+                    )
+                    if not prim.IsValid():
+                        raise RuntimeError(f"camera prim missing for env {env_id}")
+
+                    pitch = (torch.rand(1).item() * 2.0 - 1.0) * pitch_max
+                    dz = (torch.rand(1).item() * 2.0 - 1.0) * height_max
+
+                    # q_pitch about the vehicle's +Y (nose-down for +pitch), pre-multiplied
+                    # onto the nominal ROS-convention mount orientation.
+                    half = pitch * 0.5
+                    qp = torch.tensor(
+                        [math.cos(half), 0.0, math.sin(half), 0.0], dtype=torch.float32
+                    )
+                    qb = torch.tensor(base_rot, dtype=torch.float32)
+                    w1, x1, y1, z1 = qp.tolist()
+                    w2, x2, y2, z2 = qb.tolist()
+                    q_ros = torch.tensor(
+                        [
+                            [
+                                w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+                                w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+                                w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+                                w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+                            ]
+                        ],
+                        dtype=torch.float32,
+                    )
+                    q_gl = convert_camera_frame_orientation_convention(
+                        q_ros, origin="ros", target="opengl"
+                    )[0].tolist()
+
+                    xf = UsdGeom.Xformable(prim)
+                    for op in xf.GetOrderedXformOps():
+                        name = op.GetOpName()
+                        if name.endswith("translate"):
+                            op.Set(
+                                Gf.Vec3d(
+                                    base_pos[0], base_pos[1], base_pos[2] + dz
+                                )
+                            )
+                        elif name.endswith("orient"):
+                            quat_type = type(op.Get())
+                            imag_type = type(op.Get().GetImaginary())
+                            op.Set(
+                                quat_type(
+                                    q_gl[0], imag_type(q_gl[1], q_gl[2], q_gl[3])
+                                )
+                            )
+        except Exception as e:  # noqa: BLE001 — degrade to a fixed mount, never crash training
+            self._camera_jitter_ok = False
+            print(
+                f"[ConeTrackEnv] Camera extrinsic randomisation disabled ({e}). "
+                f"Training continues with the nominal mount; the sim will be optimistic "
+                f"about how well-calibrated the real cameras are."
+            )
+
+    # ------------------------------------------------------------------
+    # Chassis geometry
+    # ------------------------------------------------------------------
+
+    def _apply_wheelbase(self, stage) -> None:
+        """Re-space the front/rear axles so the spawned wheelbase is cfg.wheelbase_m.
+
+        WHY.  mushr_nano_v2.usd is spawned at ROBOT_SCALE=0.755 to bring its wheels down
+        to the real car's 74 mm, and a uniform scale shrinks the wheelbase with them:
+        296.5 mm × 0.755 = 224 mm against the real car's measured 187 mm.  A 20 % long
+        wheelbase understates the curvature the car gets from a given steer angle, so it
+        has to be corrected alongside max_steer_rad or the two errors partly mask each
+        other (they did: the sim pulled 2.4-2.6 1/m against the real car's 1.1-1.7).
+
+        HOW.  The wheelbase enters the *physics* in exactly one place — the X component of
+        the four suspension joints' localPos0, which position each corner's chain relative
+        to base_link.  Everything below (steer joint, throttle joint) is coincident with
+        zero local offset, and every wheel mesh is authored about its own link origin, so
+        nothing else has to move.  The link Xform translates are updated too: PhysX derives
+        body poses from the joint chain and would correct them anyway, but leaving them
+        stale would put the visuals in the wrong place for the first frame and in the
+        viewport before play.
+
+        Both axles are scaled about base_link's origin (x = 0) rather than about the axle
+        midpoint, which keeps each axle's distance from the chassis in proportion and so
+        preserves the front/rear static weight split that car_mass_kg was matched to.
+
+        Raises on any missing attribute rather than silently applying a partial edit — a
+        half-moved axle is a broken articulation that would be very hard to diagnose from
+        training curves.
+        """
+        target = self.cfg.wheelbase_m
+        if target <= 0.0:
+            print(
+                f"[ConeTrackEnv] Wheelbase: left at the USD's native "
+                f"{NATIVE_WHEELBASE_M * 1000:.0f} mm (cfg.wheelbase_m = 0)"
+            )
+            return
+
+        # Work in unscaled USD units; ROBOT_SCALE is applied on top at spawn.
+        factor = (target / ROBOT_SCALE) / USD_WHEELBASE_M
+        if abs(factor - 1.0) < 1e-6:
+            return
+
+        root = "/World/envs/env_0/Robot/mushr_nano"
+        corners = ("front_left", "front_right", "back_left", "back_right")
+        # Every prim whose X carries the axle position, per corner.  The front corners
+        # have a steer link in the chain, the rear ones do not.
+        link_suffixes = {
+            "front": ("_wheel_suspension_link", "_wheel_steer_link", "_wheel_link"),
+            "back": ("_wheel_suspension_link", "_wheel_link"),
+        }
+
+        moved = []
+        for corner in corners:
+            joint_prim = stage.GetPrimAtPath(
+                f"{root}/base_link/{corner}_wheel_suspension"
+            )
+            if not joint_prim.IsValid():
+                raise RuntimeError(
+                    f"[ConeTrackEnv] Wheelbase: suspension joint for '{corner}' not found "
+                    f"at {root}/base_link/{corner}_wheel_suspension — the robot USD "
+                    f"changed shape; fix _apply_wheelbase before training."
+                )
+            attr = joint_prim.GetAttribute("physics:localPos0")
+            if not attr.IsValid() or attr.Get() is None:
+                raise RuntimeError(
+                    f"[ConeTrackEnv] Wheelbase: '{corner}' suspension joint has no "
+                    f"physics:localPos0 to rescale."
+                )
+            pos = attr.Get()
+            old_x = float(pos[0])
+            new_x = old_x * factor
+            attr.Set(type(pos)(new_x, pos[1], pos[2]))
+            moved.append((corner, old_x, new_x))
+
+            for suffix in link_suffixes[corner.split("_")[0]]:
+                link = stage.GetPrimAtPath(f"{root}/{corner}{suffix}")
+                if not link.IsValid():
+                    raise RuntimeError(
+                        f"[ConeTrackEnv] Wheelbase: link {corner}{suffix} not found."
+                    )
+                t = link.GetAttribute("xformOp:translate")
+                if not t.IsValid() or t.Get() is None:
+                    raise RuntimeError(
+                        f"[ConeTrackEnv] Wheelbase: {corner}{suffix} has no "
+                        f"xformOp:translate to rescale."
+                    )
+                v = t.Get()
+                t.Set(type(v)(float(v[0]) * factor, v[1], v[2]))
+
+        front = next(x for c, _, x in moved if c.startswith("front"))
+        back = next(x for c, _, x in moved if c.startswith("back"))
+        achieved = (front - back) * ROBOT_SCALE
+        print(
+            f"[ConeTrackEnv] Wheelbase: {NATIVE_WHEELBASE_M * 1000:.0f} mm → "
+            f"{achieved * 1000:.0f} mm (target {target * 1000:.0f} mm, axles scaled "
+            f"×{factor:.4f} about base_link, {len(moved)} corners moved)"
+        )
+
+    # ------------------------------------------------------------------
     # Wall geometry helper
     # ------------------------------------------------------------------
 
@@ -1312,9 +1732,9 @@ class ConeTrackEnv(DirectRLEnv):
 
         # ── Throttle → per-wheel torque (forward-only, effort-controlled DC motor) ──
         # Three zones (the car can NEVER be driven in reverse):
-        #   throttle > 0  DRIVE: T = drive_torque · clamp(1 − ω/(throttle·ω_noload), 0, 1)
-        #                 — DC torque-speed curve, full torque at standstill tapering to
-        #                   0 at the throttle-scaled no-load speed (full throttle → max_velocity_m_s).
+        #   throttle > 0  DRIVE: T = drive_torque · clamp(throttle − ω/ω_noload_full, 0, 1)
+        #                 — the brushed-DC torque-speed LINE.  Stall torque is proportional
+        #                   to duty and the line hits zero torque at throttle·max_velocity.
         #   throttle = 0  COAST: T = 0.
         #   throttle < 0  BRAKE: T = −brake_torque_gain · |throttle|, opposing rotation,
         #                 faded out below brake_release_omega so it decelerates to a stop
@@ -1326,11 +1746,13 @@ class ConeTrackEnv(DirectRLEnv):
             min=0.0
         )  # [N,4] forward spin
 
-        # DRIVE branch (throttle > 0)
-        omega_noload = (
-            u.clamp(min=1e-3) * self.cfg.max_velocity_m_s / WHEEL_RADIUS
-        )  # [N,1]
-        drive_rolloff = (1.0 - wheel_omega / omega_noload).clamp(0.0, 1.0)  # [N,4]
+        # DRIVE branch (throttle > 0).  The roll-off is (duty − normalised speed), NOT
+        # (1 − speed/duty): the old form gave full stall torque at any duty, so the sim
+        # launched as hard on 40 % throttle as on 100 % while the real car managed 40 % of
+        # the shove.  See the DYNAMICS block for the measurements behind this.
+        drive_rolloff = (
+            u - wheel_omega / self._omega_noload_full
+        ).clamp(0.0, 1.0)  # [N,4]
         drive_torque = self.cfg.drive_torque * drive_rolloff  # [N,4]
 
         # BRAKE branch (throttle < 0): baseline + graded torque, opposes motion, fades to 0
@@ -1494,6 +1916,11 @@ class ConeTrackEnv(DirectRLEnv):
             torch.tensor(self.cfg.depth_max_m, device=depth.device),
         )
 
+        # Kept before any noise pass: the confidence model needs the true surface geometry
+        # to recover incidence angles, and Gaussian noise on a grazing plane would swamp
+        # the very gradient that identifies it.
+        clean_depth = depth
+
         # Edge weights computed on the FULL-RESOLUTION CLEAN signal so that real
         # depth discontinuities (not noise spikes) drive the mixed-pixel scatter.
         if self.cfg.depth_edge_scatter_prob > 0.0:
@@ -1514,6 +1941,13 @@ class ConeTrackEnv(DirectRLEnv):
         if self.cfg.depth_invalid_pixel_prob > 0.0:
             invalid = torch.rand_like(depth) < self.cfg.depth_invalid_pixel_prob
             depth = depth.masked_fill(invalid, self.cfg.depth_max_m)
+
+        # Structured confidence dropout — the dominant real-sensor effect.  Runs on the
+        # UNCLIPPED depth so that grazing surfaces still carry the steep gradient that
+        # identifies them; clipping to depth_max_m first would flatten the far ground into
+        # a constant and make it look like a head-on wall.
+        if self.cfg.depth_conf_enable:
+            depth = self._apply_confidence_dropout(depth, clean_depth)
 
         if self.cfg.depth_color_noise_prob > 0.0:
             color_mask = torch.rand_like(depth) < self.cfg.depth_color_noise_prob
@@ -1557,6 +1991,125 @@ class ConeTrackEnv(DirectRLEnv):
             align_corners=False,
         )
         return depth_4d.squeeze(1).reshape(self.num_envs, -1)
+
+    def _apply_confidence_dropout(
+        self, depth: torch.Tensor, clean_depth: torch.Tensor
+    ) -> torch.Tensor:
+        """Invalidate pixels the real ArduCam would return no confidence for.
+
+        A ToF pixel resolves phase only when the returned power clears the noise floor,
+        and that power goes as  ρ · cos(incidence) / range².  So a pixel dies either
+        because it is far away or because it is looking along a surface rather than at it.
+        Both terms are needed: range alone would keep the sim's crisp ground ramp (it is
+        only 1-1.5 m away in the crop band) which the real sensor never returns, because
+        at a 65 mm mounting height the floor there is seen at 2-3° of incidence.
+
+        cos(incidence) is recovered from the depth image itself.  One pixel of image
+        displacement turns the view ray by 1/f_px radians; if that step changes the range
+        by |∇d| then the surface tilts away from the ray by
+            tan(incidence) = |∇d| / (d / f_px)
+        which is exact for a locally planar surface and needs no normals buffer.
+
+        Survivors keep their depth, the rest are set to depth_max_m — the same "unmeasured
+        reads as far" convention as process_for_policy() on the car, so a dropout can never
+        be mistaken for an obstacle at the lens.
+        """
+        cfg = self.cfg
+        # Angular pixel pitch (rad/px) from the configured optics, so this stays correct if
+        # the FOV or resolution is ever changed.
+        f_px = (
+            math.sqrt(
+                cfg.camera_left_cfg.width**2 + cfg.camera_left_cfg.height**2
+            )
+            / 2.0
+            / math.tan(math.radians(_TOF_DIAG_FOV_DEG / 2.0))
+        )
+
+        d = clean_depth.clamp(min=0.05)
+        # Central differences, replicate-padded, matching the edge-weight pass above.
+        d4 = d.unsqueeze(1)
+        px = torch.nn.functional.pad(d4, (1, 1, 0, 0), mode="replicate")
+        py = torch.nn.functional.pad(d4, (0, 0, 1, 1), mode="replicate")
+        gx = (px[:, :, :, 2:] - px[:, :, :, :-2]) * 0.5
+        gy = (py[:, :, 2:, :] - py[:, :, :-2, :]) * 0.5
+        grad = torch.sqrt(gx * gx + gy * gy).squeeze(1)
+
+        tan_inc = grad * f_px / d
+        cos_inc = torch.rsqrt(1.0 + tan_inc * tan_inc)
+
+        snr = (
+            cfg.depth_conf_gain_m2
+            * cos_inc.clamp(min=1e-4).pow(cfg.depth_conf_incidence_exponent)
+            / d.clamp(min=0.05).pow(2)
+        )
+        p_valid = (cfg.depth_conf_max_pass * snr.clamp(max=1.0)).clamp(
+            cfg.depth_conf_floor_pass, cfg.depth_conf_max_pass
+        )
+
+        dropped = torch.rand_like(depth) > p_valid
+        out = torch.where(
+            dropped, torch.full_like(depth, cfg.depth_max_m), depth
+        )
+
+        if cfg.depth_conf_report_every_n_steps > 0:
+            self._conf_report_counter += 1
+            if self._conf_report_counter >= cfg.depth_conf_report_every_n_steps:
+                self._conf_report_counter = 0
+                self._report_confidence(dropped, clean_depth, out)
+        return out
+
+    def _report_confidence(
+        self, dropped: torch.Tensor, clean_depth: torch.Tensor, out: torch.Tensor
+    ) -> None:
+        """Print the dropout statistics to line up against the numbers measured on the car.
+
+        Only the crop band is reported — the rows above and below it never reach the policy,
+        and including them would flatter the numbers with sky and near floor.
+        """
+        h = clean_depth.shape[1]
+        top = int(self.cfg.depth_crop_top_fraction * h)
+        bot = h - int(self.cfg.depth_crop_bottom_fraction * h)
+        band_drop = dropped[:, top:bot, :]
+        band_clean = clean_depth[:, top:bot, :]
+        in_range = band_clean < self.cfg.depth_max_m
+
+        obs = (1.0 - out[:, top:bot, :].clamp(0.01, self.cfg.depth_max_m) / self.cfg.depth_max_m)
+        rows = torch.nn.functional.interpolate(
+            obs.unsqueeze(1),
+            size=(self._policy_depth_h, self._policy_depth_w),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(1).mean(dim=(0, 2))
+        far = torch.nn.functional.interpolate(
+            band_drop.float().unsqueeze(1),
+            size=(self._policy_depth_h, self._policy_depth_w),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(1).mean(dim=(0, 2))
+
+        def fmt(t):
+            return " ".join(f"{v:.3f}" for v in t.tolist())
+
+        print("[ConeTrackEnv][ToF confidence] crop band statistics")
+        print(
+            f"    dropped overall {band_drop.float().mean():.3f} | "
+            f"dropped among in-range pixels {band_drop[in_range].float().mean():.3f} "
+            f"| in-range pixels {in_range.float().mean():.3f}"
+        )
+        print(f"    dropped per row (top→bottom): {fmt(far)}")
+        print(
+            "      real left : 0.878 0.867 0.848 0.827 0.810 0.792 0.769 0.750 0.733 "
+            "0.718 0.705 0.696 0.684 0.665 0.645 0.630 0.617 0.614"
+        )
+        print(
+            "      real right: 0.656 0.637 0.632 0.619 0.607 0.596 0.579 0.580 0.589 "
+            "0.599 0.589 0.580 0.575 0.571 0.573 0.563 0.530 0.461"
+        )
+        print(f"    obs mean per row (top→bottom): {fmt(rows)}")
+        print(
+            "      real left  0.039 → 0.145 | real right 0.182 → 0.292 "
+            "| sim before this model 0.133 → 0.433"
+        )
 
     def _update_depth_cache(self) -> None:
         """Process both depth cameras and write self._camera_left_obs / _camera_right_obs."""
@@ -2033,3 +2586,6 @@ class ConeTrackEnv(DirectRLEnv):
         joint_pos = self.robot.data.default_joint_pos[env_ids]
         joint_vel = torch.zeros_like(joint_pos)
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
+
+        # New episode, new camera calibration — see _randomize_camera_extrinsics.
+        self._randomize_camera_extrinsics(env_ids)

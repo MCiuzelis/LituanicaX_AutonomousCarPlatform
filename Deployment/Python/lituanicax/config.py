@@ -39,8 +39,33 @@ SERVO_AMPLITUDE = 0.35
 SERVO_DIRECTION = -1
 
 MOTOR_DIRECTION = -1
+
+# --- throttle and brake scaling ------------------------------------------
+# These two are applied on DIFFERENT sides of zero and must never stack.  They
+# used to: `Drive._set_throttle` multiplied by MAX_THROTTLE after the sign was
+# already decided, so a braking command was scaled by MAX_THROTTLE *and* by
+# BRAKE_MAGNITUDE.  At MAX_THROTTLE = 0.4 the policy's hardest brake reached a
+# duty of 1.0 x 0.4 x 0.4 = 0.16 and delivered ~5.4 m/s^2, where the sim it was
+# trained in models 12.9 m/s^2 at the same action.  Capping top speed silently
+# removed most of the brakes.
+#
+# MAX_THROTTLE — forward duty ceiling only.  A hardware/safety limit on how
+#   much of the motor this build is allowed to use; it has no counterpart in
+#   the sim, which always drives a full-authority motor.
 MAX_THROTTLE = 0.4
+# BRAKE_MAGNITUDE — the policy-side brake remap, applied in `PolicyRunner`
+#   before the command ever reaches `Drive`.  It mirrors the sim's
+#   `brake_throttle_scale = 0.4` exactly: policy action -1 means "the braking
+#   level at which the tyres start to slip", not "full reverse duty".  Keep the
+#   two numbers equal or the deployed brake stops matching the trained one.
+#   Because it lives in PolicyRunner, a direct `Drive.command()` from a
+#   calibration test still means raw duty — which is what
+#   real_car_acceleration_log.txt was measured with.
 BRAKE_MAGNITUDE = 0.4
+# Duty commanded when the operator releases SPACE (or any safety gate trips).
+# Was an implicit `-1.0 * MAX_THROTTLE`; now that MAX_THROTTLE no longer touches
+# the brake side, the safety stop needs its own number to keep the same bite.
+SAFETY_BRAKE_MAGNITUDE = 0.4
 
 ADC_BUS = 0
 ADC_DEVICE = 0
@@ -75,6 +100,19 @@ ADC_MAX = 4095
 # generate back-EMF, which is what actually brings the current down.  Falling
 # is never limited: braking and safety stops stay instant.
 THROTTLE_SLEW_UP_PER_SEC = 2.5  # 0 -> full in 400 ms
+# Master switch for the ramp above.  It has no counterpart in the sim, and the
+# logged run shows it is not a minor correction: the ramp was below the policy's
+# request on 61 % of ticks, with a mean shortfall of 0.275, cutting the mean
+# delivered throttle to 73 % of what the policy asked for.  The policy moves the
+# throttle ~0.25 per 33 ms step; the ramp allows 0.083.  So the car was running a
+# heavily low-passed version of a command the network chose at 30 Hz.
+#
+# Set False to hand the policy's throttle through untouched and let CURRENT_LIMIT_A
+# below be the only protection.  That is a real backstop, not a hope: it is
+# closed-loop on the measured peak, and in the logged run it never engaged
+# (current_scale stayed at 1.0 throughout, peak 19.1 A against the 20 A limit).
+# Falling throttle is never rate-limited either way.
+THROTTLE_SLEW_ENABLED = True
 # Closed-loop backstop for sustained load the ramp cannot anticipate (climbing,
 # shoving a cone, a stalled wheel).  Kept well under the driver's trip point,
 # and under the 23.1 A sense ceiling so the reading is still in the ADC's

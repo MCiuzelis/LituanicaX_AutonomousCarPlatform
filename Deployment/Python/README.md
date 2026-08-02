@@ -47,6 +47,7 @@ Deployment/Python/run --disable dashboard --port 9090
 | `--enable/--disable dashboard` | | on |
 | `--enable/--disable screenshot_grabber` | `--enable-screenshot` | off |
 | `--enable/--disable acceleration_test` | `--enable-accel-test` | off |
+| `--enable/--disable skid_pad_test` | `--enable-skid-test` | off |
 | `--enable/--disable recorder` | `--log` / `--no-log` | on via `run` |
 
 In code it is the same thing:
@@ -57,8 +58,64 @@ from lituanicax.robot import Robot, RobotSettings
 Robot(RobotSettings(policy=False, acceleration_test=True)).run()
 ```
 
-The acceleration test takes over the drive, so disable the policy when you run
-it (`--disable-policy --enable-accel-test`); `Robot` warns if both are on.
+The calibration tests take over the drive, so disable the policy when you run one
+(`--disable-policy --enable-accel-test`); `Robot` warns if more than one thing
+that commands the drive is enabled.
+
+## Matching the car to the sim
+
+Three tests, one per axis of the actuator model the policy was trained against.
+Everything they measure feeds back into `Training/source/cone_track/env.py`.
+
+| Test | Measures | Feeds |
+|------|----------|-------|
+| `--enable-accel-test` | straight-line accel + braking distance | `drive_torque`, `brake_torque_base`, `brake_torque_gain`, `max_velocity_m_s` |
+| `--enable-skid-test` | steady-state turn radius at full lock | `max_steer_rad`, `ground_*_friction`, wheelbase |
+| `HardwareTests/steering_angle_test.py` | road-wheel angle at steer ±1 | `max_steer_rad`, `SERVO_AMPLITUDE` |
+
+The longitudinal axis was matched long ago (`Training/real_car_acceleration_log.txt`)
+and behaves. The lateral axis never was, and that is the one that fails: yaw rate
+recovered from the depth-camera image flow in a logged run puts the car at
+1.1–1.7 1/m of curvature at full steer against the sim's 2.37 1/m — a minimum turn
+radius 40–100 % larger than the line the policy plans. The skid pad and the
+steering-angle script are the direct measurements of that number.
+
+```bash
+sudo Deployment/Python/HardwareTests/steering_angle_test.py   # protractor on the front wheels
+Deployment/Python/run --disable-policy --enable-skid-test     # count laps, radius follows
+```
+
+`SkidPadTest` cannot count its own laps — there is no gyro on this car — so it
+reports the distance the wheels covered over a settled window and prints the
+radius for each plausible lap count. Sweep its `THROTTLE` across runs: a radius
+that grows with speed is the understeer gradient, and it separates a steering-
+geometry mismatch (radius too big but constant) from a grip mismatch (radius
+growing), which are two very different edits to `env.py`.
+
+## Throttle and brake scaling
+
+`MAX_THROTTLE` and `BRAKE_MAGNITUDE` sit on opposite sides of zero and must never
+stack. They used to: `Drive._set_throttle` applied `MAX_THROTTLE` after the sign
+was decided, so at `MAX_THROTTLE = 0.4` the policy's hardest brake came out as a
+`1.0 × 0.4 × 0.4 = 0.16` duty worth ~5.4 m/s², against the 12.9 m/s² the sim
+models for the same action. Capping top speed silently removed most of the brakes.
+
+| Constant | Side | Applied in | Mirrors |
+|----------|------|-----------|---------|
+| `MAX_THROTTLE` | forward only | `Drive._set_throttle` | nothing — a hardware ceiling with no sim counterpart |
+| `BRAKE_MAGNITUDE` | braking only | `PolicyRunner.update` | sim `brake_throttle_scale` |
+| `SAFETY_BRAKE_MAGNITUDE` | braking only | `Drive.set_autopilot_enabled` | — |
+
+Because `BRAKE_MAGNITUDE` lives in `PolicyRunner`, a direct `Drive.command()` from
+a calibration test still means raw duty — which is what the braking numbers in
+`real_car_acceleration_log.txt` were measured at.
+
+`THROTTLE_SLEW_ENABLED` turns off the rising-throttle ramp. The ramp has no
+counterpart in the sim and is not a minor correction: in the logged run it was
+below the policy's request on 61 % of ticks and cut mean delivered throttle to
+73 % of what the network asked for. With it off, the closed-loop current limiter
+is the only protection — a real backstop that never engaged in that run (peak
+19.1 A against a 20 A limit).
 
 ## Logging a run (`--log`)
 
@@ -130,14 +187,34 @@ Deployment/Logs/run_<timestamp>/   # written by --log, git-ignored
 | Class | Was | Rate | Reads | Writes |
 |-------|-----|------|-------|--------|
 | `TofCamera` (×2) | `tof_camera_node` | camera-driven | Arducam CSI | latest depth frame, preview JPEG |
-| `PolicyRunner` | `policy_runner_node` | 30 Hz | both cameras, encoder | `Drive.command()` |
+| `PolicyRunner` | `policy_runner_node` | frame-driven (~30 Hz) | both cameras, encoder | `Drive.command()` |
 | `Drive` | `drive_node` | 30 Hz watchdog | monitoring | motor H-bridge + servo PWM |
 | `Encoder` | `encoder_node` | 300 Hz | AS5600 over I²C | velocity, distance |
 | `Monitoring` | `monitoring_node` | 30 Hz | SPI ADC, `/proc` | battery, current, CPU, fault flags |
 | `Dashboard` | `dashboard_node` | 15 Hz | whole robot | HTTP/WebSocket/MJPEG on :8080 |
 | `AccelerationTest` | `acceleration_test_node` | 300 Hz | monitoring | `Drive.command()` |
+| `SkidPadTest` | — (new) | 300 Hz | monitoring | `Drive.command()` |
 | `ScreenshotGrabber` | `screenshot_grabber` | 1 Hz | both cameras | PNGs in `Deployment/Screenshots` |
 | `Recorder` | — (new) | 30 Hz + policy ticks | whole robot | a run directory in `Deployment/Logs` |
+
+### Why the policy tick is frame-driven
+
+`PolicyRunner` waits for **both** cameras to deliver before it runs, rather than
+ticking on a free-running 30 Hz timer. With the sensors free-running near
+29.33 Hz and the loop at 30 Hz, the two settle into a fixed arbitrary phase and
+the loop reads late: measured frame age at inference was 23.2 ms (left) and
+14.3 ms (right), both with a std of only 1.4 ms. Waiting for the *second* arrival
+puts inference right behind the newer frame and leaves the older one stale only
+by the inter-sensor skew, taking mean age from ~18.8 ms to ~4.5 ms.
+
+That is ~14 ms off a loop whose measured command-to-yaw latency is 100 ms against
+the 33 ms `action_delay_ms` the policy was trained with. The remaining 8.9 ms of
+left-vs-right skew is the phase difference between two free-running sensors with
+no shared trigger — not fixable in software without dropping frames.
+
+A stalled camera cannot wedge the loop: the wait times out after 1.5 nominal
+periods and ticks anyway, so `update()` takes its "no fresh frame" branch,
+commands zero, and keeps feeding the drive watchdog.
 
 ## How it replaces ROS
 

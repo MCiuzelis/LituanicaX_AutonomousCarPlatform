@@ -264,6 +264,14 @@ def _camera_worker(
                     cam.releaseFrame(frame)
                     break
 
+                # Stamp the frame the instant the SDK hands it over, before the
+                # copy/orient/publish work below. CLOCK_MONOTONIC is system-wide,
+                # so the parent compares this against its own clock for staleness.
+                # Taken after the copy it used to under-report frame age by
+                # however long this process took to publish, which is exactly the
+                # latency the age is supposed to expose.
+                now = time.monotonic()
+
                 # Deep-copy before releaseFrame. This is the critical guard
                 # against SDK-owned shared buffers bleeding between frames.
                 depth = np.array(frame.depth_data, copy=True).astype(np.float32)
@@ -271,26 +279,29 @@ def _camera_worker(
                 cam.releaseFrame(frame)
 
                 depth, confidence = orient_camera_frame(depth, confidence, vertical_flip)
-                now = time.monotonic()  # CLOCK_MONOTONIC is system-wide: the
-                # parent compares this against its own clock for staleness.
                 frame_count += 1
 
-                jpeg = b""
-                if now - last_preview >= preview_period:
-                    jpeg = depth_to_jpeg(depth, confidence, depth_range)
-                    last_preview = now
-
+                # Publish the depth FIRST and on its own. The preview JPEG is a
+                # dashboard nicety that costs milliseconds of cv2 colormap and
+                # encode work, and it used to run before this block — so on every
+                # preview frame the policy's depth arrived that much later, for a
+                # picture nobody in the control loop reads.
                 with ipc_lock:
                     depth_view[:] = depth
                     conf_view[:] = confidence
                     meta[_M_FRAME_TIME] = now
                     meta[_M_FRAME_COUNT] = float(frame_count)
+
+                if now - last_preview >= preview_period:
+                    last_preview = now
+                    jpeg = depth_to_jpeg(depth, confidence, depth_range)
                     if jpeg:
                         n = min(len(jpeg), PREVIEW_MAX_BYTES)
-                        preview_view[:n] = np.frombuffer(jpeg[:n], dtype=np.uint8)
-                        preview_count += 1
-                        meta[_M_PREVIEW_LEN] = float(n)
-                        meta[_M_PREVIEW_COUNT] = float(preview_count)
+                        with ipc_lock:
+                            preview_view[:n] = np.frombuffer(jpeg[:n], dtype=np.uint8)
+                            preview_count += 1
+                            meta[_M_PREVIEW_LEN] = float(n)
+                            meta[_M_PREVIEW_COUNT] = float(preview_count)
             except Exception as exc:
                 if stop_event.is_set():
                     break
@@ -325,8 +336,14 @@ class TofCamera(Module):
         camera_index: int | None = None,
         max_distance_mm: int = MAX_DISTANCE_MM,
         preview_hz: float = DASHBOARD_HZ,
+        frame_event: threading.Event | None = None,
     ) -> None:
         super().__init__(f"tof_camera_{side}", preview_hz)
+
+        #: Set by the poll thread whenever a new depth frame lands, so the policy
+        #: can run on frame arrival instead of on a free-running timer. Shared
+        #: with the other camera and with PolicyRunner, which owns the clearing.
+        self.frame_event = frame_event
 
         self.side = side
         self.camera_index = camera_index if camera_index is not None else camera_index_for_side(side)
@@ -461,6 +478,12 @@ class TofCamera(Module):
             if jpeg is not None:
                 self.preview_jpeg = jpeg
                 self._seen_preview = preview_count
+
+        # Outside the lock: the waiter immediately reads back through
+        # snapshot_with_id(), so waking it while still holding _lock would just
+        # make it block again.
+        if depth is not None and self.frame_event is not None:
+            self.frame_event.set()
 
     def shutdown(self) -> None:
         self._child_stop.set()

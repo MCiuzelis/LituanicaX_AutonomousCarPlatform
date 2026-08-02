@@ -50,6 +50,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--enable-accel-test", action="store_true", help="Same as --enable acceleration_test"
     )
     parser.add_argument(
+        "--enable-skid-test", action="store_true", help="Same as --enable skid_pad_test"
+    )
+    parser.add_argument(
         "--enable-screenshot", action="store_true", help="Same as --enable screenshot_grabber"
     )
 
@@ -92,6 +95,8 @@ def settings_from_args(args: argparse.Namespace) -> RobotSettings:
         settings.policy = False
     if args.enable_accel_test:
         settings.acceleration_test = True
+    if args.enable_skid_test:
+        settings.skid_pad_test = True
     if args.enable_screenshot:
         settings.screenshot_grabber = True
     # --no-log wins, so `run` can pass --log unconditionally and still be

@@ -25,6 +25,11 @@ class AccelerationTest(Module):
     ACCEL_THROTTLE = 0.5  # 1
     BRAKE_THROTTLE = -0.5
     VELOCITY_EPSILON = 0.1
+    #: Give up waiting for a standstill after this long. The braking phase ends on
+    #: the encoder reading ~zero, so an encoder that stops updating (I2C error,
+    #: unplugged magnet) leaves the test latched in BRAKING with the brake held and
+    #: the autopilot never released. Timing out reports the run instead of hanging.
+    BRAKE_TIMEOUT_S = 4.0
     MONITORING_TIMEOUT_S = 0.2
     TICK_HZ = 300
     STARTUP_DELAY_S = 5.0
@@ -41,6 +46,7 @@ class AccelerationTest(Module):
         self.accel_end_distance = 0.0
         self.peak_velocity = 0.0
         self.accel_start_time = 0.0
+        self.brake_start_time = 0.0
         self._module_start_time = 0.0
 
     def setup(self) -> None:
@@ -117,6 +123,12 @@ class AccelerationTest(Module):
         self.drive.command(self.BRAKE_THROTTLE, 0.0)
         if abs(self.monitoring.linear_velocity) <= self.VELOCITY_EPSILON:
             self._finish(aborted=False)
+        elif time.monotonic() - self.brake_start_time >= self.BRAKE_TIMEOUT_S:
+            self.log.warning(
+                f"Still reading {self.monitoring.linear_velocity:.2f} m/s after "
+                f"{self.BRAKE_TIMEOUT_S:.1f}s of braking — releasing anyway"
+            )
+            self._finish(aborted=False)
 
     def _record_accel_end(self) -> None:
         self.peak_velocity = self.monitoring.linear_velocity
@@ -124,6 +136,7 @@ class AccelerationTest(Module):
 
     def _begin_braking(self) -> None:
         self.state = "BRAKING"
+        self.brake_start_time = time.monotonic()
         self.drive.command(self.BRAKE_THROTTLE, 0.0)
         self.log.info("Braking...")
 

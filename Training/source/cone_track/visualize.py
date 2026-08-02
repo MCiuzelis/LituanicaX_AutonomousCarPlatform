@@ -53,6 +53,16 @@ parser.add_argument("--edge_grad_thresh", type=float, default=None,
     help="Override depth_edge_gradient_threshold_m (gradient m/px that gives edge_weight=1).")
 parser.add_argument("--edge_noise_sigma", type=float, default=None,
     help="Override depth_edge_blur_sigma_m (Gaussian std at full edges, metres).")
+# ToF confidence dropout — the structured range/incidence model matched to the real sensor.
+parser.add_argument("--no_conf", action="store_true",
+    help="Disable the ToF confidence dropout (shows the dense depth the sim used to produce).")
+parser.add_argument("--conf_gain", type=float, default=None,
+    help="Override depth_conf_gain_m2. Higher keeps more pixels; the real camera returns "
+         "only ~21-31%% of the crop band.")
+parser.add_argument("--conf_incidence_exp", type=float, default=None,
+    help="Override depth_conf_incidence_exponent (how hard grazing surfaces are culled).")
+parser.add_argument("--conf_report", type=int, default=None,
+    help="Print dropout statistics every N frames, to compare against the real per-row numbers.")
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -185,6 +195,10 @@ def main():
     if args_cli.color_noise_prob is not None: env_cfg.depth_color_noise_prob             = args_cli.color_noise_prob
     if args_cli.edge_grad_thresh is not None: env_cfg.depth_edge_gradient_threshold_m    = args_cli.edge_grad_thresh
     if args_cli.edge_noise_sigma is not None: env_cfg.depth_edge_blur_sigma_m           = args_cli.edge_noise_sigma
+    if args_cli.no_conf:                      env_cfg.depth_conf_enable                  = False
+    if args_cli.conf_gain        is not None: env_cfg.depth_conf_gain_m2                 = args_cli.conf_gain
+    if args_cli.conf_incidence_exp is not None: env_cfg.depth_conf_incidence_exponent    = args_cli.conf_incidence_exp
+    if args_cli.conf_report      is not None: env_cfg.depth_conf_report_every_n_steps    = args_cli.conf_report
 
     cam_h     = env_cfg.camera_left_cfg.height   # 180
     cam_w     = env_cfg.camera_left_cfg.width    # 240
@@ -212,6 +226,14 @@ def main():
         f"| color_prob={env_cfg.depth_color_noise_prob:.3f}  "
         f"| edge_sigma={env_cfg.depth_edge_blur_sigma_m:.3f} m  "
         f"| edge_thresh={env_cfg.depth_edge_gradient_threshold_m:.3f} m/px"
+    )
+    print(
+        f"[visualize] ToF confidence dropout: "
+        f"{'ON' if env_cfg.depth_conf_enable else 'OFF'}  "
+        f"| gain={env_cfg.depth_conf_gain_m2:.2f} m²  "
+        f"| max_pass={env_cfg.depth_conf_max_pass:.2f}  "
+        f"| incidence_exp={env_cfg.depth_conf_incidence_exponent:.2f}  "
+        f"(real sensor returns ~21 % of the left band, ~31 % of the right)"
     )
     print(f"[visualize] Frames → {out_dir}/   |   Press Ctrl+C to stop.")
 
@@ -267,7 +289,12 @@ def main():
             f"g={env_cfg.depth_noise_sigma_m:.3f} "
             f"inv={env_cfg.depth_invalid_pixel_prob:.2f} "
             f"col={env_cfg.depth_color_noise_prob:.2f} "
-            f"edge={env_cfg.depth_edge_blur_sigma_m:.3f}@{env_cfg.depth_edge_gradient_threshold_m:.2f}"
+            f"edge={env_cfg.depth_edge_blur_sigma_m:.3f}@{env_cfg.depth_edge_gradient_threshold_m:.2f} "
+            + (
+                f"conf={env_cfg.depth_conf_gain_m2:.2f}"
+                if env_cfg.depth_conf_enable
+                else "conf=off"
+            )
         )
         cv2.putText(
             pol_bgr, noise_txt,

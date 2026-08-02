@@ -138,10 +138,25 @@ def main():
     print(f"  brake_power            = {brake_power:.2f}")
     print(f"  max_velocity_m_s       = {max_vel:.2f}  (cfg: {max_vel_cfg})")
     print(f"  car_mass_kg            = {mushr_env.cfg.car_mass_kg}")
-    print(f"  drive_torque           = {drive_torque:.4f} Nm/wheel (stall)")
+    # Stall torque scales with duty (brushed-DC line), so quote it at the throttle in use.
+    _a0 = 4.0 * drive_torque * accel_throttle / WHEEL_RADIUS / mushr_env.cfg.car_mass_kg
+    print(f"  drive_torque           = {drive_torque:.4f} Nm/wheel (stall at FULL throttle)")
+    print(f"  stall torque @ u={accel_throttle:.2f}   = {drive_torque * accel_throttle:.4f} Nm/wheel")
     print(f"  brake_torque_gain      = {brake_torque_gain:.4f} Nm/wheel per unit |throttle|")
     print(f"  no-load speed          = {max_vel_cfg:.2f} m/s")
     print(f"  WHEEL_RADIUS           = {WHEEL_RADIUS} m")
+    print(f"  ground friction        = {mushr_env.cfg.ground_static_friction:.2f} static / "
+          f"{mushr_env.cfg.ground_dynamic_friction:.2f} dynamic (effective μ; grip ceiling "
+          f"≈ {mushr_env.cfg.ground_static_friction:.2f} g)")
+    print("─" * 60)
+    print("  TARGETS — real car, Training/real_car_acceleration_log.txt (all at duty 1.0):")
+    print("    accel   0 → 4.7 m/s in 1.36 s over 3.45 m")
+    print("    brake   from ~4.6 m/s: 2.61 m @ 0.1, 1.77 m @ 0.2, 1.35 m @ 0.3, 0.86 m @ 0.5")
+    print(f"    predicted standing-start accel here = {_a0:.2f} m/s²  "
+          f"(real: {5.95 * accel_throttle:.2f} = 5.95 × duty)")
+    print("    If the sim now falls short of the brake targets, friction is the binding")
+    print("    constraint rather than brake_torque_gain — that is expected after the μ 2.0 →")
+    print("    0.95 correction, and the brake terms should be re-fitted, not the friction.")
     print("─" * 60)
 
     all_ids = mushr_env._all_throttle_ids
