@@ -1,0 +1,4 @@
+(fp_lib_table
+	(version 7)
+	(lib (name "TimerLib") (type "KiCad") (uri "/Users/matasciuzelis/Projects/LituanicaX_InteligentRobotCompetition/CAD/Timer/Library/TimerLib.pretty") (options "") (descr ""))
+)

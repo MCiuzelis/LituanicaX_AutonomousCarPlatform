@@ -1,193 +1,94 @@
-# LituanicaX — Intelligent Robot Competition
+# LituanicaX — Intelligent Robot Competition (CAD)
 
-RL-trained autonomous RC car that navigates a cone-track circuit using a depth camera.  
-Policy trained in NVIDIA Isaac Sim 5.1 / Isaac Lab (PPO); deployed on a Raspberry Pi 5.
+Mechanical and electrical design files for the LituanicaX autonomous RC car:
+a Raspberry Pi 5–based robot that navigates a cone-track circuit using a
+depth camera.
+
+This branch of the repository contains **only the CAD**. The RL training
+pipeline (Isaac Lab) and the Raspberry Pi deployment code were removed from
+the tree but are fully preserved in git history — check out any commit
+before the "CAD-only" commit to get them back.
 
 ---
 
 ## Repository Structure
 
 ```
-.
-├── Deployment/               # Code that runs on the Raspberry Pi 5
-│   ├── autopilot.py          # Main autonomous-driving loop
-│   ├── hardware.py           # Motor, servo, and camera interface
-│   └── Policy/               # Exported policy files (deploy these to the Pi)
-│       ├── policy.pt         # TorchScript export
-│       └── policy.onnx       # ONNX export (used by autopilot.py)
+CAD/
+├── PCB/                        # Main driver board (KiCad)
+│   ├── Main_V2/                # KiCad project — schematic + layout, V2
+│   │   ├── Main.kicad_pro
+│   │   ├── Main.kicad_sch
+│   │   ├── Main.kicad_pcb
+│   │   └── jlcpcb/             # Fabrication outputs for JLCPCB
+│   │       ├── gerber/         # Gerber + drill files
+│   │       └── production_files/   # BOM, CPL (pick-and-place), gerber zip
+│   ├── RC_CAR.kicad_sym        # Project symbol library
+│   ├── RC_CAR.pretty/          # Project footprint library
+│   ├── Downloaded_IC_Models/   # Vendor symbols / footprints / 3D models
+│   └── board_V2.step           # 3D export of the assembled board
 │
-├── CAD/
-│   ├── Car/                  # MuSHR nano v2 CAD (Blender + STL)
-│   └── PCB/                  # KiCAD schematic + layout for driver board
+├── Solidworks/                 # Mechanical design (SolidWorks)
+│   ├── !Main.SLDASM            # Top-level assembly
+│   ├── Case.SLDPRT             # Electronics enclosure
+│   ├── CameraMount.SLDPRT      # Depth-camera mount + adapter
+│   ├── CameraAdapter.SLDPRT
+│   ├── MountAdapter.SLDPRT     # Chassis-to-case adapter
+│   ├── servoMount.SLDPRT       # Steering-servo bracket
+│   ├── ExtendedHeaders.SLDPRT
+│   ├── board_V2.SLDPRT         # PCB reference geometry
+│   ├── Raspberry_pi_5.SLDPRT   # Off-the-shelf part models
+│   ├── RP5_ActiveCooler.SLDPRT
+│   ├── RPiAIHaloHat.SLDPRT
+│   ├── SparkfunVoltmeter.SLDPRT
+│   ├── STEP/                   # STEP versions of the reference parts
+│   └── export/                 # Print-ready parts (3MF exports are not tracked)
 │
-└── Training/                 # Isaac Sim RL training pipeline
-    ├── assets/
-    │   ├── Track/            # Blender sources for the track and its props
-    │   └── Export/           # USD the sim loads (+ textures/)
-    │       ├── mushr_nano_v2.usd
-    │       ├── Track.usdc    # Cone-track (visible to the depth cameras)
-    │       ├── Walls.usdc    # Boundary walls (termination only, invisible)
-    │       └── Assets_1..5.usdc  # Prop sets, cycled during training
-    ├── outputs/              # One directory per run — excluded from git
-    └── source/
-        └── cone_track/
-            ├── __init__.py           # gym.register("ConeTrack", ...)
-            ├── env.py                # ConeTrackEnv + ConeTrackEnvCfg
-            ├── ppo_cfg.py            # ConeTrackPPORunnerCfg
-            ├── actor_critic.py       # Policy network
-            ├── train.py              # Entry point — launches Isaac Sim, runs PPO
-            ├── play.py               # Loads a checkpoint, runs inference + FPV view
-            ├── visualize.py          # Manual WASD drive + live depth-camera windows
-            ├── acceleration_test.py  # Drivetrain bench test
-            └── cli_args.py           # Shared RSL-RL CLI arguments
+└── Timer/                      # Lap-timer board (KiCad, ESP32 + ToF sensor)
+    ├── Kicad/                  # Timer.kicad_pro / _sch / _pcb
+    ├── Library/                # TimerLib symbol + footprint library
+    └── DownloadedICs/          # Vendor symbols / footprints / 3D models
 ```
 
 ---
 
-## Hardware
+## Hardware Overview
 
 | Component | Details |
 |---|---|
-| Robot | MuSHR nano v2 — Ackermann-steered, all-wheel-drive RC car |
-| Onboard compute | Raspberry Pi 5 (4 GB) |
-| Depth sensor | ArduCam TOF — 240×180 px @ 30 fps, 70° diagonal FOV, ±2 cm accuracy |
-| Custom PCB | Motor driver + servo control + power management (CAD/PCB/) |
-| Training GPU | Any NVIDIA GPU supported by Isaac Sim (RTX 3080+ recommended) |
+| Robot | Ackermann-steered RC car chassis, custom 3D-printed mounts and case |
+| Onboard compute | Raspberry Pi 5 |
+| Depth sensor | ArduCam ToF camera on the custom `CameraMount` |
+| Main PCB (`CAD/PCB`) | Motor driver, servo control, power management, Pi header breakout |
+| Timer PCB (`CAD/Timer`) | ESP32-based lap timer with TMF8801 ToF sensor, USB-C, RS-485 |
 
 ---
 
-## Installation (Training — Linux only)
+## Tooling
 
-**Supported OS: Ubuntu 24.04 LTS (x86-64).  Ubuntu 26.04 is not supported by Isaac Sim 5.1.**
-
-### 1. Install `uv`
-
-```bash
-wget -qO- https://astral.sh/uv/install.sh | sh
-```
-
-### 2. Run the setup script
-
-From the repository root:
-
-```bash
-./Training/install.sh
-```
-
-This will:
-1. Initialize and update the `Training/IsaacLab` git submodule.
-2. Pin the submodule to Isaac Lab `v2.3.0` (required for Isaac Sim 5.1 compatibility).
-3. Create `Training/.venv` and install all dependencies with `uv sync`.
-
-See `Training/README.md` for details.
-
----
-
-## Terminal Shortcuts
-
-Four shortcuts are installed to `~/.local/bin` so you can run training commands from any directory:
-
-| Command | Equivalent |
+| Files | Tool |
 |---|---|
-| `train [args]` | `cd Training && uv run python source/cone_track/train.py [args]` |
-| `play [args]` | `cd Training && uv run python source/cone_track/play.py [args]` |
-| `visualize [args]` | `cd Training && uv run python source/cone_track/visualize.py [args]` |
-| `acceleration_test [args]` | `cd Training && uv run python source/cone_track/acceleration_test.py [args]` |
+| `*.kicad_pro`, `*.kicad_sch`, `*.kicad_pcb` | KiCad 8+ |
+| `*.SLDPRT`, `*.SLDASM` | SolidWorks 2024+ |
+| `*.step` / `*.stp` | Any CAD viewer |
 
-`~/.local/bin` must be on your `PATH` (it is by default on Ubuntu 24.04).  
-Changes take effect in new terminal sessions (or run `source ~/.bashrc`).
+### Regenerating fabrication files
 
----
+Open `CAD/PCB/Main_V2/Main.kicad_pro` in KiCad and run the
+*Fabrication Toolkit* / JLCPCB plugin — outputs land in `Main_V2/jlcpcb/`.
 
-## Training
+### 3D-printed parts
 
-```bash
-# Basic run (default 40 envs, 3000 iterations)
-train --task ConeTrack
-
-# Common overrides
-train --task ConeTrack \
-    --num_envs 200 \
-    --max_iterations 5000 \
-    --seed 42 \
-    --run_name my_experiment
-```
-
-Every run writes a single directory — checkpoints, TensorBoard events, resolved
-configs, and the exported policy all land in:
-```
-Training/outputs/<YYYY-MM-DD_HH-MM-SS>[_<run_name>]/
-```
-
-Monitor training (`train` opens this for you automatically):
-```bash
-cd Training && uv run tensorboard --logdir outputs/
-```
+Open `CAD/Solidworks/!Main.SLDASM` and export the printed parts
+(`Case`, `CameraMount`, `CameraAdapter`, `MountAdapter`, `servoMount`) to
+3MF/STL for your slicer. Slicer exports (`*.3mf`) are ignored by git —
+the SolidWorks sources are the single source of truth.
 
 ---
 
-## Inference / Playback
+## What is *not* tracked
 
-```bash
-# Load the latest checkpoint automatically
-play --task ConeTrack --num_envs 1
-
-# Load a specific checkpoint
-play --task ConeTrack --num_envs 1 \
-    --checkpoint Training/outputs/<run>/model_1000.pt
-
-# First-person depth-camera view (requires $DISPLAY)
-play --task ConeTrack --num_envs 1 --fpv
-```
-
-`play.py` exports the policy to `<checkpoint_dir>/exported/policy.pt` and `policy.onnx`
-on every run — copy these to `Deployment/Policy/` for on-robot use.
-
----
-
-## Depth Camera Visualisation (no policy)
-
-```bash
-visualize --task ConeTrack
-
-# Tune crop and noise parameters live
-visualize --task ConeTrack \
-    --crop_top 0.30 --crop_bottom 0.25 \
-    --noise_sigma 0.010 --invalid_prob 0.15
-```
-
-Opens four cv2 windows (left/right × raw/policy-processed depth).  
-WASD to drive; `Q` to quit.
-
----
-
-## Deployment on Raspberry Pi 5
-
-### One-time hardware setup
-
-Enable hardware PWM by adding to `/boot/firmware/config.txt`:
-```
-dtoverlay=pwm-2chan,pin=12,func=4,pin2=18,func2=4
-```
-
-### Running the autopilot
-
-```bash
-source ~/arducam_venv/bin/activate
-python Deployment/autopilot.py
-```
-
-The autopilot loads `Deployment/Policy/policy.onnx` and drives the car autonomously.  
-Hold **Spacebar** in the browser UI to activate the policy.
-
----
-
-## Sim-to-Real Notes
-
-- The policy observes **normalised depth** only (no RGB, no velocity).  
-  Close objects → 1.0; far/clear → 0.0.
-- Noise simulated during training: Gaussian σ ≈ 0.008 m, 20 % invalid-pixel dropout,
-  5 % colour-speckle, and edge-blur at depth discontinuities.
-- Action latency of 33 ms (1 policy step) is simulated in training to match hardware.
-- `Deployment/autopilot.py` mirrors the same depth pipeline (`crop → clamp → normalise`)
-  used in `env.py → _process_single_depth()`.
+`.gitignore` excludes KiCad auto-backups (`*-backups/`), VS Code local
+history (`.history/`), KiCad local project settings (`*.kicad_prl`),
+`*.bak` library backups, SolidWorks lock files (`~$*`), 3MF/G-code slicer
+exports, and OS noise.

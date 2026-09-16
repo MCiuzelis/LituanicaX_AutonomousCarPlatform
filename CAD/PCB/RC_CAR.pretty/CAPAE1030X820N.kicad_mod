@@ -1,0 +1,250 @@
+(footprint "CAPAE1030X820N"
+	(version 20260206)
+	(generator "pcbnew")
+	(generator_version "10.0")
+	(layer "F.Cu")
+	(descr "J80")
+	(tags "Capacitor Polarised")
+	(property "Reference" "C**"
+		(at 0 0 0)
+		(layer "F.SilkS")
+		(uuid "596a1b86-b588-40e5-acd5-0eb91f979a75")
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.254)
+			)
+		)
+	)
+	(property "Value" "CAPAE1030X820N"
+		(at 0 0 0)
+		(layer "F.SilkS")
+		(hide yes)
+		(uuid "08722750-5a65-4c88-841b-7251df1633e5")
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.254)
+			)
+		)
+	)
+	(property "Datasheet" ""
+		(at 0 0 0)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "af990a4f-b551-467a-99c2-517e282e57ba")
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+		)
+	)
+	(property "Description" ""
+		(at 0 0 0)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "9aeeec0c-cdcb-4456-8bc6-7de570b58ef7")
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+		)
+	)
+	(attr smd)
+	(duplicate_pad_numbers_are_jumpers no)
+	(fp_line
+		(start -5.120703 -2.53)
+		(end -5.120703 2.58)
+		(stroke
+			(width 0.2)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "bb57f559-56db-4eb3-99c9-55b6304afd69")
+	)
+	(fp_line
+		(start -5.120703 -2.529297)
+		(end -2.5 -5.15)
+		(stroke
+			(width 0.2)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "35027e64-9f36-457e-90fb-cd1636a75dc3")
+	)
+	(fp_line
+		(start -5.12 2.58)
+		(end -2.55 5.15)
+		(stroke
+			(width 0.2)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "e6d36627-85d4-46aa-b580-2d5d6b33b199")
+	)
+	(fp_line
+		(start -2.55 5.15)
+		(end 5.15 5.15)
+		(stroke
+			(width 0.2)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "f425a626-6f6a-408b-9332-6d3bc02acafd")
+	)
+	(fp_line
+		(start -2.5 -5.15)
+		(end 5.15 -5.15)
+		(stroke
+			(width 0.2)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "e2437e38-5e68-4fc7-9957-4146a80eb2d9")
+	)
+	(fp_line
+		(start 5.15 -5.15)
+		(end 5.15 5.15)
+		(stroke
+			(width 0.2)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "6f0fcc61-614b-46e7-91e5-ce268ff27730")
+	)
+	(fp_line
+		(start -6.825 -5.75)
+		(end 6.825 -5.75)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "7e40e679-9e46-4e05-aecc-265ef0a76504")
+	)
+	(fp_line
+		(start -6.825 5.75)
+		(end -6.825 -5.75)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "21e0b307-07f2-4685-9382-f6251e5860d6")
+	)
+	(fp_line
+		(start 6.825 -5.75)
+		(end 6.825 5.75)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "dcefb08b-490b-4e93-8fdd-134e613646db")
+	)
+	(fp_line
+		(start 6.825 5.75)
+		(end -6.825 5.75)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "acd7c48d-207b-4dd4-adeb-fde6c3e94ef6")
+	)
+	(fp_line
+		(start -5.15 -2.575)
+		(end -5.15 2.575)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.Fab")
+		(uuid "3fecee4d-50e2-48a8-9f8c-387dca47e3ef")
+	)
+	(fp_line
+		(start -5.15 2.575)
+		(end -2.575 5.15)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.Fab")
+		(uuid "c2a6be19-7988-4d7c-8a19-b81904ef024c")
+	)
+	(fp_line
+		(start -2.575 -5.15)
+		(end -5.15 -2.575)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.Fab")
+		(uuid "4bec1281-54d0-4e04-a1b5-a579cb996a7c")
+	)
+	(fp_line
+		(start -2.575 5.15)
+		(end 5.15 5.15)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.Fab")
+		(uuid "48ac1502-5bd7-4ef5-975b-1bc18ff35777")
+	)
+	(fp_line
+		(start 5.15 -5.15)
+		(end -2.575 -5.15)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.Fab")
+		(uuid "5a59f040-3a7d-443b-9066-fa9fdff98240")
+	)
+	(fp_line
+		(start 5.15 5.15)
+		(end 5.15 -5.15)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.Fab")
+		(uuid "ae8f01ff-b49d-41ed-9832-f328481a8c5e")
+	)
+	(fp_text user "${REFERENCE}"
+		(at 0 0 0)
+		(layer "F.Fab")
+		(uuid "da60e568-888a-46cb-b9f8-9f900e034e8c")
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.254)
+			)
+		)
+	)
+	(pad "1" smd rect
+		(at 4.25 0 90)
+		(size 2.1 4.15)
+		(layers "F.Cu" "F.Mask" "F.Paste")
+		(uuid "becce92a-e714-49e7-ab36-5a1cf22bf65a")
+	)
+	(pad "2" smd rect
+		(at -4.25 0 90)
+		(size 2.1 4.15)
+		(layers "F.Cu" "F.Mask" "F.Paste")
+		(uuid "f07f43f5-0f4a-44e3-89f1-8d5b4f7ed2fb")
+	)
+	(embedded_fonts no)
+	(model "/Users/matasciuzelis/Projects/LituanicaX_InteligentRobotCompetition/CAD/PCB/Downloaded_IC_Models/APXG160ARA561MJ80G/APXG160ARA561MJ80G.stp"
+		(offset
+			(xyz 0 0 0)
+		)
+		(scale
+			(xyz 1 1 1)
+		)
+		(rotate
+			(xyz 0 0 0)
+		)
+	)
+)
