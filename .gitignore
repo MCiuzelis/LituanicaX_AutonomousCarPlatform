@@ -37,3 +37,8 @@ fp-info-cache
 #    only — see README. Ignored so a local checkout stays clean.
 /Deployment/
 /Training/
+
+# ── Animation: rendered frame sequence + Blender autosaves (regenerate from .blend)
+/Animation/Frames/
+*.blend1
+*.blend@

@@ -48,6 +48,12 @@ CAD/
     ├── Kicad/                  # Timer.kicad_pro / _sch / _pcb
     ├── Library/                # TimerLib symbol + footprint library
     └── DownloadedICs/          # Vendor symbols / footprints / 3D models
+
+Animation/
+├── race_animation.blend        # Blender scene of the race animation
+├── RaceAnimation.mp4           # Rendered video
+├── KICK-OFF_v3.pptx            # Kick-off presentation
+└── Frames/                     # Rendered PNG frame sequence (not tracked)
 ```
 
 ---
@@ -91,4 +97,5 @@ the SolidWorks sources are the single source of truth.
 `.gitignore` excludes KiCad auto-backups (`*-backups/`), VS Code local
 history (`.history/`), KiCad local project settings (`*.kicad_prl`),
 `*.bak` library backups, SolidWorks lock files (`~$*`), 3MF/G-code slicer
-exports, and OS noise.
+exports, the rendered `Animation/Frames/` PNG sequence, Blender
+`*.blend1` autosaves, and OS noise.
