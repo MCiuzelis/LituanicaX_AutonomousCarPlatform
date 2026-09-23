@@ -144,11 +144,13 @@ class Camera(Subsystem):
         return max(fitting, key=lambda m: m.max_fps)
 
     # ---- mode switching --------------------------------------------------
-    def set_mode(self, width, height, fps=30.0, sensor_mode=None, settle_s=0.3, **controls):
+    def set_mode(self, width, height, fps=30.0, sensor_mode=None, settle_s=0.3, lores=None, **controls):
         """(Re)configure output resolution + frame rate and start streaming.
 
         Can be called while running: the pipeline is stopped, reconfigured and restarted.
         Returns the effective CameraMode (fps may be clamped to the sensor mode maximum).
+        lores=(w, h, format) adds a second, ISP-scaled stream (e.g. (640, 360, "BGR888") for the
+        detector); encoders keep using the main stream.
         Extra keyword args are passed as libcamera controls (e.g. ExposureTime=15000).
         """
         cam = self.cam
@@ -161,6 +163,7 @@ class Camera(Subsystem):
             self._running = False
         cfg = cam.create_video_configuration(
             main={"size": (width, height), "format": self.pixel_format},
+            lores={"size": lores[:2], "format": lores[2]} if lores else None,
             raw={"size": sensor_mode.size, "format": sensor_mode.raw_format},
         )
         try:

@@ -34,6 +34,12 @@
   #reclist li span { flex:1; }
   #reclist button { padding:2px 8px; font-size:12px; }
   video { width:100%; border-radius:6px; background:#000; display:none; margin-top:8px; }
+  .camwrap { position:relative; }
+  canvas#ov { position:absolute; left:0; top:0; width:100%; height:100%; pointer-events:none; }
+  #hud { position:absolute; left:8px; top:8px; padding:2px 8px; border-radius:4px; background:rgba(0,0,0,.55);
+         font:12px/1.5 ui-monospace, monospace; color:#fff; display:none; }
+  input[type=range] { padding:0; vertical-align:middle; width:110px; }
+  select#vmodel { max-width:220px; }
 </style>
 </head>
 <body>
@@ -48,7 +54,11 @@
 </header>
 <main>
   <section class="panel">
-    <img id="cam" src="/stream.mjpg" alt="camera">
+    <div class="camwrap">
+      <img id="cam" src="/stream.mjpg" alt="camera">
+      <canvas id="ov"></canvas>
+      <div id="hud"></div>
+    </div>
     <div class="row">
       <label>Resolution <select id="mode"></select></label>
       <span id="camstat" class="keys"></span>
@@ -56,6 +66,15 @@
       <span style="flex:1"></span>
       <button id="drivebtn">enable keyboard driving</button>
       <label>throttle <input id="lvl" type="number" min="1" max="20" value="10" style="width:60px"> %</label>
+    </div>
+    <div class="row">
+      <button id="visbtn">&#9654; detection</button>
+      <label>model <select id="vmodel"></select></label>
+      <label>classes <select id="vfilter"><option value="apple">apple only</option><option value="all">all</option></select></label>
+      <label>conf <input id="vconf" type="range" min="0.05" max="0.95" step="0.05" value="0.35"> <span id="vconfv">0.35</span></label>
+      <label><input id="vshow" type="checkbox" checked> boxes</label>
+      <label><input id="vlabels" type="checkbox" checked> labels</label>
+      <span id="vstat" class="keys"></span>
     </div>
     <div id="ctrl">
       <div><div class="keys">throttle</div><div class="big" id="c-t">0 %</div><div class="bar"><i id="b-t" style="width:0"></i></div></div>
@@ -66,6 +85,7 @@
       Server caps throttle at <span id="cap">20</span> %; motor stops if no command for 0.4 s.</p>
   </section>
   <aside class="panel">
+    <h2>Vision</h2><table id="t-vision"></table>
     <h2>Drive</h2><table id="t-drive"></table>
     <h2>Battery / power</h2><table id="t-power"></table>
     <h2>System</h2><table id="t-sys"></table>
@@ -110,6 +130,7 @@ function render(d) {
   const lk = c.links_ms||{};
   const age = k => (lk[k]==null) ? 'never' : (lk[k] < 1000 ? lk[k]+' ms ago' : fmt(lk[k]/1000,0)+' s ago');
   table('t-links', [['wifi', w.up ? fmt(w.level_dbm,0)+' dBm' : 'down'], ['browser cmd', age('ws')], ['pc client cmd', age('tcp')]]);
+  renderVision(d.vision||{}, cam);
   const rec = cam.recording;
   $('recbtn').textContent = rec ? '■ stop recording' : '● record';
   $('recbtn').classList.toggle('rec', !!rec);
@@ -138,6 +159,89 @@ $('mode').onchange = async () => {
   if (!r.ok) { $('camstat').textContent = (await r.json()).error; return; }
   $('cam').src = '/stream.mjpg?' + Date.now();
 };
+
+// ---- vision: boxes overlay (own websocket, up to 30 Hz) + controls
+let det = {boxes: []}, detAt = 0, vis = {};
+function connectDet() {
+  const s = new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws/det');
+  s.onmessage = ev => { det = JSON.parse(ev.data); detAt = performance.now(); requestAnimationFrame(drawOv); };
+  s.onclose = () => setTimeout(connectDet, 1000);
+}
+connectDet();
+function scoreColor(sc) { const t = Math.max(0, Math.min(1, (sc - 0.3) / 0.6)); return `hsl(${Math.round(t*120)},90%,55%)`; }
+function drawOv() {
+  const img = $('cam'), cv = $('ov'), dpr = window.devicePixelRatio || 1;
+  const W = img.clientWidth, H = img.clientHeight;
+  if (cv.width !== Math.round(W*dpr) || cv.height !== Math.round(H*dpr)) { cv.width = Math.round(W*dpr); cv.height = Math.round(H*dpr); }
+  const g = cv.getContext('2d');
+  g.setTransform(dpr,0,0,dpr,0,0); g.clearRect(0,0,W,H);
+  const fresh = vis.on && performance.now() - detAt < 500;
+  $('hud').style.display = vis.on ? 'block' : 'none';
+  if (!fresh || !$('vshow').checked) return;
+  g.lineWidth = 2; g.font = '12px ui-monospace, monospace'; g.textBaseline = 'bottom';
+  for (const [x1,y1,x2,y2,sc,lab] of det.boxes) {
+    const c = scoreColor(sc), x = x1*W, y = y1*H, w = (x2-x1)*W, h = (y2-y1)*H;
+    g.strokeStyle = c; g.strokeRect(x, y, w, h);
+    if ($('vlabels').checked) {
+      const t = (lab==='apple' ? '' : lab+' ') + sc.toFixed(2), tw = g.measureText(t).width + 6;
+      const ty = y > 14 ? y : y + h + 14;
+      g.fillStyle = 'rgba(0,0,0,.6)'; g.fillRect(x-1, ty-14, tw, 14); g.fillStyle = c; g.fillText(t, x+2, ty-1);
+    }
+  }
+}
+window.addEventListener('resize', () => requestAnimationFrame(drawOv));
+setInterval(() => requestAnimationFrame(drawOv), 250);   // clears stale boxes when detection stops
+async function setVision(body) {
+  const r = await fetch('/api/vision', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+  const j = await r.json(); if (!r.ok) $('vstat').textContent = j.error;
+}
+$('visbtn').onclick = () => { $('vstat').textContent = vis.requested ? '' : 'loading model…'; setVision({on: !vis.requested}); };
+$('vmodel').onchange = () => setVision({hef: $('vmodel').value});
+$('vfilter').onchange = () => setVision({filter: $('vfilter').value});
+$('vconf').oninput = () => { $('vconfv').textContent = Number($('vconf').value).toFixed(2); };
+$('vconf').onchange = () => setVision({conf: Number($('vconf').value)});
+// page-side delay: half the HTTP round trip to the Pi (clocks are not synced, so this is the
+// best estimate of how long boxes take to reach this browser after the Pi has them)
+let netLag = null;
+setInterval(async () => {
+  const t0 = performance.now();
+  try { await fetch('/api/telemetry', {cache:'no-store'}); netLag = (performance.now() - t0) / 2; } catch (e) {}
+}, 2000);
+let modelsKey = '';
+function renderVision(v, cam) {
+  vis = v;
+  $('visbtn').innerHTML = v.requested ? '&#9632; detection' : '&#9654; detection';
+  $('visbtn').classList.toggle('on', !!v.requested);
+  const key = (v.models||[]).join('|');
+  if (key !== modelsKey) {
+    modelsKey = key;
+    $('vmodel').innerHTML = (v.models||[]).map(m => `<option value="${m}">${m.split('/').pop()}${m.startsWith('/usr/') ? ' (stock COCO)' : ''}</option>`).join('');
+  }
+  if (document.activeElement !== $('vmodel')) $('vmodel').value = v.hef_path;
+  if (document.activeElement !== $('vfilter')) $('vfilter').value = v.filter;
+  $('vfilter').disabled = v.classes === 1;
+  if (document.activeElement !== $('vconf')) { $('vconf').value = v.conf; $('vconfv').textContent = fmt(v.conf,2); }
+  if (v.error) $('vstat').textContent = 'error: ' + v.error;
+  else if (v.on || !v.requested) $('vstat').textContent = '';
+  const L = v.lat_ms||{}, b = v.boxes||{}, camFps = cam.mode ? cam.mode[2] : null;
+  const wide = cam.sensor && cam.sensor !== '1536x864';
+  const apples = v.filter === 'apple' || v.classes === 1;
+  table('t-vision', [
+    ['state', v.error ? '<span style="color:var(--bad)">error</span>' : v.on ? '<span style="color:var(--ok)">running</span>' : (v.requested ? 'starting…' : 'off')],
+    ['model', `${v.hef} <span class="keys">(${v.classes||'?'} cls)</span>`],
+    ['detection rate', `${fmt(v.fps,1)} / ${fmt(camFps,0)} fps <span class="keys">· dropped ${fmt(v.dropped_pct,1)} %</span>`],
+    ['delay sensor→boxes', `${fmt(L.p50,1)} ms <span class="keys">p95 ${fmt(L.p95,1)} · max ${fmt(L.max,0)}</span>`],
+    ['&nbsp;&nbsp;sensor→python', fmt(v.sensor_ms,1)+' ms'],
+    ['&nbsp;&nbsp;hailo (pcie+npu+nms)', fmt(v.hailo_ms,1)+' ms'],
+    ['&nbsp;&nbsp;queue+decode', fmt(v.other_ms,1)+' ms'],
+    ['&nbsp;&nbsp;+ wifi to this page', v.on && netLag!=null ? '≈ '+fmt(netLag,0)+' ms' : '–'],
+    ['boxes', `${b.now??'–'} now <span class="keys">· mean ${fmt(b.mean,1)} · top ${fmt(b.max_score,2)}</span>`],
+    ['hailo chip', v.chip_temp_c==null ? '–' : fmt(v.chip_temp_c,1)+' °C'],
+    ['detector input', v.lores ? `${v.lores[0]}×${v.lores[1]} ← sensor ${cam.sensor||'?'}${wide ? ' <span style="color:var(--warn)">(wider FoV than training)</span>' : ''}` : '–'],
+    ['frames processed', v.frames ?? '–'],
+  ]);
+  $('hud').textContent = v.on ? `${fmt(v.fps,0)} fps · ${fmt(L.p50,0)} ms · ${b.now??0} ${apples ? 'apples' : 'objects'}` : '';
+}
 
 // ---- recording
 let recording = false;

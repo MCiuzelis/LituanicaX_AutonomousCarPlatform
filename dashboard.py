@@ -9,6 +9,8 @@ Serves
                            switching, mp4 recording, all telemetry, keyboard driving over a
                            WebSocket
   tcp  <pi>:8081           command/health link for car_client.py on a PC
+  /ws/det, /api/vision     Hailo object detection on the camera (Vision class): boxes for the
+                           page overlay, and on/off + model/threshold/class filter settings
 
 Protocol on both the WebSocket and the tcp link (one JSON object per line):
   client -> pi   {"t": -1..1, "s": -1..1}   throttle (negative = brake) and steering, sent
@@ -25,18 +27,21 @@ import json
 import logging
 import os
 import socket
+import statistics
 import sys
 import threading
 import time
 from collections import deque
 from fractions import Fraction
 
+import numpy as np
 from aiohttp import web
 from picamera2.encoders import JpegEncoder, LibavH264Encoder
 from picamera2.outputs import FileOutput, PyavOutput
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.join(ROOT, "vision"))
 from hardware import Drive, Camera, BoardPower, BatteryMonitor, HailoBoard  # noqa: E402
 
 HTTP_PORT, TCP_PORT = 8080, 8081
@@ -53,6 +58,17 @@ CAMERA_MODES = [(640, 360, 120), (640, 480, 120), (800, 600, 120), (1024, 576, 1
 DEFAULT_MODE = (1280, 720, 60)
 WEB_DIR = os.path.join(ROOT, "web")
 REC_DIR = os.path.join(ROOT, "recordings")
+MODEL_DIR = os.path.join(ROOT, "models")
+STOCK_HEF = "/usr/share/hailo-models/yolov8s_h8.hef"   # COCO yolov8s: same arch/input as ours
+DET_PUSH_HZ = 30             # max rate boxes are pushed to the page overlay
+COCO_NAMES = (
+    "person bicycle car motorcycle airplane bus train truck boat traffic_light fire_hydrant "
+    "stop_sign parking_meter bench bird cat dog horse sheep cow elephant bear zebra giraffe "
+    "backpack umbrella handbag tie suitcase frisbee skis snowboard sports_ball kite baseball_bat "
+    "baseball_glove skateboard surfboard tennis_racket bottle wine_glass cup fork knife spoon bowl "
+    "banana apple sandwich orange broccoli carrot hot_dog pizza donut cake chair couch potted_plant "
+    "bed dining_table toilet tv laptop mouse remote keyboard cell_phone microwave oven toaster sink "
+    "refrigerator book clock vase scissors teddy_bear hair_drier toothbrush").split()
 
 log = logging.getLogger("dashboard")
 
@@ -144,6 +160,7 @@ class CameraStream:
         self.out = StreamingOutput()
         self.lock = threading.Lock()
         self.mode = None           # (width, height, fps) currently streaming
+        self.lores_size = None     # (640, h) RGB copy of every frame for the detector
         self.rec = None            # (encoder, path, start_time) while recording
         os.makedirs(REC_DIR, exist_ok=True)
         self.set_mode(*mode)
@@ -154,7 +171,10 @@ class CameraStream:
                 raise RuntimeError("stop the recording before switching resolution")
             if self.mode is not None:
                 self.cam.cam.stop_encoder()
-            m = self.cam.set_mode(int(w), int(h), float(fps), settle_s=0.0)
+            # detector input: 640 wide, same aspect as main (ISP-scaled, costs no CPU)
+            lo = (640, min(640, int(h) * 640 // int(w)) // 2 * 2)
+            m = self.cam.set_mode(int(w), int(h), float(fps), settle_s=0.0, lores=(*lo, "BGR888"))
+            self.lores_size = lo
             self.cam.cam.start_encoder(JpegEncoder(q=70), FileOutput(self.out))
             self.mode = (m.width, m.height, m.fps)
             log.info("camera %dx%d @ %.1f fps", *self.mode)
@@ -198,7 +218,9 @@ class CameraStream:
         if self.rec:
             rec = {"file": os.path.basename(self.rec[1]), "seconds": round(time.monotonic() - self.rec[2], 1)}
         fs = os.statvfs(REC_DIR)
+        m = self.cam.mode
         return {"mode": self.mode, "stream_fps": round(self.out.fps, 1), "modes": CAMERA_MODES,
+                "sensor": m and "%dx%d" % m.sensor.size,
                 "recording": rec, "disk_free_gb": round(fs.f_bavail * fs.f_frsize / 1e9, 2)}
 
     def close(self):
@@ -211,12 +233,202 @@ class CameraStream:
             self.cam.close()
 
 
+# ---------------------------------------------------------------- vision (Hailo detector)
+def _pct(xs, p):
+    if not xs:
+        return None
+    s = sorted(xs)
+    return round(s[min(len(s) - 1, int(len(s) * p))], 2)
+
+
+class Vision:
+    """Runs the Hailo detector on the camera's lores stream while switched on.
+
+    A capture thread submits every lores frame to the Hailo (async, several frames may be in
+    flight); a result thread collects them in order and publishes boxes the moment the chip is
+    done. Delay is measured from the frame's SensorTimestamp (start of sensor readout,
+    CLOCK_MONOTONIC) to the moment its boxes are available here.
+    """
+
+    def __init__(self, camera):
+        self.camera = camera
+        self.cond = threading.Condition()
+        self.latest = {"seq": 0, "boxes": []}
+        default = os.path.join(MODEL_DIR, "apple_yolov8s.hef")
+        self.cfg = {"on": False, "hef": default if os.path.exists(default) else STOCK_HEF,
+                    "conf": 0.35, "filter": "apple"}
+        self.det, self.names, self.error = None, [], None
+        self.chip_temp, self._next_temp = None, 0.0
+        self.frames = self.dropped = 0
+        self._last_ts = None
+        n = 240
+        self.t_done, self.lat_total, self.lat_sensor = deque(maxlen=n), deque(maxlen=n), deque(maxlen=n)
+        self.lat_hailo, self.n_boxes, self.max_score = deque(maxlen=n), deque(maxlen=n), deque(maxlen=n)
+        self._det_lock = threading.Lock()   # guards self.det between the two threads
+        self._run = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        self._results = threading.Thread(target=self._result_loop, daemon=True)
+        self._results.start()
+
+    # ---- control
+    @staticmethod
+    def models():
+        out = sorted(os.path.join(MODEL_DIR, f) for f in os.listdir(MODEL_DIR) if f.endswith(".hef")) \
+            if os.path.isdir(MODEL_DIR) else []
+        return out + ([STOCK_HEF] if os.path.exists(STOCK_HEF) else [])
+
+    def configure(self, **kw):
+        for k in ("on", "hef", "conf", "filter"):
+            if k in kw and kw[k] is not None:
+                self.cfg[k] = kw[k]
+        self.cfg["conf"] = max(0.05, min(0.95, float(self.cfg["conf"])))
+        if kw.get("on"):
+            self.error = None
+        self._reset_stats()
+        return self.status()
+
+    def _reset_stats(self):
+        for d in (self.t_done, self.lat_total, self.lat_sensor, self.lat_hailo, self.n_boxes, self.max_score):
+            d.clear()
+        self.frames = self.dropped = 0
+        self._last_ts = None
+
+    # ---- worker
+    def _open(self):
+        from apple_detector import AppleDetector   # needs python3-hailort; only loaded when used
+        det = AppleDetector(self.cfg["hef"], lores_size=self.camera.lores_size)
+        det.detect(np.full((det.lo_h, det.lo_w, 3), 114, np.uint8))   # learn class count
+        self.names = COCO_NAMES if det.num_classes == 80 else ["apple"] if det.num_classes == 1 \
+            else ["class%d" % i for i in range(det.num_classes)]
+        log.info("vision: %s (%d classes) on %dx%d lores", self.cfg["hef"], det.num_classes, det.lo_w, det.lo_h)
+        return det
+
+    def _close(self):
+        with self._det_lock:
+            det, self.det = self.det, None
+        if det is not None:
+            try:
+                det.close()
+            except Exception:  # noqa: BLE001 - best effort
+                pass
+            with self.cond:
+                self.latest = {"seq": self.latest["seq"] + 1, "boxes": []}
+                self.cond.notify_all()
+
+    def _apply_cfg(self):
+        d = self.det
+        d.score_thr = self.cfg["conf"]
+        d.class_ids = {COCO_NAMES.index("apple")} if (self.cfg["filter"] == "apple" and len(self.names) == 80) else None
+
+    def _result_loop(self):
+        while self._run:
+            with self._det_lock:
+                r = self.det.collect(timeout=0.05) if self.det is not None else None
+                infer_s = self.det.last_infer_s if r is not None else 0.0
+            if r is None:
+                time.sleep(0.005)
+                continue
+            try:
+                self._publish(*r, infer_s)
+            except Exception as e:  # noqa: BLE001 - never kill the result thread
+                log.exception("vision publish: %s", e)
+
+    def _publish(self, boxes, tag, infer_s):
+        ts_sensor, ts_py = tag
+        now = time.monotonic_ns()
+        self.t_done.append(time.monotonic())
+        self.lat_total.append((now - ts_sensor) / 1e6)
+        self.lat_sensor.append((ts_py - ts_sensor) / 1e6)
+        self.lat_hailo.append(infer_s * 1e3)
+        self.n_boxes.append(len(boxes))
+        self.max_score.append(max((b[4] for b in boxes), default=0.0))
+        self.frames += 1
+        with self.cond:
+            self.latest = {"seq": self.latest["seq"] + 1, "lat_ms": round((now - ts_sensor) / 1e6, 1),
+                           "boxes": [[round(b[0], 4), round(b[1], 4), round(b[2], 4), round(b[3], 4),
+                                      round(b[4], 3), self.names[b[5]] if b[5] < len(self.names) else b[5]]
+                                     for b in boxes]}
+            self.cond.notify_all()
+
+    def _loop(self):
+        while self._run:
+            if not self.cfg["on"]:
+                self._close()
+                time.sleep(0.1)
+                continue
+            try:
+                if self.det is None or self.det.hef_path != self.cfg["hef"]:
+                    self._close()
+                    det = self._open()          # warm-up runs before the result thread sees it
+                    with self._det_lock:
+                        self.det = det
+                    self._reset_stats()
+                self._apply_cfg()
+                with self.camera.lock:                     # a mode switch waits for this frame
+                    req = self.camera.cam.cam.capture_request()
+                try:
+                    ts = req.get_metadata().get("SensorTimestamp")
+                    lo = req.make_array("lores")
+                finally:
+                    req.release()
+                if lo.shape[:2] != (self.det.lo_h, self.det.lo_w):   # camera mode was switched
+                    while self.det.in_flight:                          # result thread drains them
+                        time.sleep(0.002)
+                    self.det.set_lores_size(lo.shape[1], lo.shape[0])
+                    self._reset_stats()
+                fps = self.camera.mode[2] if self.camera.mode else 0
+                if self._last_ts and fps and (ts - self._last_ts) / 1e9 > 1.5 / fps:
+                    self.dropped += round((ts - self._last_ts) / 1e9 * fps) - 1
+                self._last_ts = ts
+                self.det.submit(lo, (ts, time.monotonic_ns()))   # result thread publishes it
+                if time.monotonic() > self._next_temp:
+                    self.chip_temp, self._next_temp = self.det.chip_temp_c(), time.monotonic() + 2.0
+            except Exception as e:  # noqa: BLE001 - report on the page, keep the dashboard up
+                log.exception("vision: %s", e)
+                self.error = str(e).splitlines()[0][:200]
+                self.cfg["on"] = False
+                self._close()
+
+    def wait(self, seen, timeout=1.0):
+        with self.cond:
+            self.cond.wait_for(lambda: self.latest["seq"] != seen, timeout)
+            return self.latest
+
+    def status(self):
+        t = list(self.t_done)
+        recent = [x for x in t if x > time.monotonic() - 1.0]
+        fps = (len(recent) - 1) / (recent[-1] - recent[0]) if len(recent) > 2 else 0.0
+        tot, sen, hai = list(self.lat_total), list(self.lat_sensor), list(self.lat_hailo)
+        other = [a - b - c for a, b, c in zip(tot, sen, hai)]
+        seen = self.frames + self.dropped
+        return {
+            "on": self.cfg["on"] and self.det is not None, "requested": self.cfg["on"],
+            "hef": os.path.basename(self.cfg["hef"]), "hef_path": self.cfg["hef"], "models": self.models(),
+            "conf": self.cfg["conf"], "filter": self.cfg["filter"], "classes": len(self.names),
+            "lores": self.camera.lores_size, "fps": round(fps, 1), "frames": self.frames,
+            "dropped_pct": round(100.0 * self.dropped / seen, 1) if seen else 0.0,
+            "lat_ms": {"p50": _pct(tot, 0.5), "p95": _pct(tot, 0.95), "max": _pct(tot, 1.0)},
+            "sensor_ms": _pct(sen, 0.5), "hailo_ms": _pct(hai, 0.5), "other_ms": _pct(other, 0.5),
+            "boxes": {"now": self.n_boxes[-1] if self.n_boxes else 0,
+                      "mean": round(statistics.mean(self.n_boxes), 1) if self.n_boxes else 0,
+                      "max_score": round(self.max_score[-1], 2) if self.max_score else None},
+            "chip_temp_c": self.chip_temp, "error": self.error,
+        }
+
+    def close(self):
+        self._run = False
+        self._thread.join(2.0)
+        self._results.join(2.0)
+        self._close()
+
+
 # ---------------------------------------------------------------- telemetry
 class Telemetry:
     """Samples every subsystem at TELEMETRY_HZ into .data (a JSON-able dict)."""
 
-    def __init__(self, drive, camera, control):
-        self.drive, self.camera, self.control = drive, camera, control
+    def __init__(self, drive, camera, control, vision):
+        self.drive, self.camera, self.control, self.vision = drive, camera, control, vision
         self.power = BoardPower()
         self.battery = BatteryMonitor()
         self.hailo = self._hailo_info()
@@ -283,6 +495,7 @@ class Telemetry:
                     "wifi": self._wifi(),
                     "hailo": self.hailo,
                     "control": self.control.status(),
+                    "vision": self.vision.status(),
                 }
             except Exception as e:  # noqa: BLE001 - keep sampling after a transient failure
                 log.exception("telemetry: %s", e)
@@ -402,6 +615,34 @@ async def stream(request):
     return resp
 
 
+async def api_vision(request):
+    """{"on": bool, "hef": path, "conf": 0..1, "filter": "apple"|"all"} - any subset."""
+    m = await request.json()
+    vision = request.app["vision"]
+    if m.get("hef") and m["hef"] not in vision.models():
+        return web.json_response({"error": "unknown model %s" % m["hef"]}, status=400)
+    return web.json_response(vision.configure(**m))
+
+
+async def ws_detections(request):
+    """Latest boxes for the page overlay, pushed as soon as they exist (max DET_PUSH_HZ):
+    {"seq", "lat_ms", "boxes": [[x1, y1, x2, y2, score, label], ...]}, coords 0..1 of the frame."""
+    ws = web.WebSocketResponse(heartbeat=5)
+    await ws.prepare(request)
+    vision, loop, seen = request.app["vision"], asyncio.get_running_loop(), -1
+    try:
+        while not ws.closed:
+            t0 = loop.time()
+            latest = await loop.run_in_executor(None, vision.wait, seen)
+            if latest["seq"] != seen:
+                seen = latest["seq"]
+                await ws.send_json(latest)
+            await asyncio.sleep(max(0.0, 1.0 / DET_PUSH_HZ - (loop.time() - t0)))
+    except (ConnectionResetError, asyncio.CancelledError):
+        pass
+    return ws
+
+
 async def websocket(request):
     """Telemetry push at TELEMETRY_HZ; incoming messages are drive commands."""
     ws = web.WebSocketResponse(heartbeat=5)
@@ -439,15 +680,18 @@ def main():
     drive = Drive(max_throttle=MAX_THROTTLE)
     camera = CameraStream()
     control = Control(drive)
-    telem = Telemetry(drive, camera, control)
+    vision = Vision(camera)
+    telem = Telemetry(drive, camera, control, vision)
     threading.Thread(target=tcp_server, args=(control, telem), daemon=True).start()
 
     app = web.Application()
-    app.update(drive=drive, camera=camera, control=control, telem=telem)
+    app.update(drive=drive, camera=camera, control=control, telem=telem, vision=vision)
     app.add_routes([
         web.get("/", index),
         web.get("/stream.mjpg", stream),
         web.get("/ws", websocket),
+        web.get("/ws/det", ws_detections),
+        web.post("/api/vision", api_vision),
         web.get("/api/telemetry", api_telemetry),
         web.post("/api/mode", api_mode),
         web.post("/api/record", api_record),
@@ -462,6 +706,7 @@ def main():
     finally:
         control.close()
         telem.close()
+        vision.close()
         camera.close()
         drive.close()
 
