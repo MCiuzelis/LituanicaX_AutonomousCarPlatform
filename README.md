@@ -13,8 +13,14 @@ rc_car/
   tests/              hardware self-test, PWM sweep, CPU/Hailo stress + soak tests
   scripts/            boot / setup / diagnostics shell scripts
   config/             steering.json (written by tools/steering_cal.py)
+  vision/             Hailo-8 object detection (see "Vision")
   results/            test outputs      recordings/  dashboard mp4s      logs/  dashboard.log
+  models/             *.hef detectors (built on the PC, not in git)
 ```
+
+Git: this folder is a repo (`main`). The PC keeps a clone in `RcCarYoloTraining/car/` and pushes
+straight into this checkout (`receive.denyCurrentBranch updateInstead`). `recordings/`,
+`results/`, `logs/`, `models/` and `*.bak` are not tracked.
 
 ## Safety
 
@@ -46,7 +52,28 @@ out at 5 Hz. The freshest command from any link wins.
 
 HTTP API: `GET /api/telemetry`, `POST /api/mode {"w","h","fps"}` (409 while recording),
 `POST /api/record {"on":bool}`, `GET /api/recordings`, `DELETE /api/recordings/<name>`,
-`GET /recordings/<name>` (range requests), `GET /stream.mjpg`, `GET /ws`.
+`GET /recordings/<name>` (range requests), `GET /stream.mjpg`, `GET /ws`,
+`POST /api/vision {"on","hef","conf","filter"}`, `GET /ws/det` (detection boxes, see "Vision").
+
+## Vision
+
+Apple detector for the track (trained in `RcCarYoloTraining` on the PC). Needs `python3-hailort`
+(apt, 4.23.0) + picamera2; no OpenCV.
+
+* `vision/apple_detector.py`: camera lores stream (640 wide, ISP-scaled from the main stream) ->
+  letterbox 640x640 -> HailoRT async API (several frames in flight) -> on-chip NMS -> boxes
+  normalised 0..1. Standalone benchmark (needs the camera, so stop the dashboard first):
+  `python3 vision/apple_detector.py --save 3`.
+* Dashboard: **▶ detection** under the video; model = any `models/*.hef` or the stock COCO
+  yolov8s (`/usr/share/hailo-models/yolov8s_h8.hef`, "apple only" = COCO class 47). Boxes are
+  drawn over the MJPEG in the browser (not burned into recordings). The Vision panel shows
+  detection vs camera fps, dropped frames, delay from sensor timestamp to boxes (readout+ISP /
+  Hailo / decode) and Hailo chip temperature. Use 1280x720 modes: that is the sensor mode
+  (1536x864) the model was trained on.
+* `vision/eval_hef.py`: run a HEF over saved JPEGs and dump predictions (accuracy checks).
+
+Measured 2026-09-23 with `models/apple_yolov8s.hef` at 1280x720@120: 120 det/s, delay 24.5 ms p50,
+CPU ~27 %. Only one process can own the Hailo: turn detection off before running other Hailo tools.
 
 WiFi only (the Pi 5 antenna sits under the Hailo HAT, so Bluetooth was dropped). Ethernet is
 for updates. NetworkManager keyfiles: wlan0 = 192.168.88.126, eth0 = 192.168.88.129.
