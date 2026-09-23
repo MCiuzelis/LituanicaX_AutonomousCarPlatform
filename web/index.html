@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>RC car dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { --bg:#111418; --panel:#1b2026; --fg:#e6e9ee; --dim:#8a94a3; --ok:#3fbf6f; --warn:#e8b33c; --bad:#e0524d; --acc:#4da3ff; }
+  * { box-sizing:border-box; }
+  body { margin:0; overflow-x:hidden; background:var(--bg); color:var(--fg); font:14px/1.4 system-ui, sans-serif; }
+  header { display:flex; gap:16px; align-items:center; padding:8px 16px; background:var(--panel); }
+  header h1 { font-size:16px; margin:0 12px 0 0; }
+  .pill { padding:2px 10px; border-radius:12px; background:#2a323c; color:var(--dim); font-size:12px; }
+  .pill.ok { background:#1f4d33; color:var(--ok); } .pill.bad { background:#4d2320; color:var(--bad); } .pill.warn { background:#4d3f1a; color:var(--warn); }
+  main { display:grid; grid-template-columns: minmax(0,2fr) minmax(300px,1fr); gap:12px; padding:12px 16px; }
+  @media (max-width:900px) { main { grid-template-columns:1fr; } }
+  .panel { background:var(--panel); border-radius:8px; padding:12px; }
+  img#cam { width:100%; background:#000; border-radius:6px; display:block; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:8px 0; }
+  select, button, input { background:#2a323c; color:var(--fg); border:1px solid #3a4553; border-radius:6px; padding:5px 10px; font:inherit; }
+  button.on { background:#264a7a; border-color:var(--acc); }
+  table { width:100%; table-layout:fixed; border-collapse:collapse; font-variant-numeric:tabular-nums; }
+  td { padding:3px 4px; border-bottom:1px solid #262d36; overflow-wrap:anywhere; } td:last-child { text-align:right; }
+  td.k { color:var(--dim); }
+  h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); margin:12px 0 6px; }
+  .bar { height:8px; background:#2a323c; border-radius:4px; overflow:hidden; } .bar > i { display:block; height:100%; background:var(--acc); }
+  kbd { background:#2a323c; border:1px solid #3a4553; border-radius:4px; padding:0 5px; font-family:monospace; }
+  .keys { color:var(--dim); font-size:12px; }
+  #ctrl { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  .big { font-size:22px; font-weight:600; }
+  button.rec { background:#4d2320; border-color:var(--bad); color:#fff; }
+  #reclist { list-style:none; padding:0; margin:0; max-height:220px; overflow:auto; }
+  #reclist li { display:flex; gap:8px; align-items:center; padding:4px 0; border-bottom:1px solid #262d36; font-size:13px; }
+  #reclist li span { flex:1; }
+  #reclist button { padding:2px 8px; font-size:12px; }
+  video { width:100%; border-radius:6px; background:#000; display:none; margin-top:8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>RC car</h1>
+  <span id="p-ws" class="pill">websocket</span>
+  <span id="p-wifi" class="pill">wifi</span>
+  <span id="p-tcp" class="pill">pc client</span>
+  <span id="p-ctl" class="pill">control</span>
+  <span style="flex:1"></span>
+  <span id="clock" class="pill"></span>
+</header>
+<main>
+  <section class="panel">
+    <img id="cam" src="/stream.mjpg" alt="camera">
+    <div class="row">
+      <label>Resolution <select id="mode"></select></label>
+      <span id="camstat" class="keys"></span>
+      <button id="recbtn">● record</button><span id="recstat" class="keys"></span>
+      <span style="flex:1"></span>
+      <button id="drivebtn">enable keyboard driving</button>
+      <label>throttle <input id="lvl" type="number" min="1" max="20" value="10" style="width:60px"> %</label>
+    </div>
+    <div id="ctrl">
+      <div><div class="keys">throttle</div><div class="big" id="c-t">0 %</div><div class="bar"><i id="b-t" style="width:0"></i></div></div>
+      <div><div class="keys">steering</div><div class="big" id="c-s">0</div><div class="bar"><i id="b-s" style="width:50%;margin-left:50%"></i></div></div>
+    </div>
+    <p class="keys"><kbd>W</kbd> forward <kbd>S</kbd> brake <kbd>A</kbd>/<kbd>D</kbd> steer <kbd>space</kbd> stop &nbsp;·&nbsp;
+      commands go over WiFi (WebSocket); run <code>car_client.py --host &lt;pi-ip&gt;</code> on the PC for the tcp link.
+      Server caps throttle at <span id="cap">20</span> %; motor stops if no command for 0.4 s.</p>
+  </section>
+  <aside class="panel">
+    <h2>Drive</h2><table id="t-drive"></table>
+    <h2>Battery / power</h2><table id="t-power"></table>
+    <h2>System</h2><table id="t-sys"></table>
+    <h2>Links</h2><table id="t-links"></table>
+    <h2>Recordings <button id="recrefresh" style="font-size:11px;padding:1px 6px">refresh</button></h2>
+    <ul id="reclist"></ul>
+    <video id="player" controls></video>
+  </aside>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const fmt = (v, d=2) => (v==null||isNaN(v)) ? '–' : Number(v).toFixed(d);
+function table(id, rows) {
+  $(id).innerHTML = rows.map(([k,v]) => `<tr><td class="k">${k}</td><td>${v}</td></tr>`).join('');
+}
+function pill(id, cls, text) { const e=$(id); e.className='pill '+cls; if (text) e.textContent=text; }
+
+// ---- telemetry over websocket
+let ws, lastMsg = 0;
+function connect() {
+  ws = new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');
+  ws.onopen = () => pill('p-ws','ok','websocket');
+  ws.onclose = () => { pill('p-ws','bad','websocket lost'); setTimeout(connect, 1000); };
+  ws.onmessage = ev => { lastMsg = Date.now(); render(JSON.parse(ev.data)); };
+}
+connect();
+
+let modesFilled = false;
+function render(d) {
+  const dr=d.drive||{}, c=d.control||{}, cpu=d.cpu||{}, p=d.power||{}, cam=d.camera||{}, w=d.wifi||{};
+  $('clock').textContent = new Date(d.time*1000).toLocaleTimeString();
+  table('t-drive', [['throttle pulse', fmt(dr.pulse_us,0)+' µs'], ['speed', fmt(dr.rps,1)+' rev/s'], ['rpm', fmt(dr.rpm,0)],
+    ['odometer', fmt(dr.turns,1)+' turns'], ['steering', fmt(dr.steer,2)], ['active link', c.active||'none'],
+    ['state', c.stopped ? 'stopped (dead-man)' : 'driving']]);
+  table('t-power', [['battery', fmt(d.battery_v,2)+' V'], ['board power', fmt(p.total_w,2)+' W'], ['5 V rail', fmt(p.ext5v_v,2)+' V']]);
+  const h = d.hailo||{};
+  const u = cpu.util||{};
+  table('t-sys', [['cpu load', fmt(u.total,0)+' %  <span class="keys">('+(u.cores||[]).map(c=>fmt(c,0)).join(' / ')+')</span>'],
+    ['cpu temperature', fmt(cpu.temp_c,1)+' °C'], ['arm clock', cpu.arm_freq_mhz+' MHz'],
+    ['throttled', cpu.throttled_hex==='0x0' ? 'no' : cpu.throttled_hex], ['hailo', h.up ? 'up ('+(h.board||'')+')' : 'DOWN'],
+    ['sd card free', fmt(cam.disk_free_gb,1)+' GB']]);
+  const lk = c.links_ms||{};
+  const age = k => (lk[k]==null) ? 'never' : (lk[k] < 1000 ? lk[k]+' ms ago' : fmt(lk[k]/1000,0)+' s ago');
+  table('t-links', [['wifi', w.up ? fmt(w.level_dbm,0)+' dBm' : 'down'], ['browser cmd', age('ws')], ['pc client cmd', age('tcp')]]);
+  const rec = cam.recording;
+  $('recbtn').textContent = rec ? '■ stop recording' : '● record';
+  $('recbtn').classList.toggle('rec', !!rec);
+  $('recstat').textContent = rec ? `${rec.file} · ${fmt(rec.seconds,0)} s` : '';
+  pill('p-wifi', w.up ? 'ok':'bad', w.up ? 'wifi '+fmt(w.level_dbm,0)+' dBm' : 'wifi down');
+  pill('p-tcp', (lk.tcp!=null && lk.tcp<1000) ? 'ok':'', 'pc client');
+  pill('p-ctl', c.stopped ? '' : 'ok', c.stopped ? 'control idle' : 'driving via '+c.active);
+  $('cap').textContent = Math.round((c.max_throttle||0.2)*100);
+  $('c-t').textContent = Math.round((c.throttle||0)*100)+' %'; $('b-t').style.width = Math.abs(c.throttle||0)*100/(c.max_throttle||0.2)+'%';
+  $('b-t').style.background = (c.throttle||0) < 0 ? 'var(--bad)' : 'var(--acc)';
+  $('c-s').textContent = fmt(c.steer,2);
+  const s=(c.steer||0); $('b-s').style.width=Math.abs(s)*50+'%'; $('b-s').style.marginLeft=(s<0?50+s*50:50)+'%';
+  if (cam.mode) $('camstat').textContent = `${cam.mode[0]}×${cam.mode[1]} @ ${fmt(cam.mode[2],0)} fps set · ${fmt(cam.stream_fps,1)} fps streamed`;
+  if (!modesFilled && cam.modes) {
+    modesFilled = true;
+    $('mode').innerHTML = cam.modes.map(m => `<option value="${m.join(',')}">${m[0]}×${m[1]} @ ${m[2]} fps</option>`).join('');
+    const cur = cam.modes.find(m => m[0]==cam.mode[0] && m[1]==cam.mode[1] && Math.round(m[2])==Math.round(cam.mode[2]))
+             || cam.modes.find(m => m[0]==cam.mode[0] && m[1]==cam.mode[1]);
+    if (cur) $('mode').value = cur.join(',');
+  }
+}
+$('mode').onchange = async () => {
+  const [w,h,fps] = $('mode').value.split(',').map(Number);
+  $('camstat').textContent = 'switching…';
+  const r = await fetch('/api/mode', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({w,h,fps})});
+  if (!r.ok) { $('camstat').textContent = (await r.json()).error; return; }
+  $('cam').src = '/stream.mjpg?' + Date.now();
+};
+
+// ---- recording
+let recording = false;
+$('recbtn').onclick = async () => {
+  recording = !$('recbtn').classList.contains('rec');
+  await fetch('/api/record', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({on: recording})});
+  if (!recording) setTimeout(loadRecordings, 500);
+};
+async function loadRecordings() {
+  const list = await (await fetch('/api/recordings')).json();
+  $('reclist').innerHTML = list.map(r => `<li><span>${r.name.replace('rec_','').replace('.mp4','')} · ${r.size_mb} MB</span>
+    <button data-play="${r.name}">play</button><button data-del="${r.name}">delete</button></li>`).join('') || '<li><span>none yet</span></li>';
+}
+$('reclist').onclick = async e => {
+  const b = e.target;
+  if (b.dataset.play) { const v = $('player'); v.style.display='block'; v.src = '/recordings/'+b.dataset.play; v.play(); }
+  if (b.dataset.del) { await fetch('/api/recordings/'+b.dataset.del, {method:'DELETE'}); loadRecordings(); }
+};
+$('recrefresh').onclick = loadRecordings;
+loadRecordings();
+
+// ---- keyboard driving (WiFi/WebSocket only)
+const keys = new Set(); let driving = false, timer = null;
+$('drivebtn').onclick = () => {
+  driving = !driving; $('drivebtn').classList.toggle('on', driving);
+  $('drivebtn').textContent = driving ? 'keyboard driving ON (click to stop)' : 'enable keyboard driving';
+  if (driving) timer = setInterval(send, 50); else { clearInterval(timer); keys.clear(); send(); }
+};
+function send() {
+  let t = 0, s = 0;
+  if (keys.has('w')) t = Number($('lvl').value)/100;
+  if (keys.has('s')) t = -1;
+  if (keys.has('a')) s -= 1; if (keys.has('d')) s += 1;
+  if (keys.has(' ')) { t = 0; s = 0; }
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({t, s}));
+}
+
+window.addEventListener('keydown', e => { if (!driving || e.target.tagName==='INPUT') return; keys.add(e.key.toLowerCase()); if (e.key===' ') e.preventDefault(); });
+window.addEventListener('keyup', e => keys.delete(e.key.toLowerCase()));
+window.addEventListener('blur', () => keys.clear());
+</script>
+</body>
+</html>
