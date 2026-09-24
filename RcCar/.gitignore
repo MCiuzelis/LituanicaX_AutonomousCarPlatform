@@ -1,0 +1,12 @@
+# runtime output / data (not source)
+recordings/
+results/
+logs/
+models/
+*.log
+__pycache__/
+*.pyc
+*.bak
+backup_*/
+# lgpio notification FIFO
+.lgd-*

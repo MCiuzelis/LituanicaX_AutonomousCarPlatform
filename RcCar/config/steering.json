@@ -1,0 +1,6 @@
+{
+  "gpio": 12,
+  "center_us": 1440.0,
+  "amplitude_us": 270.0,
+  "invert": false
+}
