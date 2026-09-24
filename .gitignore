@@ -49,8 +49,6 @@ YoloTraining/.venv/
 __pycache__/
 *.pyc
 YoloTraining/logs/
-# car/ is its own git repo (remote rp5:rc_car) - not vendored here
-YoloTraining/car/
 # dataset (videos, frames, labels, previews) - regenerate with scripts 01-03
 YoloTraining/data/*
 !YoloTraining/data/yolo/

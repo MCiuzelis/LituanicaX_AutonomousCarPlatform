@@ -18,7 +18,7 @@ import threading
 import time
 from datetime import datetime
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # rc_car/
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # Pi5/
 sys.path.insert(0, ROOT)
 from hardware import Camera  # noqa: E402
 

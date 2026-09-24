@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Steering servo calibration: tune the center pulse and the amplitude, saved automatically.
 
-Run it in a terminal (it needs a TTY):   ssh -t rp5 python3 ~/rc_car/tools/steering_cal.py
+Run it in a terminal (it needs a TTY):   ssh -t rp5 python3 ~/LituanicaX_InteligentRobotCompetition/Pi5/tools/steering_cal.py
 
 Keys
   a / d    center  -/+ 5 us          A / D    center  -/+ 25 us
@@ -21,7 +21,7 @@ import sys
 import termios
 import tty
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # rc_car/
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # Pi5/
 sys.path.insert(0, ROOT)
 from hardware.base import HardwareError  # noqa: E402
 from hardware.steering import Steering, DEFAULTS, save_config, CONFIG_PATH  # noqa: E402
@@ -36,7 +36,7 @@ def getch(timeout=0.1):
 
 def main():
     if not sys.stdin.isatty():
-        print("needs a TTY: run with  ssh -t rp5 python3 ~/rc_car/tools/steering_cal.py")
+        print("needs a TTY: run with  ssh -t rp5 python3 ~/LituanicaX_InteligentRobotCompetition/Pi5/tools/steering_cal.py")
         return 2
     try:
         st = Steering()

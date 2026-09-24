@@ -31,5 +31,5 @@ hailomz compile yolov8s \
 
 mv yolov8s.hef apple_yolov8s.hef
 echo "done -> $(pwd)/apple_yolov8s.hef"
-echo "deploy: scp export/apple_yolov8s.hef rp5:rc_car/models/ && ssh rp5 sync"
-echo "test:   ssh rp5 python3 rc_car/vision/apple_detector.py --save 3"
+echo "deploy: scp export/apple_yolov8s.hef rp5:LituanicaX_InteligentRobotCompetition/Pi5/models/ && ssh rp5 sync"
+echo "test:   ssh rp5 python3 LituanicaX_InteligentRobotCompetition/Pi5/vision/apple_detector.py --save 3"

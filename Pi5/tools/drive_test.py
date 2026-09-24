@@ -20,7 +20,7 @@ import signal
 import sys
 import time
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # rc_car/
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # Pi5/
 sys.path.insert(0, ROOT)
 from hardware import HobbywingESC, AS5600, HardwareError  # noqa: E402
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Send raw throttle pulses to the ESC from the keyboard (ESC calibration / bench checks).
 
-Run it in a terminal (it needs a TTY):   ssh -t rp5 python3 ~/rc_car/tools/esc_throttle.py
+Run it in a terminal (it needs a TTY):   ssh -t rp5 python3 ~/LituanicaX_InteligentRobotCompetition/Pi5/tools/esc_throttle.py
 
 Keys
   n / f / b   neutral / full forward / full brake (1500 / 1000 / 2000 us - the throttle is
@@ -21,7 +21,7 @@ import sys
 import termios
 import tty
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # rc_car/
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # Pi5/
 sys.path.insert(0, ROOT)
 from hardware import HobbywingESC  # noqa: E402
 
@@ -35,7 +35,7 @@ def getch(timeout=0.1):
 
 def main():
     if not sys.stdin.isatty():
-        print("needs a TTY: run with  ssh -t rp5 python3 ~/rc_car/tools/esc_throttle.py")
+        print("needs a TTY: run with  ssh -t rp5 python3 ~/LituanicaX_InteligentRobotCompetition/Pi5/tools/esc_throttle.py")
         return 2
     esc = HobbywingESC()
     print(__doc__)

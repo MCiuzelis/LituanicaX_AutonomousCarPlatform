@@ -8,7 +8,7 @@ dashboard's 1280x720 setting). The ISP produces the 1280x720 main stream *and* a
 lores copy for free; lores is letterboxed to 640x640 (grey 114 bars, exactly like Ultralytics
 training) and sent to the Hailo through the async API. NMS runs on-chip.
 
-    python3 apple_detector.py                                            # ~/rc_car/models/apple_yolov8s.hef
+    python3 apple_detector.py                                            # Pi5/models/apple_yolov8s.hef
     python3 apple_detector.py --hef /usr/share/hailo-models/yolov8s_h8.hef --class-id 47  # stock COCO 'apple'
     python3 apple_detector.py --save 5                                   # also save annotated JPEGs
 
@@ -27,6 +27,8 @@ from contextlib import ExitStack
 
 import numpy as np
 from hailo_platform import FormatType, HailoSchedulingAlgorithm, VDevice
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # Pi5/
 
 NET = 640                         # model input (square)
 CAM_W, CAM_H = 1280, 720          # camera output the car works in (standalone benchmark)
@@ -190,7 +192,7 @@ def pct(xs, p):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--hef", default=os.path.expanduser("~/rc_car/models/apple_yolov8s.hef"))
+    ap.add_argument("--hef", default=os.path.join(ROOT, "models", "apple_yolov8s.hef"))
     ap.add_argument("--seconds", type=float, default=10.0)
     ap.add_argument("--fps", type=float, default=120.0, help="camera frame rate (sensor max 120)")
     ap.add_argument("--conf", type=float, default=0.35)
@@ -198,7 +200,7 @@ def main():
                     help="keep only these classes (47 = apple for the stock COCO model)")
     ap.add_argument("--depth", type=int, default=4, help="max frames in flight on the Hailo")
     ap.add_argument("--save", type=int, default=0, help="save N annotated frames")
-    ap.add_argument("--out", default=os.path.expanduser("~/rc_car/results/vision"))
+    ap.add_argument("--out", default=os.path.join(ROOT, "results", "vision"))
     args = ap.parse_args()
 
     det = AppleDetector(args.hef, args.conf, set(args.class_id) if args.class_id else None, args.depth,

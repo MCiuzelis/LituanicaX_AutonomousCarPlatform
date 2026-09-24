@@ -12,7 +12,7 @@ import time
 import traceback
 from datetime import datetime
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # rc_car/
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # Pi5/
 sys.path.insert(0, ROOT)
 from hardware import RP5Board, Steering, HardwareError, PWM_PINS  # noqa: E402
 from hardware.base import run_cmd, read_sysfs  # noqa: E402

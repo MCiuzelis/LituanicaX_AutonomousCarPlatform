@@ -1,15 +1,15 @@
-# rc_car — Raspberry Pi 5 RC car
+# Pi5 — Raspberry Pi 5 RC car
 
-Everything that runs on the car's Pi 5 (`ssh rp5`, `~/rc_car`): hardware drivers, the web
+Everything that runs on the car's Pi 5 (`ssh rp5`, `~/LituanicaX_InteligentRobotCompetition/Pi5`): hardware drivers, the web
 dashboard / remote-control server, calibration tools and hardware tests.
 
 ```
-rc_car/
+Pi5/
   dashboard.py        web dashboard + control server  (http://rp5:8080, tcp :8081)
   web/index.html      the dashboard page
   car_client.py       PC-side keyboard client for the tcp link (stdlib only, copy to the PC)
   hardware/           Python package: one class per subsystem (see "Hardware package")
-  tools/              interactive tools (need a TTY: ssh -t rp5 python3 ~/rc_car/tools/...)
+  tools/              interactive tools (need a TTY: ssh -t rp5 python3 ~/LituanicaX_InteligentRobotCompetition/Pi5/tools/...)
   tests/              hardware self-test, PWM sweep, CPU/Hailo stress + soak tests
   scripts/            boot / setup / diagnostics shell scripts
   config/             steering.json (written by tools/steering_cal.py)
@@ -18,9 +18,12 @@ rc_car/
   models/             *.hef detectors (built on the PC, not in git)
 ```
 
-Git: this folder is a repo (`main`). The PC keeps a clone in `RcCarYoloTraining/car/` and pushes
-straight into this checkout (`receive.denyCurrentBranch updateInstead`). `recordings/`,
-`results/`, `logs/`, `models/` and `*.bak` are not tracked.
+Git: this folder is `Pi5/` of the LituanicaX_InteligentRobotCompetition repo; the Pi runs it from its
+clone at `~/LituanicaX_InteligentRobotCompetition` (the only copy of the car code on the Pi). The Pi's
+clone accepts pushes into its checkout (`receive.denyCurrentBranch updateInstead`), so from the PC:
+`git push origin main && git push rp5 main` (remote `rp5` = `rp5:LituanicaX_InteligentRobotCompetition`).
+Changes made on the Pi: commit there, then `git pull rp5 main` on the PC and push to GitHub.
+`recordings/`, `results/`, `logs/`, `models/` and `*.bak` are not tracked.
 
 ## Safety
 
@@ -57,7 +60,7 @@ HTTP API: `GET /api/telemetry`, `POST /api/mode {"w","h","fps"}` (409 while reco
 
 ## Vision
 
-Apple detector for the track (trained in `RcCarYoloTraining` on the PC). Needs `python3-hailort`
+Apple detector for the track (trained in `YoloTraining/` on the PC). Needs `python3-hailort`
 (apt, 4.23.0) + picamera2; no OpenCV.
 
 * `vision/apple_detector.py`: camera lores stream (640 wide, ISP-scaled from the main stream) ->
@@ -81,7 +84,7 @@ for updates. NetworkManager keyfiles: wlan0 = 192.168.88.126, eth0 = 192.168.88.
 ## Hardware package
 
 ```python
-import sys; sys.path.insert(0, "/home/matasciuzelis/rc_car")
+import sys; sys.path.insert(0, "/home/matasciuzelis/LituanicaX_InteligentRobotCompetition/Pi5")
 from hardware import RP5Board, Drive
 
 with RP5Board() as b:
@@ -129,7 +132,7 @@ Every class derives from `hardware.base.Subsystem`: `available()` cheap presence
 | camera | Arducam 12MP IMX708 (no EEPROM) on CAM0, `dtoverlay=imx708,cam0` |
 | Hailo-8 26 TOPS | AI HAT on PCIe |
 
-## Tools (`ssh -t rp5 python3 ~/rc_car/tools/<tool>`)
+## Tools (`ssh -t rp5 python3 ~/LituanicaX_InteligentRobotCompetition/Pi5/tools/<tool>`)
 
 | tool | purpose |
 |---|---|

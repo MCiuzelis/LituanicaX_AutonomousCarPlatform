@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """RC car dashboard: live camera, telemetry and remote control server.
 
-    python3 ~/rc_car/dashboard.py            (or scripts/dashboard_restart.sh to run it detached)
+    python3 ~/LituanicaX_InteligentRobotCompetition/Pi5/dashboard.py            (or scripts/dashboard_restart.sh to run it detached)
     then open http://rp5:8080  (or http://<pi-ip>:8080)
 
 Serves

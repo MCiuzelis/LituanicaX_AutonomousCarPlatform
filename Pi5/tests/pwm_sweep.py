@@ -22,7 +22,7 @@ import sys
 import time
 from datetime import datetime
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # rc_car/
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # Pi5/
 sys.path.insert(0, ROOT)
 from hardware import Servo, HardwareError, PWM_PINS  # noqa: E402
 from hardware.esc import ESC_PWM_GPIO  # noqa: E402

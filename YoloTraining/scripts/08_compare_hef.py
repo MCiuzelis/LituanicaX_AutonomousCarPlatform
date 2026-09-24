@@ -3,9 +3,9 @@
 Both are scored with the same matcher: greedy IoU>=0.5 matching per image, AP50 from the
 precision/recall curve, plus P/R/F1 at a fixed confidence. Coordinates are normalised 0..1.
 
-    scp -r data/yolo/images/val rp5:rc_car/vision/val_images
-    ssh rp5 "cd rc_car/vision && python3 eval_hef.py --images val_images --out preds_hef.json && rm -rf val_images"
-    scp rp5:rc_car/vision/preds_hef.json runs/hef_eval/
+    scp -r data/yolo/images/val rp5:LituanicaX_InteligentRobotCompetition/Pi5/vision/val_images
+    ssh rp5 "cd LituanicaX_InteligentRobotCompetition/Pi5/vision && python3 eval_hef.py --images val_images --out preds_hef.json && rm -rf val_images"
+    scp rp5:LituanicaX_InteligentRobotCompetition/Pi5/vision/preds_hef.json runs/hef_eval/
     uv run scripts/08_compare_hef.py
 """
 import argparse
