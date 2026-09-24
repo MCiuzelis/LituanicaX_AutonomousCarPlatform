@@ -42,3 +42,28 @@ fp-info-cache
 /Animation/Frames/
 *.blend1
 *.blend@
+
+# ── YoloTraining: keep code, final model (r2 best.pt), deployed HEF, run metrics
+!YoloTraining/uv.lock
+YoloTraining/.venv/
+__pycache__/
+*.pyc
+YoloTraining/logs/
+# car/ is its own git repo (remote rp5:rc_car) - not vendored here
+YoloTraining/car/
+# dataset (videos, frames, labels, previews) - regenerate with scripts 01-03
+YoloTraining/data/*
+!YoloTraining/data/yolo/
+YoloTraining/data/yolo/*
+!YoloTraining/data/yolo/data.yaml
+# Hailo AI SW Suite docker bundle (8.5 GB) - download from Hailo Developer Zone
+YoloTraining/third_party/hailo/*.zip
+# pretrained start points (auto-downloaded by Ultralytics)
+YoloTraining/weights/
+# intermediate / regenerable export artifacts (05_export_hailo.py, compile_hailo.sh)
+YoloTraining/export/calib/
+YoloTraining/export/*.onnx
+YoloTraining/export/*.har
+YoloTraining/runs/*/weights/*
+!YoloTraining/runs/apple_yolov8s_r2/weights/best.pt
+YoloTraining/runs/*.mp4
