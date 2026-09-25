@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools<82.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lituanicax-sim"
+version = "0.1.0"
+description = "Isaac Sim test bench for the LituanicaX car's driving algorithms (detections + IMU + encoder)."
+readme = "README.md"
+requires-python = "==3.11.*"
+dependencies = [
+    "setuptools<82.0.0",
+    "isaacsim[all,extscache]==5.1.0",
+    "isaaclab==2.3.2.post1",
+    "torch==2.7.0",
+    "torchvision==0.22.0",
+    "numpy<2.0.0",
+    "scipy",
+    "pynput",
+]
+
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.setuptools]
+package-dir = {"" = "source"}
+
+[tool.setuptools.packages.find]
+where = ["source"]
+include = ["rc_sim*"]
+
+[tool.uv]
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64' and python_full_version == '3.11.*'"]
+
+[tool.uv.sources]
+isaacsim = { index = "nvidia" }
+isaaclab = { index = "nvidia" }
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+
+[tool.uv.extra-build-dependencies]
+flatdict = ["setuptools<82"]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+explicit = false

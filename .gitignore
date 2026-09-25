@@ -45,6 +45,7 @@ fp-info-cache
 
 # ── YoloTraining: keep code, final model (r2 best.pt), deployed HEF, run metrics
 !YoloTraining/uv.lock
+!Sim/uv.lock
 YoloTraining/.venv/
 __pycache__/
 *.pyc
