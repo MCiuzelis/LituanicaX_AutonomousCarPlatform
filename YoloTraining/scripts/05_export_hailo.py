@@ -1,7 +1,7 @@
 """Export the trained model to ONNX for the Hailo Dataflow Compiler + collect calibration images.
 
 Output in export/:
-    apple_yolov8s.onnx   static 1x3x640x640, opset 11, no NMS (Hailo adds its own NMS on-chip)
+    apple_yolov8s.onnx   static 1x3x544x960, opset 11, no NMS (Hailo adds its own NMS on-chip)
     calib/               training frames for INT8 quantisation calibration
 Then compile on Linux (Hailo DFC does not run on Windows) with export/compile_hailo.sh.
 
@@ -20,13 +20,13 @@ ROOT = Path(__file__).resolve().parents[1]
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--weights", type=Path, default=ROOT / "runs/apple_yolov8s_r2/weights/best.pt")
-    ap.add_argument("--imgsz", type=int, default=640)
+    ap.add_argument("--imgsz", type=int, nargs=2, default=(544, 960), help="h w")
     ap.add_argument("--out", type=Path, default=ROOT / "export")
     ap.add_argument("--n-calib", type=int, default=1024)
     args = ap.parse_args()
     args.out.mkdir(exist_ok=True)
 
-    onnx = YOLO(args.weights).export(format="onnx", imgsz=args.imgsz, opset=11, simplify=True,
+    onnx = YOLO(args.weights).export(format="onnx", imgsz=list(args.imgsz), opset=11, simplify=True,
                                      dynamic=False, nms=False)
     dst = args.out / "apple_yolov8s.onnx"
     shutil.copy2(onnx, dst)

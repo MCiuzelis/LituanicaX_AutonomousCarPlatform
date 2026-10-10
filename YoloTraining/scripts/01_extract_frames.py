@@ -1,12 +1,15 @@
 """Extract frames from the driving videos, dropping blurry and redundant ones.
 
-Keeps a frame only if it differs enough from the last kept frame of the same video
-(mean abs diff on a small grayscale thumbnail) and is not much blurrier than its
-neighbours. Output: data/frames/<video_stem>_<frame_idx>.jpg
+Keeps a frame only if the car is driving (motor_rps from the recording's <stem>_frames.csv,
+when present), it differs enough from the last kept frame of the same video (mean abs diff
+on a small grayscale thumbnail) and is not much blurrier than its neighbours. The motion
+gate drops the static start/end of each clip and the tail after hitting apples, where the
+car has stopped but the apples are still rolling. Output: data/frames/<video_stem>_<frame_idx>.jpg
 
     uv run scripts/01_extract_frames.py
 """
 import argparse
+import csv
 from pathlib import Path
 
 import cv2
@@ -26,6 +29,22 @@ def sharpness(frame):
     return cv2.Laplacian(g, cv2.CV_64F).var()
 
 
+def driving_mask(vid: Path, n: int, min_rps: float, pad: int):
+    """Per-frame bool: car driving, dilated by `pad` frames. None if the clip has no frames.csv."""
+    csv_path = vid.with_name(f"{vid.stem}_frames.csv")
+    if not csv_path.exists():
+        return None
+    moving = np.zeros(n, bool)
+    with open(csv_path, newline="") as f:
+        for row in csv.DictReader(f):
+            i = int(row["frame"])
+            if i < n and row["motor_rps"] and abs(float(row["motor_rps"])) >= min_rps:
+                moving[i] = True
+    if pad:
+        moving = np.convolve(moving, np.ones(2 * pad + 1), "same") > 0
+    return moving
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--videos", type=Path, default=ROOT / "data/videos")
@@ -33,6 +52,8 @@ def main():
     ap.add_argument("--stride", type=int, default=3, help="look at every Nth frame (60fps -> 20fps)")
     ap.add_argument("--min-diff", type=float, default=16.0, help="min mean abs pixel diff vs last kept frame")
     ap.add_argument("--max-gap", type=int, default=60, help="force-keep after this many source frames")
+    ap.add_argument("--min-rps", type=float, default=5.0, help="motor rev/s that counts as driving")
+    ap.add_argument("--pad", type=int, default=0, help="also keep this many frames around driving ones")
     ap.add_argument("--blur-ratio", type=float, default=0.45,
                     help="drop frame if sharpness < ratio * running median sharpness")
     args = ap.parse_args()
@@ -42,13 +63,14 @@ def main():
     for vid in sorted(args.videos.glob("*.mp4")):
         cap = cv2.VideoCapture(str(vid))
         n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        moving = driving_mask(vid, n, args.min_rps, args.pad)
         last_thumb, last_idx = None, -10**9
         sharp_hist = []
         kept = seen = 0
         for idx in tqdm(range(n), desc=vid.stem, leave=False):
             if not cap.grab():
                 break
-            if idx % args.stride:
+            if idx % args.stride or (moving is not None and not moving[idx]):
                 continue
             ok, frame = cap.retrieve()
             if not ok:

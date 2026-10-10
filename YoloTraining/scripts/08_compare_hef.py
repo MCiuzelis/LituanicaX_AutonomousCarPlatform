@@ -84,7 +84,7 @@ def main():
     # PyTorch reference: same 0.2 floor and IoU 0.7 NMS as the HEF's on-chip NMS
     model = YOLO(args.weights)
     pt = {}
-    for r in model.predict(str(args.images), imgsz=640, conf=0.2, iou=0.7, stream=True, verbose=False):
+    for r in model.predict(str(args.images), imgsz=960, conf=0.2, iou=0.7, stream=True, verbose=False):
         pt[Path(r.path).stem] = [[*b, s] for b, s in zip(r.boxes.xyxyn.cpu().tolist(), r.boxes.conf.cpu().tolist())]
 
     res = {"pytorch_fp32": score(pt, gt, args.conf), "hef_int8_on_hailo": score(hef, gt, args.conf)}

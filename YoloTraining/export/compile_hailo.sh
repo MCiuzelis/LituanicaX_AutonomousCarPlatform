@@ -17,8 +17,10 @@ cd "$(dirname "$0")"
 
 # Cut the graph at the six raw head convs (box regression cv2.*, class scores cv3.* per stride).
 # Without this the parser swallows Ultralytics' DFL/decode tail and the on-chip NMS config
-# (conv41/42, conv52/53, conv62/63 in yolov8s.alls) no longer matches.
-hailomz compile yolov8s \
+# (conv41/42, conv52/53, conv62/63 in apple_yolov8s.alls) no longer matches.
+# apple_yolov8s.yaml/.alls/_nms_config.json = the Model Zoo's yolov8s ones with a 544x960 input
+# (the stock ones are hard-wired to 640x640); they reference /work, the container mount.
+hailomz compile --yaml apple_yolov8s.yaml \
   --ckpt apple_yolov8s.onnx \
   --hw-arch hailo8 \
   --calib-path calib/ \

@@ -1,8 +1,8 @@
 # RC car apple-track detector
 
 Single-class (`apple`) YOLOv8s detector for the Pi 5 + Hailo-8 car: trained on this PC (RTX 3070),
-compiled to a HEF in the Hailo AI Software Suite docker image, run live on the car at 1280x720
-up to 120 FPS.
+compiled to a HEF in the Hailo AI Software Suite docker image. Trained at 960 and run at 960x544
+(the 1536x864 camera frame scales to it with no letterbox padding).
 
 ## Layout
 ```
@@ -11,8 +11,8 @@ YoloTraining/
   pipeline.sh              labeling + two-round training end to end (steps 2-4b)
   scripts/                 01..08 pipeline steps (table below)
   data/
-    videos/                source recordings from the car (1280x720 @ 60 fps)
-    frames/                deduplicated frames
+    videos/                car recordings (1536x864 @ 60 fps): <id>.mp4 + _frames/_imu/_drive.csv + _meta.json
+    frames/                frames while driving, deduplicated
     labels/ labels_r2/     Grounding DINO labels / + round-2 additions (YOLO txt)
     preview/ preview_r2/   label previews (boxes drawn; red = added in round 2)
     yolo/                  train/val dataset + data.yaml (split by video)
@@ -20,9 +20,9 @@ YoloTraining/
   runs/
     apple_yolov8s/         round-1 model
     apple_yolov8s_r2/      final model (weights/best.pt)
-    hef_eval/              HEF-on-Hailo predictions for 08_compare_hef.py
+    old_20260923_r2/       previous model (1280x720 recordings, 640x640)
     pred_*.mp4             annotated held-out video
-  export/                  apple_yolov8s.onnx, calib/, compile_hailo.sh -> yolov8s.har, apple_yolov8s.hef
+  export/                  apple_yolov8s.onnx, calib/, compile_hailo.sh -> apple_yolov8s.hef (old_20260923_*.hef = previous model)
   logs/                    autolabel / pipeline / Hailo compile logs
   third_party/hailo/       Hailo AI SW Suite 2026-07 docker bundle (zip) + its run script
 ```
@@ -30,10 +30,10 @@ YoloTraining/
 ## Pipeline
 | step | command | output |
 |---|---|---|
-| 0. get videos | `scp 'rp5:LituanicaX_InteligentRobotCompetition/Pi5/recordings/*.mp4' data/videos/` | 8 clips, 1280x720 @ 60 fps |
-| 1. frames | `uv run scripts/01_extract_frames.py` | `data/frames/`: every 3rd frame, blurry + near-duplicate frames dropped |
+| 0. get videos | `scp 'rp5:LituanicaX_InteligentRobotCompetition/Pi5/recordings/*/*' data/videos/` | 9 sessions (2026-10-10), 1536x864 @ 60 fps + sensor CSVs |
+| 1. frames | `uv run scripts/01_extract_frames.py` | `data/frames/`: every 3rd frame while driving (motor >= 5 rev/s from `_frames.csv`), blurry + near-duplicate frames dropped |
 | 2. auto-label | `uv run scripts/02_autolabel.py --preview` | `data/labels/`, `data/preview/` |
-| 3. dataset | `uv run scripts/03_build_dataset.py` | `data/yolo/` split by video (val = `rec_20260923_152645`) |
+| 3. dataset | `uv run scripts/03_build_dataset.py` | `data/yolo/` split by video (val = sessions `131416`, `131458`, `131840`) |
 | 4. train | `uv run scripts/04_train.py` | `runs/apple_yolov8s/weights/best.pt` |
 | 4b. round-2 labels | `uv run scripts/07_refine_labels.py --preview`, then 3 + 4 with `--labels data/labels_r2` / `--name apple_yolov8s_r2` | `data/labels_r2/`, `runs/apple_yolov8s_r2/` |
 | 5. export | `uv run scripts/05_export_hailo.py` | `export/apple_yolov8s.onnx` + `export/calib/` |
@@ -46,25 +46,33 @@ YoloTraining/
 - Grounding DINO base (`IDEA-Research/grounding-dino-base`), prompt
   `apple. basket. box. leaf. stone. shoe. car.`; only `apple` boxes are kept, the other phrases
   absorb look-alikes.
-- Boxes whose bottom edge is above 34 % of the frame height are dropped: track apples lie on the
-  ground and the camera is fixed low. (This also drops the apples in the crate on the table.)
+- Boxes whose bottom edge is above 25 % of the frame height are dropped: track apples lie on the
+  ground and the camera is fixed low (horizon of the 1536x864 mode is at ~26 %).
+- Boxes that contain the centres of >= 2 other boxes are dropped (DINO sometimes boxes a whole row).
+- The motion gate in step 1 drops static clip starts/ends and the tail after the car hits apples
+  (car stopped, apples still rolling).
 - Each frame is labeled whole plus 3 zoomed tiles of the ground band, merged with NMS.
 - Grounding DINO misses apples cut off by the frame edge; round 2 (`07_refine_labels.py`) adds
   the first model's confident detections that DINO missed, and the model is retrained.
 - More clips (other lighting, track layouts, apple-free frames) will help more than any
   hyper-parameter.
 
-## Results (2026-09-23)
-Held-out clip `rec_20260923_152645` (207 frames, 5163 apples, never trained on):
+## Results (2026-10-10)
+Held-out sessions `131416` + `131458` + `131840` (441 frames, 7826 apples, never trained on), 960x544:
 
-| | AP50 | P@0.35 | R@0.35 |
-|---|---|---|---|
-| PyTorch fp32 on the PC (`runs/apple_yolov8s_r2`) | 0.970 | 0.974 | 0.982 |
-| HEF int8 on the car's Hailo-8 | 0.967 | 0.974 | 0.981 |
+| | mAP50 | mAP50-95 | P | R |
+|---|---|---|---|---|
+| round 1 (`runs/apple_yolov8s`, DINO labels) | 0.994 | 0.918 | 0.983 | 0.986 |
+| final (`runs/apple_yolov8s_r2`, round-2 labels) | 0.994 | 0.920 | 0.991 | 0.986 |
 
-Ultralytics val: mAP50 0.974, mAP50-95 0.898. Visual check: `runs/pred_rec_20260923_152645_1280x720.mp4`.
-Speed on the car: `hailortcli run` 185 FPS; live in the dashboard at 1280x720@120: 120 det/s,
-delay sensor->boxes 24.5 ms p50 (10.9 readout+ISP, 13.1 Hailo, 0.4 decode).
+| HEF int8 on the car's Hailo-8 (AP50 / P / R at 0.35, `08_compare_hef.py`) | 0.9885 | | 0.980 | 0.991 |
+| PyTorch fp32, same matcher | 0.9893 | | 0.982 | 0.991 |
+
+Visual check: `runs/pred_20261010_131840_cam0_1536x864_60fps.mp4`.
+On the car (`models/apple_yolov8s.hef`; the previous 640x640 model is kept as `apple_yolov8s_640_20260923.hef`):
+`hailortcli run` 145.7 FPS (640x640 model: 185.6); dashboard at 1280x720@120 with 960x540 lores:
+120 det/s, delay sensor->boxes 29.7 ms p50 (640x640 model: 24.5 ms). The detector reads the input size
+from the HEF and the dashboard sizes the lores stream to fit it, so both models stay selectable.
 
 ## Compiling for Hailo
 Docker Desktop + the suite image `hailo8_ai_sw_suite_2026-07:latest` (DFC 3.34 / Model Zoo 2.19 /

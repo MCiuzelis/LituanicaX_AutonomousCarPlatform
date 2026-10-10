@@ -1,0 +1,2 @@
+# shell scripts run inside Linux (Hailo docker, the Pi): keep LF even with core.autocrlf=true
+*.sh text eol=lf

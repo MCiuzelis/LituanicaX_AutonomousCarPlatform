@@ -1,9 +1,10 @@
 """Train the single-class apple detector.
 
-YOLOv8s @ 640 is the target: it is the architecture Hailo's Model Zoo ships for Hailo-8
-(stock yolov8s_h8.hef measured 309 FPS on the car's Hailo-8), so compiling it is the
-well-trodden path and leaves 3x headroom over the 100 FPS goal. The 1280x720 camera frame
-is letterboxed to 640 (apples at the far end of the track are ~10-15 px after that).
+YOLOv8s is the target: it is the architecture Hailo's Model Zoo ships for Hailo-8
+(stock yolov8s_h8.hef measured 309 FPS at 640x640 on the car's Hailo-8). Trained at 960
+(square mosaics) and run at 960x544: the 1536x864 camera frame scales to it with no
+letterbox padding, so far apples get 1.5x the pixels they had at 640x640 for ~1.3x the
+compute. Ultralytics validates with rect batches, i.e. at 960x544 too.
 
     uv run scripts/04_train.py                      # yolov8s, 150 epochs
     uv run scripts/04_train.py --model yolov8n.pt   # faster/smaller fallback
@@ -21,8 +22,8 @@ def main():
     ap.add_argument("--data", type=Path, default=ROOT / "data/yolo/data.yaml")
     ap.add_argument("--model", default=str(ROOT / "weights/yolov8s.pt"), help="COCO-pretrained start point")
     ap.add_argument("--epochs", type=int, default=150)
-    ap.add_argument("--imgsz", type=int, default=640)
-    ap.add_argument("--batch", type=int, default=16, help="16 fits yolov8s@640 in 8 GB")
+    ap.add_argument("--imgsz", type=int, default=960)
+    ap.add_argument("--batch", type=int, default=8, help="8 fits yolov8s@960 in 8 GB")
     ap.add_argument("--name", default="apple_yolov8s")
     ap.add_argument("--workers", type=int, default=4)
     args = ap.parse_args()

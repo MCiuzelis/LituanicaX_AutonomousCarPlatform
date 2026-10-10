@@ -46,7 +46,7 @@ def main():
     ap.add_argument("--out", type=Path, default=ROOT / "data/labels_r2")
     ap.add_argument("--conf", type=float, default=0.6, help="only add student boxes at least this confident")
     ap.add_argument("--iou", type=float, default=0.2, help="treat as already labeled above this IoU")
-    ap.add_argument("--min-bottom", type=float, default=0.34, help="same ground-plane rule as 02_autolabel")
+    ap.add_argument("--min-bottom", type=float, default=0.25, help="same ground-plane rule as 02_autolabel")
     ap.add_argument("--preview", action="store_true")
     args = ap.parse_args()
 
@@ -62,7 +62,7 @@ def main():
     imgs = sorted(args.frames.glob("*.jpg"))
     added = touched = 0
     for p in imgs:
-        r = model.predict(str(p), conf=args.conf, imgsz=640, verbose=False)[0]
+        r = model.predict(str(p), conf=args.conf, imgsz=960, verbose=False)[0]
         H, W = r.orig_shape
         src = args.labels / f"{p.stem}.txt"
         old_lines = [l for l in src.read_text().splitlines() if l.strip()] if src.exists() else []

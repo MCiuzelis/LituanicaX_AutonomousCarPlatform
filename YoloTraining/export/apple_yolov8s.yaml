@@ -1,0 +1,24 @@
+# Model Zoo network config for the apple detector: stock yolov8s.yaml with a 544x960 input.
+base:
+- base/yolov8.yaml
+preprocessing:
+  input_shape:
+  - 544
+  - 960
+  - 3
+postprocessing:
+  device_pre_post_layers:
+    nms: true
+  hpp: true
+network:
+  network_name: yolov8s
+paths:
+  network_path:
+  - apple_yolov8s.onnx
+  alls_script: /work/apple_yolov8s.alls
+info:
+  task: object detection
+  input_shape: 544x960x3
+  framework: pytorch
+evaluation:
+  classes: 1

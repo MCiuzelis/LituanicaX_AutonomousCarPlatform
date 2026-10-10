@@ -63,6 +63,13 @@ YoloTraining/weights/
 YoloTraining/export/calib/
 YoloTraining/export/*.onnx
 YoloTraining/export/*.har
+# logs the Hailo compiler drops next to its inputs
+YoloTraining/export/*.log
+YoloTraining/export/.install_logs/
+YoloTraining/export/*_tmp.json
+# local copies of the previous model (its files are in git history)
+YoloTraining/export/old_*
+YoloTraining/runs/old_*/
 YoloTraining/runs/*/weights/*
 !YoloTraining/runs/apple_yolov8s_r2/weights/best.pt
 YoloTraining/runs/*.mp4

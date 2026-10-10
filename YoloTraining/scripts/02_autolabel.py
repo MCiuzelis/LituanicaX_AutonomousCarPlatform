@@ -31,10 +31,10 @@ def main():
     ap.add_argument("--max-area", type=float, default=0.08, help="drop boxes larger than this frac of the image")
     ap.add_argument("--min-side", type=int, default=6, help="drop boxes smaller than this (px)")
     ap.add_argument("--max-aspect", type=float, default=2.2, help="apples are roughly round")
-    ap.add_argument("--min-bottom", type=float, default=0.34,
+    ap.add_argument("--min-bottom", type=float, default=0.25,
                     help="box bottom must be below this frac of image height (apples lie on the ground)")
     ap.add_argument("--tiles", type=int, default=3, help="zoomed tiles across the ground band (0 = full frame only)")
-    ap.add_argument("--band", type=float, nargs=2, default=(0.28, 0.78),
+    ap.add_argument("--band", type=float, nargs=2, default=(0.2, 0.7),
                     help="vertical extent of the tiled ground band, as fractions of image height")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--redo", action="store_true", help="relabel frames that already have a label file")
@@ -97,6 +97,13 @@ def main():
                 boxes, scores = torch.cat([boxes, b]), torch.cat([scores, s[ok]])
         if len(boxes):
             keep = nms(boxes, scores, 0.5)
+            boxes, scores = boxes[keep], scores[keep]
+            # drop "group" boxes drawn around a row of apples: they contain >= 2 other boxes' centres
+            c = (boxes[:, :2] + boxes[:, 2:]) / 2
+            inside = ((c[None, :, 0] > boxes[:, None, 0]) & (c[None, :, 0] < boxes[:, None, 2])
+                      & (c[None, :, 1] > boxes[:, None, 1]) & (c[None, :, 1] < boxes[:, None, 3]))
+            inside.fill_diagonal_(False)
+            keep = inside.sum(1) < 2
             boxes, scores = boxes[keep], scores[keep]
 
         lines, draw = [], []
