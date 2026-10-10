@@ -66,7 +66,8 @@ REC_FPS_SMALL, REC_FPS_LARGE = 60, 30    # modes up to 1536x864 / larger
 WEB_DIR = os.path.join(ROOT, "web")
 REC_DIR = os.path.join(ROOT, "recordings")
 MODEL_DIR = os.path.join(ROOT, "models")
-STOCK_HEF = "/usr/share/hailo-models/yolov8s_h8.hef"   # COCO yolov8s: same arch/input as ours
+STOCK_HEF = "/usr/share/hailo-models/yolov8s_h8.hef"   # COCO yolov8s, 640x640 input
+DET_INPUT = (960, 544)       # input (w, h) of models/apple_yolov8s.hef; the lores stream follows the loaded model
 DET_PUSH_HZ = 30             # max rate boxes are pushed to the page overlay
 IMU_PUSH_HZ = 25             # attitude / g-g plot push rate (/ws/imu); the IMU itself runs at 100 Hz
 COCO_NAMES = (
@@ -169,7 +170,8 @@ class CameraStream:
         self.out = StreamingOutput()
         self.lock = threading.Lock()
         self.mode = None           # (width, height, fps) currently streaming
-        self.lores_size = None     # (640, h) RGB copy of every frame for the detector
+        self.lores_size = None     # RGB copy of every frame for the detector, scaled to fit det_input
+        self.det_input = DET_INPUT
         self.rec = None            # recorder.Recording while recording
         os.makedirs(REC_DIR, exist_ok=True)
         self.set_mode(*mode)
@@ -180,8 +182,11 @@ class CameraStream:
                 raise RuntimeError("stop the recording before switching resolution")
             if self.mode is not None:
                 self.cam.cam.stop_encoder()
-            # detector input: 640 wide, same aspect as main (ISP-scaled, costs no CPU)
-            lo = (640, min(640, int(h) * 640 // int(w)) // 2 * 2)
+            # detector input: same aspect as main, as large as fits the model input (ISP-scaled, costs no
+            # CPU); never larger than main, the detector letterboxes whatever is left
+            nw, nh = self.det_input
+            s = min(nw / int(w), nh / int(h), 1.0)
+            lo = (min(nw, round(int(w) * s / 2) * 2), min(nh, round(int(h) * s / 2) * 2))
             # extra buffers absorb hiccups of the software H.264 encoder while recording (default 6)
             nbuf = BUFFERS_SMALL if int(w) * int(h) <= 1536 * 864 else BUFFERS_LARGE
             m = self.cam.set_mode(int(w), int(h), float(fps), settle_s=0.0, lores=(*lo, "BGR888"), buffer_count=nbuf)
@@ -192,6 +197,13 @@ class CameraStream:
             self.mode = (m.width, m.height, m.fps)
             log.info("camera %dx%d @ %.1f fps", *self.mode)
             return self.mode
+
+    def set_det_input(self, w, h):
+        """Resize the lores stream for a model with a (w, h) input; restarts the camera if it changes."""
+        if (w, h) != self.det_input:
+            self.det_input = (w, h)
+            if self.mode is not None:
+                self.set_mode(*self.mode)
 
     def start_recording(self, imu=None, drive=None, control=None):
         """Start a take (IMU / drive / control are sampled into it); returns its id."""
@@ -307,12 +319,14 @@ class Vision:
 
     # ---- worker
     def _open(self):
-        from apple_detector import AppleDetector   # needs python3-hailort; only loaded when used
+        from apple_detector import AppleDetector, hef_input_size   # needs python3-hailort; loaded when used
+        self.camera.set_det_input(*hef_input_size(self.cfg["hef"]))
         det = AppleDetector(self.cfg["hef"], lores_size=self.camera.lores_size)
         det.detect(np.full((det.lo_h, det.lo_w, 3), 114, np.uint8))   # learn class count
         self.names = COCO_NAMES if det.num_classes == 80 else ["apple"] if det.num_classes == 1 \
             else ["class%d" % i for i in range(det.num_classes)]
-        log.info("vision: %s (%d classes) on %dx%d lores", self.cfg["hef"], det.num_classes, det.lo_w, det.lo_h)
+        log.info("vision: %s (%d classes, %dx%d input) on %dx%d lores", self.cfg["hef"], det.num_classes,
+                 det.net_w, det.net_h, det.lo_w, det.lo_h)
         return det
 
     def _close(self):

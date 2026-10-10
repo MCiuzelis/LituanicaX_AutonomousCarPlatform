@@ -1,7 +1,8 @@
-"""Run a HEF over a folder of 1280x720 JPEGs on the Pi's Hailo and dump predictions as JSON.
+"""Run a HEF over a folder of 16:9 JPEGs on the Pi's Hailo and dump predictions as JSON.
 
-Frames are downscaled to 640x360 with PIL bilinear (the car gets this from the ISP) and go
-through the exact AppleDetector path used on the car.
+Frames are downscaled with PIL bilinear to the lores size the car would use for this model
+(960x540 for a 960x544 HEF, 640x360 for 640x640; the car gets it from the ISP) and go through
+the exact AppleDetector path used on the car.
 
     python3 eval_hef.py --hef ../models/apple_yolov8s.hef --images val_images --out preds_hef.json
 """
@@ -13,7 +14,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from apple_detector import ROOT, AppleDetector
+from apple_detector import ROOT, AppleDetector, hef_input_size, lores_fit
 
 
 def main():
@@ -24,11 +25,13 @@ def main():
     ap.add_argument("--conf", type=float, default=0.2, help="HEF NMS already cuts at 0.2")
     args = ap.parse_args()
 
-    det = AppleDetector(args.hef, score_thr=args.conf, lores_size=(640, 360))
+    imgs = sorted(args.images.glob("*.jpg"))
+    lores = lores_fit(*Image.open(imgs[0]).size, *hef_input_size(args.hef))
+    det = AppleDetector(args.hef, score_thr=args.conf, lores_size=lores)
     preds = {}
     try:
-        for p in sorted(args.images.glob("*.jpg")):
-            im = np.asarray(Image.open(p).convert("RGB").resize((640, 360), Image.BILINEAR))
+        for p in imgs:
+            im = np.asarray(Image.open(p).convert("RGB").resize(lores, Image.BILINEAR))
             preds[p.stem] = [[round(v, 5) for v in b[:5]] for b in det.detect(im)]
     finally:
         det.close()
