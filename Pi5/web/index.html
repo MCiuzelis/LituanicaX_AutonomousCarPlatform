@@ -31,7 +31,7 @@
   button.rec { background:#4d2320; border-color:var(--bad); color:#fff; }
   #reclist { list-style:none; padding:0; margin:0; max-height:220px; overflow:auto; }
   #reclist li { display:flex; gap:8px; align-items:center; padding:4px 0; border-bottom:1px solid #262d36; font-size:13px; }
-  #reclist li span { flex:1; }
+  #reclist li span { flex:1; min-width:0; overflow-wrap:anywhere; }
   #reclist button { padding:2px 8px; font-size:12px; }
   video { width:100%; border-radius:6px; background:#000; display:none; margin-top:8px; }
   .camwrap { position:relative; }
@@ -40,6 +40,8 @@
          font:12px/1.5 ui-monospace, monospace; color:#fff; display:none; }
   input[type=range] { padding:0; vertical-align:middle; width:110px; }
   select#vmodel { max-width:220px; }
+  canvas#imucv { width:100%; height:150px; display:block; background:#151a20; border-radius:6px; }
+  .h2btn { font-size:11px; padding:1px 6px; text-transform:none; letter-spacing:0; }
 </style>
 </head>
 <body>
@@ -65,7 +67,7 @@
       <button id="recbtn">● record</button><span id="recstat" class="keys"></span>
       <span style="flex:1"></span>
       <button id="drivebtn">enable keyboard driving</button>
-      <label>throttle <input id="lvl" type="number" min="1" max="20" value="10" style="width:60px"> %</label>
+      <label>throttle <input id="lvl" type="number" min="1" max="40" value="10" style="width:60px"> %</label>
     </div>
     <div class="row">
       <button id="visbtn">&#9654; detection</button>
@@ -82,11 +84,15 @@
     </div>
     <p class="keys"><kbd>W</kbd> forward <kbd>S</kbd> brake <kbd>A</kbd>/<kbd>D</kbd> steer <kbd>space</kbd> stop &nbsp;·&nbsp;
       commands go over WiFi (WebSocket); run <code>car_client.py --host &lt;pi-ip&gt;</code> on the PC for the tcp link.
-      Server caps throttle at <span id="cap">20</span> %; motor stops if no command for 0.4 s.</p>
+      Server caps throttle at <span id="cap">40</span> %; motor stops if no command for 0.4 s.</p>
   </section>
   <aside class="panel">
     <h2>Vision</h2><table id="t-vision"></table>
     <h2>Drive</h2><table id="t-drive"></table>
+    <h2>IMU <button id="imulevel" class="h2btn" title="car still on level ground: this pose becomes roll = pitch = 0 (saved)">set level</button>
+      <button id="imuyaw" class="h2btn">zero yaw</button> <span id="imustat" class="keys"></span></h2>
+    <canvas id="imucv"></canvas>
+    <table id="t-imu"></table>
     <h2>Battery / power</h2><table id="t-power"></table>
     <h2>System</h2><table id="t-sys"></table>
     <h2>Links</h2><table id="t-links"></table>
@@ -131,15 +137,22 @@ function render(d) {
   const age = k => (lk[k]==null) ? 'never' : (lk[k] < 1000 ? lk[k]+' ms ago' : fmt(lk[k]/1000,0)+' s ago');
   table('t-links', [['wifi', w.up ? fmt(w.level_dbm,0)+' dBm' : 'down'], ['browser cmd', age('ws')], ['pc client cmd', age('tcp')]]);
   renderVision(d.vision||{}, cam);
+  renderImu(d.imu||{});
   const rec = cam.recording;
   $('recbtn').textContent = rec ? '■ stop recording' : '● record';
   $('recbtn').classList.toggle('rec', !!rec);
-  $('recstat').textContent = rec ? `${rec.file} · ${fmt(rec.seconds,0)} s` : '';
+  if (rec) {
+    const warn = rec.dropped || rec.error || !rec.imu || rec.frames_no_imu > 2;
+    $('recstat').innerHTML = `${rec.id} · ${fmt(rec.seconds,0)} s · ${rec.frames} frames` +
+      ` · <span style="color:var(--${warn ? 'warn' : 'ok'})">dropped ${rec.dropped} · ` +
+      (rec.imu ? `imu ${rec.imu_samples} samples` + (rec.frames_no_imu ? ` · ${rec.frames_no_imu} frames w/o imu` : '') : 'NO IMU') +
+      (rec.error ? ` · ${rec.error}` : '') + '</span>';
+  } else if (!recPending) $('recstat').textContent = recMsg;
   pill('p-wifi', w.up ? 'ok':'bad', w.up ? 'wifi '+fmt(w.level_dbm,0)+' dBm' : 'wifi down');
   pill('p-tcp', (lk.tcp!=null && lk.tcp<1000) ? 'ok':'', 'pc client');
   pill('p-ctl', c.stopped ? '' : 'ok', c.stopped ? 'control idle' : 'driving via '+c.active);
-  $('cap').textContent = Math.round((c.max_throttle||0.2)*100);
-  $('c-t').textContent = Math.round((c.throttle||0)*100)+' %'; $('b-t').style.width = Math.abs(c.throttle||0)*100/(c.max_throttle||0.2)+'%';
+  $('cap').textContent = Math.round((c.max_throttle||0.4)*100);
+  $('c-t').textContent = Math.round((c.throttle||0)*100)+' %'; $('b-t').style.width = Math.abs(c.throttle||0)*100/(c.max_throttle||0.4)+'%';
   $('b-t').style.background = (c.throttle||0) < 0 ? 'var(--bad)' : 'var(--acc)';
   $('c-s').textContent = fmt(c.steer,2);
   const s=(c.steer||0); $('b-s').style.width=Math.abs(s)*50+'%'; $('b-s').style.marginLeft=(s<0?50+s*50:50)+'%';
@@ -243,22 +256,134 @@ function renderVision(v, cam) {
   $('hud').textContent = v.on ? `${fmt(v.fps,0)} fps · ${fmt(L.p50,0)} ms · ${b.now??0} ${apples ? 'apples' : 'objects'}` : '';
 }
 
+// ---- IMU: attitude indicator + g-g plot (own websocket, 25 Hz) and status table
+const G0 = 9.80665, IMU_LINK_STALE_MS = 300, IMU_DATA_STALE_MS = 150;
+let imu = null, imuTrail = [];
+function connectImu() {
+  const s = new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws/imu');
+  s.onmessage = ev => { imu = JSON.parse(ev.data); imu.at = performance.now();
+    imuTrail.push([imu.acc[0], imu.acc[1]]); if (imuTrail.length > 50) imuTrail.shift();
+    requestAnimationFrame(drawImu); };
+  s.onclose = () => { imu = null; requestAnimationFrame(drawImu); setTimeout(connectImu, 200); };
+}
+connectImu();
+function drawImu() {
+  const cv = $('imucv'), dpr = window.devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
+  if (cv.width !== Math.round(W*dpr) || cv.height !== Math.round(H*dpr)) { cv.width = Math.round(W*dpr); cv.height = Math.round(H*dpr); }
+  const g = cv.getContext('2d'); g.setTransform(dpr,0,0,dpr,0,0); g.clearRect(0,0,W,H);
+  g.font = '11px ui-monospace, monospace'; g.textBaseline = 'top';
+  // link: messages come at 25 Hz; data: age of the attitude sample itself (IMU runs at 100 Hz)
+  const linkLost = !imu || performance.now() - imu.at > IMU_LINK_STALE_MS;
+  const dataStale = !linkLost && imu.age_ms > IMU_DATA_STALE_MS;
+  const stale = linkLost || dataStale;
+  const r = Math.min(H/2 - 10, W/4 - 10), cx1 = W/4, cx2 = 3*W/4, cy = H/2;
+  // attitude: horizon tilts against roll (right side down -> horizon's right end rises), drops with nose up
+  g.save(); g.beginPath(); g.arc(cx1, cy, r, 0, 2*Math.PI); g.clip();
+  g.fillStyle = '#2b4a6b'; g.fillRect(cx1-r, cy-r, 2*r, 2*r);
+  if (!stale) {
+    const k = r / 30;   // px per degree of pitch: +-30 deg spans the disc
+    g.translate(cx1, cy); g.rotate(-imu.roll * Math.PI/180); g.translate(0, Math.max(-r, Math.min(r, imu.pitch * k)));
+    g.fillStyle = '#5a4128'; g.fillRect(-2*r, 0, 4*r, 2*r);
+    g.strokeStyle = '#fff'; g.lineWidth = 1.5; g.beginPath(); g.moveTo(-2*r, 0); g.lineTo(2*r, 0); g.stroke();
+    g.lineWidth = 1; g.strokeStyle = 'rgba(255,255,255,.6)';
+    for (const p of [-20, -10, 10, 20]) { const y = -p*k, w = Math.abs(p) === 10 ? r*.25 : r*.4; g.beginPath(); g.moveTo(-w, y); g.lineTo(w, y); g.stroke(); }
+  }
+  g.restore();
+  g.strokeStyle = '#e8b33c'; g.lineWidth = 2; g.beginPath();   // car symbol
+  g.moveTo(cx1-r*.55, cy); g.lineTo(cx1-r*.15, cy); g.lineTo(cx1, cy+r*.12); g.lineTo(cx1+r*.15, cy); g.lineTo(cx1+r*.55, cy); g.stroke();
+  g.strokeStyle = '#3a4553'; g.lineWidth = 1; g.beginPath(); g.arc(cx1, cy, r, 0, 2*Math.PI); g.stroke();
+  // g-g: lateral (right +) across, longitudinal (forward +) up; rings at 0.25 / 0.5 g, edge 0.75 g
+  const gs = r / 0.75;
+  g.strokeStyle = '#2f3843'; g.beginPath(); g.moveTo(cx2-r, cy); g.lineTo(cx2+r, cy); g.moveTo(cx2, cy-r); g.lineTo(cx2, cy+r); g.stroke();
+  for (const rr of [0.25, 0.5, 0.75]) { g.beginPath(); g.arc(cx2, cy, rr*gs, 0, 2*Math.PI); g.stroke(); }
+  g.fillStyle = '#8a94a3'; g.fillText('0.5g', cx2 + 0.5*gs*0.71 + 2, cy - 0.5*gs*0.71 - 12);
+  g.fillText('fwd', cx2 + 3, cy - r); g.fillText('right', cx2 + r - 30, cy + 3);
+  if (!stale) {
+    imuTrail.forEach(([f, l], i) => { g.fillStyle = `rgba(77,163,255,${(i+1)/imuTrail.length*0.5})`;
+      g.beginPath(); g.arc(cx2 - l/G0*gs, cy - f/G0*gs, 2, 0, 2*Math.PI); g.fill(); });
+    const f = imu.acc[0]/G0, l = imu.acc[1]/G0;
+    g.fillStyle = '#4da3ff'; g.beginPath(); g.arc(cx2 - Math.max(-1, Math.min(1, l/0.75))*r, cy - Math.max(-1, Math.min(1, f/0.75))*r, 5, 0, 2*Math.PI); g.fill();
+  }
+  g.fillStyle = stale ? '#e0524d' : '#e6e9ee';
+  g.fillText(linkLost ? 'imu link lost' : dataStale ? `imu data stale (${fmt(imu.age_ms,0)} ms)` : `R ${fmt(imu.roll,1)}°  P ${fmt(imu.pitch,1)}°`, 4, 4);
+  if (!stale) g.fillText(`${fmt(Math.hypot(imu.acc[0], imu.acc[1])/G0,2)} g`, W/2 + 4, 4);
+}
+window.addEventListener('resize', () => requestAnimationFrame(drawImu));
+setInterval(() => requestAnimationFrame(drawImu), 100);   // shows a stall even when no message arrives
+const ACC = ['unreliable', 'low', 'medium', 'high'];
+function renderImu(m) {
+  const fr = m.frame || {};
+  if (!m.up) {
+    table('t-imu', [['state', `<span style="color:var(--bad)">down</span>`], ['error', m.error || '–']]);
+    return;
+  }
+  const v = m.values || {}, a = v.acc || [], w = v.rate || [], sens = m.sensors || {}, ac = m.accuracy || {};
+  const hz = Object.values(sens).map(x => x.hz), lost = Object.values(sens).reduce((t, x) => t + (x.lost||0), 0);
+  const ok = (c, t) => c ? t : `<span style="color:var(--warn)">${t}</span>`;
+  table('t-imu', [
+    ['roll <span class="keys">(right down +)</span>', fmt(v.roll,1)+' °'],
+    ['pitch <span class="keys">(nose up +)</span>', fmt(v.pitch,1)+' °'],
+    ['yaw <span class="keys">(left +, relative)</span>', fmt(v.yaw,1)+' °'],
+    ['yaw rate <span class="keys">(left +)</span>', fmt(w[2],1)+' °/s'],
+    ['accel fwd / lat', `${fmt((a[0]||0)/G0,2)} / ${fmt(-(a[1]||0)/G0,2)} g <span class="keys">(right +)</span>`],
+    ['tilt from level', fmt(v.tilt,1)+' °'],
+    ['sensors', ok(lost === 0 && hz.every(h => h > 80), `${hz.length} × ${fmt(Math.min(...hz),0)}–${fmt(Math.max(...hz),0)} Hz · lost ${lost}`)],
+    ['accuracy', `rv ${ACC[ac.game_rv] ?? '–'} · acc ${ACC[ac.accel] ?? '–'} · gyro ${ACC[ac.gyro] ?? '–'}`],
+    ['|accel|', `${fmt(m.g,2)} m/s²`],
+    ['level ref', fr.levelled ? `${fr.level_time.replace('T',' ')} <span class="keys">(mount ${fmt(fr.mount_tilt_deg,1)}° off ${fr.up} up)</span>` : ok(false, 'not set — press "set level"')],
+    ['dropouts <span class="keys">(gap &gt; 50 ms)</span>', ok(!(m.gaps||{}).count, `${(m.gaps||{}).count ?? '–'} · max gap ${fmt((m.gaps||{}).max_ms,0)} ms` +
+      ((m.gaps||{}).last ? ` <span class="keys">last ${new Date(m.gaps.last*1000).toLocaleTimeString()}</span>` : '') +
+      ` <span class="keys">since ${m.gaps ? new Date(m.gaps.since*1000).toLocaleTimeString() : '–'}</span>`)],
+    ['self-calibration', ok((m.self_cal||[]).includes('gyro'), (m.self_cal||[]).join(' + ') || 'off')],
+    ['link', ok(!m.hub_resets && !m.worker_restarts, `fw ${m.fw} · INT p99 ${m.int_p99_us ?? '–'} µs · resets ${m.hub_resets}/${m.worker_restarts}`)],
+  ]);
+}
+async function imuPost(path, busy) {
+  $('imustat').textContent = busy;
+  const r = await fetch(path, {method:'POST'}); const j = await r.json();
+  $('imustat').textContent = r.ok ? 'done' : j.error; setTimeout(() => $('imustat').textContent = '', r.ok ? 2000 : 8000);
+}
+$('imulevel').onclick = () => imuPost('/api/imu/level', 'hold still…');
+$('imuyaw').onclick = () => imuPost('/api/imu/zero_yaw', '');
+
 // ---- recording
-let recording = false;
+// one take = folder recordings/<id>/: <id>.mp4, <id>_frames.csv (IMU + odometry per video frame),
+// <id>_imu.csv (every IMU sample), <id>_drive.csv, <id>_meta.json (camera, crop, intrinsics, mounts)
+let recording = false, recPending = false, recMsg = '';
 $('recbtn').onclick = async () => {
   recording = !$('recbtn').classList.contains('rec');
-  await fetch('/api/record', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({on: recording})});
-  if (!recording) setTimeout(loadRecordings, 500);
+  recPending = true; recMsg = ''; $('recstat').textContent = recording ? 'starting…' : 'saving…';
+  const r = await fetch('/api/record', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({on: recording})});
+  recPending = false;
+  if (!r.ok) recMsg = 'record failed: ' + ((await r.json()).error || r.status);
+  if (!recording) loadRecordings();
 };
 async function loadRecordings() {
   const list = await (await fetch('/api/recordings')).json();
-  $('reclist').innerHTML = list.map(r => `<li><span>${r.name.replace('rec_','').replace('.mp4','')} · ${r.size_mb} MB</span>
-    <button data-play="${r.name}">play</button><button data-del="${r.name}">delete</button></li>`).join('') || '<li><span>none yet</span></li>';
+  $('reclist').innerHTML = list.map(r => {
+    const info = r.legacy ? `${r.name} · ${r.size_mb} MB <span class="keys">(old: no IMU)</span>`
+      : `${r.name} · ${fmt(r.seconds,0)} s · ${r.frames ?? '?'} frames · ${r.size_mb} MB` +
+        (!r.complete ? ' <span style="color:var(--warn)">(not finalised)</span>'
+          : (r.dropped || r.no_imu) ? ` <span style="color:var(--warn)">dropped ${r.dropped} · w/o imu ${r.no_imu}</span>` : '');
+    return `<li><span title="${(r.files||[]).join('\n')}">${info}</span><button data-play="${r.video}">play</button>` +
+      (r.legacy ? '' : `<button data-get="${r.name}" title="video + IMU + metadata as one .tar">download</button>`) +
+      `<button data-del="${r.name}" title="deletes the video together with its IMU / metadata files">delete</button></li>`;
+  }).join('') || '<li><span>none yet</span></li>';
 }
 $('reclist').onclick = async e => {
   const b = e.target;
   if (b.dataset.play) { const v = $('player'); v.style.display='block'; v.src = '/recordings/'+b.dataset.play; v.play(); }
-  if (b.dataset.del) { await fetch('/api/recordings/'+b.dataset.del, {method:'DELETE'}); loadRecordings(); }
+  if (b.dataset.get) location.href = '/api/recordings/'+b.dataset.get+'/download';
+  if (b.dataset.del) {
+    if (!b.dataset.armed) {   // two clicks: a take is not recoverable
+      b.dataset.armed = 1; b.textContent = 'sure?';
+      setTimeout(() => { delete b.dataset.armed; b.textContent = 'delete'; }, 3000);
+      return;
+    }
+    const r = await fetch('/api/recordings/'+b.dataset.del, {method:'DELETE'});
+    if (!r.ok) recMsg = (await r.json()).error;
+    loadRecordings();
+  }
 };
 $('recrefresh').onclick = loadRecordings;
 loadRecordings();

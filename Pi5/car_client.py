@@ -6,7 +6,7 @@
 Health lines from the Pi (battery, speed, active link, dead-man state) are shown live.
 
 Keys (window must have focus):  W forward   S brake   A / D steer   space stop
-                                + / - throttle level (5 % steps, max 20 %)   Esc quit
+                                + / - throttle level (5 % steps, max 40 %)   Esc quit
 """
 import argparse
 import json
@@ -93,7 +93,7 @@ class App:
         if k == "escape":
             self.root.destroy()
         elif k in ("plus", "equal"):
-            self.level = min(0.20, self.level + 0.05)
+            self.level = min(0.40, self.level + 0.05)
         elif k in ("minus", "underscore"):
             self.level = max(0.05, self.level - 0.05)
         else:
@@ -140,10 +140,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--host", default="rp5", help="Pi hostname/IP for the WiFi link")
     ap.add_argument("--port", type=int, default=8081)
-    ap.add_argument("--level", type=float, default=0.10, help="forward throttle for W (0.05..0.20)")
+    ap.add_argument("--level", type=float, default=0.10, help="forward throttle for W (0.05..0.40)")
     a = ap.parse_args()
     links = [Link("wifi", tcp_connect(a.host, a.port))]
-    App(links, min(0.20, max(0.05, a.level))).root.mainloop()
+    App(links, min(0.40, max(0.05, a.level))).root.mainloop()
 
 
 if __name__ == "__main__":

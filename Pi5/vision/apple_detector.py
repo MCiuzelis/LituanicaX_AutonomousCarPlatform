@@ -4,16 +4,17 @@ Runs on the Pi 5 (system python3 with python3-hailort + picamera2, no OpenCV nee
 Used standalone (benchmark below) and by dashboard.py (live overlay + telemetry).
 
 Camera: same raw sensor mode as the training recordings (1536x864 @ up to 120 fps, via the
-dashboard's 1280x720 setting). The ISP produces the 1280x720 main stream *and* a 640-wide
-lores copy for free; lores is letterboxed to 640x640 (grey 114 bars, exactly like Ultralytics
-training) and sent to the Hailo through the async API. NMS runs on-chip.
+dashboard's 1280x720 setting). The ISP produces the 1280x720 main stream *and* a lores copy
+scaled to fit the model input for free (960x540 for the 960x544 apple model, 640x360 for
+640x640 models); lores is letterboxed to the model input (grey 114 bars, exactly like
+Ultralytics) and sent to the Hailo through the async API. NMS runs on-chip.
 
     python3 apple_detector.py                                            # Pi5/models/apple_yolov8s.hef
     python3 apple_detector.py --hef /usr/share/hailo-models/yolov8s_h8.hef --class-id 47  # stock COCO 'apple'
     python3 apple_detector.py --save 5                                   # also save annotated JPEGs
 
 Library use:
-    det = AppleDetector("apple_yolov8s.hef", lores_size=(640, 360))
+    det = AppleDetector("apple_yolov8s.hef", lores_size=(960, 540))   # lores_fit() gives the size
     boxes = det.detect(rgb_lores)   # -> [(x1, y1, x2, y2, score, class_id)], coords 0..1 of the frame
 """
 import argparse
@@ -30,8 +31,20 @@ from hailo_platform import FormatType, HailoSchedulingAlgorithm, VDevice
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # Pi5/
 
-NET = 640                         # model input (square)
 CAM_W, CAM_H = 1280, 720          # camera output the car works in (standalone benchmark)
+
+
+def hef_input_size(hef_path):
+    """(width, height) of the HEF's input layer, read from the file (no device needed)."""
+    from hailo_platform import HEF
+    h, w, _ = HEF(hef_path).get_input_vstream_infos()[0].shape
+    return w, h
+
+
+def lores_fit(frame_w, frame_h, net_w, net_h):
+    """Largest even (w, h) with the frame's aspect that fits in the net input; the rest is letterbox."""
+    s = min(net_w / frame_w, net_h / frame_h)
+    return min(net_w, round(frame_w * s / 2) * 2), min(net_h, round(frame_h * s / 2) * 2)
 
 
 class AppleDetector:
@@ -42,13 +55,10 @@ class AppleDetector:
     result thread collects them, so boxes are available as soon as the chip is done with a frame
     instead of when the next camera frame arrives."""
 
-    def __init__(self, hef_path, score_thr=0.35, class_ids=None, depth=4, lores_size=(640, 360)):
+    def __init__(self, hef_path, score_thr=0.35, class_ids=None, depth=4, lores_size=(960, 540)):
         self.hef_path = hef_path
         self.score_thr = score_thr
         self.class_ids = class_ids
-        self.lo_w, self.lo_h = lores_size
-        assert self.lo_w == NET and self.lo_h <= NET, f"lores must be {NET} wide and <= {NET} high"
-        self.pad_top = (NET - self.lo_h) // 2
         params = VDevice.create_params()
         params.scheduling_algorithm = HailoSchedulingAlgorithm.ROUND_ROBIN
         self.vdevice = VDevice(params)
@@ -56,13 +66,13 @@ class AppleDetector:
         self.model.set_batch_size(1)
         self.model.input().set_format_type(FormatType.UINT8)
         self.model.output().set_format_type(FormatType.FLOAT32)
-        h, w, _ = self.model.input().shape
-        assert (h, w) == (NET, NET), f"expected {NET}x{NET} input, HEF has {w}x{h}"
+        self.net_h, self.net_w, _ = self.model.input().shape
+        self._set_lores(*lores_size)
         self._stack = ExitStack()
         self.cfg = self._stack.enter_context(self.model.configure())
         self._slots = []
         for _ in range(depth):
-            canvas = np.full((NET, NET, 3), 114, np.uint8)
+            canvas = np.full((self.net_h, self.net_w, 3), 114, np.uint8)
             b = self.cfg.create_bindings(
                 output_buffers={self.model.output().name: np.empty(self.model.output().shape, np.float32)})
             b.input().set_buffer(canvas)
@@ -83,7 +93,7 @@ class AppleDetector:
         self._free.acquire()
         canvas, b = self._slots[self._next]
         self._next = (self._next + 1) % len(self._slots)
-        canvas[self.pad_top:self.pad_top + self.lo_h] = rgb_lores
+        canvas[self.pad_top:self.pad_top + self.lo_h, self.pad_left:self.pad_left + self.lo_w] = rgb_lores
         self.cfg.wait_for_async_ready(timeout_ms=1000)
         with self._cond:
             self._pending.append((self.cfg.run_async([b]), b, tag, time.perf_counter()))
@@ -105,10 +115,14 @@ class AppleDetector:
     def set_lores_size(self, w, h):
         """Switch input frame size (e.g. after a camera mode change). Nothing may be in flight."""
         assert not self._pending, "drain in-flight frames first"
-        assert w == NET and h <= NET, f"lores must be {NET} wide and <= {NET} high"
-        self.lo_w, self.lo_h, self.pad_top = w, h, (NET - h) // 2
+        self._set_lores(w, h)
         for canvas, _ in self._slots:
             canvas.fill(114)   # old image rows must not survive in the new letterbox bars
+
+    def _set_lores(self, w, h):
+        assert w <= self.net_w and h <= self.net_h,             f"lores {w}x{h} does not fit the {self.net_w}x{self.net_h} model input"
+        self.lo_w, self.lo_h = w, h
+        self.pad_left, self.pad_top = (self.net_w - w) // 2, (self.net_h - h) // 2
 
     @property
     def in_flight(self):
@@ -122,7 +136,7 @@ class AppleDetector:
     def _decode(self, raw):
         """HAILO_NMS_BY_CLASS -> [(x1, y1, x2, y2, score, class_id)] normalised to the camera frame.
         `raw` is a per-class list of (n, 5) arrays [ymin, xmin, ymax, xmax, score] in letterboxed
-        640x640 space (0..1)."""
+        model-input space (0..1)."""
         self.num_classes = len(raw)
         out = []
         for cid, dets in enumerate(raw):
@@ -131,10 +145,10 @@ class AppleDetector:
             for y1, x1, y2, x2, s in np.asarray(dets).reshape(-1, 5):
                 if s < self.score_thr:
                     continue
-                out.append((float(np.clip(x1, 0, 1)),
-                            float(np.clip((y1 * NET - self.pad_top) / self.lo_h, 0, 1)),
-                            float(np.clip(x2, 0, 1)),
-                            float(np.clip((y2 * NET - self.pad_top) / self.lo_h, 0, 1)),
+                out.append((float(np.clip((x1 * self.net_w - self.pad_left) / self.lo_w, 0, 1)),
+                            float(np.clip((y1 * self.net_h - self.pad_top) / self.lo_h, 0, 1)),
+                            float(np.clip((x2 * self.net_w - self.pad_left) / self.lo_w, 0, 1)),
+                            float(np.clip((y2 * self.net_h - self.pad_top) / self.lo_h, 0, 1)),
                             float(s), cid))
         return out
 
@@ -156,14 +170,14 @@ class AppleDetector:
         self.vdevice.release()
 
 
-def open_camera(fps):
+def open_camera(fps, lores_size):
     """Same raw mode the dashboard picks for 1280x720 (1536x864, 2x2 binned, max 120 fps)."""
     from picamera2 import Picamera2
     cam = Picamera2()
     # picamera2 "BGR888" = bytes in R,G,B order, i.e. an RGB numpy array (what the model expects)
     cfg = cam.create_video_configuration(
         main={"size": (CAM_W, CAM_H), "format": "BGR888"},
-        lores={"size": (NET, NET * CAM_H // CAM_W), "format": "BGR888"},
+        lores={"size": lores_size, "format": "BGR888"},
         raw={"size": (1536, 864)},
         buffer_count=6,
     )
@@ -203,9 +217,9 @@ def main():
     ap.add_argument("--out", default=os.path.join(ROOT, "results", "vision"))
     args = ap.parse_args()
 
-    det = AppleDetector(args.hef, args.conf, set(args.class_id) if args.class_id else None, args.depth,
-                        (NET, NET * CAM_H // CAM_W))
-    cam = open_camera(args.fps)
+    lores = lores_fit(CAM_W, CAM_H, *hef_input_size(args.hef))
+    det = AppleDetector(args.hef, args.conf, set(args.class_id) if args.class_id else None, args.depth, lores)
+    cam = open_camera(args.fps, lores)
     try:
         # 1) Hailo alone, on a real camera frame, pipeline kept full
         lo = cam.capture_array("lores")
@@ -262,6 +276,8 @@ def main():
     ms = lambda xs: f"median {statistics.median(xs) * 1e3:.2f} ms, p99 {pct(xs, 0.99) * 1e3:.2f} ms"
     report = {
         "hef": args.hef,
+        "net_input": f"{det.net_w}x{det.net_h}",
+        "lores": f"{det.lo_w}x{det.lo_h}",
         "hailo_only_fps": round(hailo_fps, 1),
         "camera_fps_requested": args.fps,
         "end_to_end_fps": round(e2e_fps, 1),

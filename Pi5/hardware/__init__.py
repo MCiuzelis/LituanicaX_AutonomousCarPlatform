@@ -11,6 +11,8 @@ Board / sensors
     MCP3202         12-bit SPI ADC through the kernel IIO driver
     BatteryMonitor  battery voltage on MCP3202 CH1 behind a 15k/4.7k divider
     AS5600          12-bit magnetic rotary encoder on the motor shaft (I2C bus 1, 0x36)
+    BNO085          9-DOF IMU with sensor fusion on SPI0 CE1 (worker process, SHTP/SH-2)
+    CarFrame        IMU board frame -> car frame (mount axes + level reference, config/imu.json)
 
 Actuators
     HardwarePWM     RP1 hardware PWM on GPIO 12/13 (18/19)
@@ -29,6 +31,8 @@ from .camera import Camera, CameraMode, SensorMode
 from .adc import MCP3202, BatteryMonitor, BatteryReading
 from .pwm import HardwarePWM, Servo, PWM_PINS
 from .encoder import AS5600, EncoderReading
+from .bno085 import BNO085, Reading as ImuReading
+from .imu_frame import CarFrame
 from .esc import HobbywingESC
 from .steering import Steering
 from .drive import Drive
@@ -42,6 +46,7 @@ __all__ = [
     "MCP3202", "BatteryMonitor", "BatteryReading",
     "HardwarePWM", "Servo", "PWM_PINS",
     "AS5600", "EncoderReading",
+    "BNO085", "ImuReading", "CarFrame",
     "HobbywingESC", "Steering", "Drive",
     "RP5Board",
 ]
