@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """End-to-end self-test of the hardware framework against the real hardware.
 
-    python3 tests/selftest.py [--batt-min 6.4] [--batt-max 8.4] [--skip camera,hailo,...]
+    python3 tests/selftest.py [--batt-min 6.4] [--batt-max V] [--skip camera,hailo,imu,...]
                         [--bench-seconds 3] [--out results/selftest.json]
 """
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -14,7 +15,7 @@ from datetime import datetime
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # Pi5/
 sys.path.insert(0, ROOT)
-from hardware import RP5Board, Steering, HardwareError, PWM_PINS  # noqa: E402
+from hardware import RP5Board, Steering, HardwareError, PWM_PINS, CarFrame  # noqa: E402
 from hardware.base import run_cmd, read_sysfs  # noqa: E402
 from hardware.pwm import find_pwm_chip  # noqa: E402
 
@@ -87,8 +88,59 @@ def test_battery(b, vmin, vmax):
     RESULTS["battery"] = b.battery.status()
     check("adc CH1 non-zero", r.raw > 0, "raw=%.1f" % r.raw)
     check("adc CH1 stable", (r.raw_max - r.raw_min) < 40, "spread=%d counts" % (r.raw_max - r.raw_min))
-    check("battery within %.1f..%.1f V (2S LiPo)" % (vmin, vmax), vmin <= r.battery_volts <= vmax,
-          "measured %.3f V" % r.battery_volts)
+    if vmax is None:     # bench DC supply or any pack: only a floor
+        check("supply >= %.1f V" % vmin, r.battery_volts >= vmin, "measured %.3f V" % r.battery_volts)
+    else:
+        check("battery within %.1f..%.1f V" % (vmin, vmax), vmin <= r.battery_volts <= vmax,
+              "measured %.3f V" % r.battery_volts)
+
+
+def test_encoder(b):
+    section("AS5600 encoder (motor shaft)")
+    r = b.encoder.read()
+    print(" ", r.as_dict())
+    RESULTS["encoder"] = r.as_dict()
+    check("encoder magnet ok", r.magnet == "ok", "magnet=%s agc=%d magnitude=%d" % (r.magnet, r.agc, r.magnitude))
+    hz, _ = b.encoder.sample_rate(1.0)
+    RESULTS["encoder"]["read_fast_hz"] = round(hz, 1)
+    check("encoder read_fast() > 500 Hz", hz > 500, "%.0f Hz" % hz)
+
+
+def test_imu(b, seconds=5.0):
+    """BNO085 with the dashboard's setup (enable_default) for a few seconds, car at rest, plus
+    the car-frame attitude from config/imu.json (should be ~level in the nominal pose)."""
+    section("BNO085 IMU")
+    G = 9.80665
+    imu = b.imu
+    fw = (imu.product or [{}])[0]
+    print("  product:", fw, "rt priority:", imu.rt_priority)
+    check("imu product id", bool(imu.product), "fw %s" % fw.get("version"))
+    imu.enable_default()
+    time.sleep(seconds)
+    st = imu.stats()
+    RESULTS["imu"] = {"product": imu.product, "stats": st}
+    for n, v in sorted(st["sensors"].items()):
+        print("  %-13s %6.1f Hz  lost %d" % (n, v["rate_hz"], v["lost"]))
+    rates = {n: v["rate_hz"] for n, v in st["sensors"].items()}
+    lost = sum(v["lost"] for v in st["sensors"].values())
+    resets = {k: v for k, v in st["link"].items() if k.startswith("resets_") and k != "resets_start"}
+    check("imu 7 sensors >= 90 Hz", len(rates) == 7 and min(rates.values()) >= 90, str(rates))
+    check("imu no lost samples", lost == 0, "%d lost" % lost)
+    check("imu no hub resets / worker restarts", not resets and not st["link"].get("worker_restarts"),
+          "%s restarts=%s" % (resets, st["link"].get("worker_restarts", 0)))
+    a, gy = imu.acceleration, imu.gyro
+    na, ngy = math.sqrt(sum(x * x for x in a)), math.sqrt(sum(x * x for x in gy))
+    check("imu |accel| ~ g", abs(na - G) < 0.6, "%.2f m/s^2" % na)
+    check("imu gyro ~ 0 at rest", ngy < 0.05, "%.4f rad/s" % ngy)
+    frame = CarFrame.load()
+    roll, pitch, _ = frame.attitude(imu.game_quaternion)
+    up = frame.to_car(a)
+    RESULTS["imu"].update({"frame": frame.status(), "roll": roll, "pitch": pitch, "accel_car": up})
+    print("  car frame: roll %.2f  pitch %.2f deg, accel (fwd, left, up) = (%.2f, %.2f, %.2f) m/s^2; %s" %
+          (roll, pitch, up[0], up[1], up[2], frame.status()))
+    check("imu level reference set", frame.level_gravity is not None, str(frame.level_time))
+    check("imu car frame: gravity along car up", up[2] > 0.98 * na, "up=%.2f of %.2f" % (up[2], na))
+    check("imu car frame: ~level in nominal pose", abs(roll) < 2 and abs(pitch) < 2, "roll %.2f pitch %.2f" % (roll, pitch))
 
 
 def _pin_high_fraction(gpio, n=300):
@@ -119,11 +171,19 @@ def test_pwm(b):
         # crude waveform check: sample the pad level; expect ~7.5 % high at 1.5 ms / 20 ms
         frac = _pin_high_fraction(12)
         check("GPIO12 output toggling (~7.5% high)", 0.01 < frac < 0.25, "sampled high %.1f%%" % (frac * 100))
+        # sysfs duty is exact; the pad sampling is statistical (~1 % error at 600 samples
+        # against a ~2.7 % right/left difference; 150 samples was too few and failed by chance)
         steer.set(1.0)
-        frac_hi = _pin_high_fraction(12, 150)
+        duty_hi = steer.servo.status()["sysfs_duty"]
+        frac_hi = _pin_high_fraction(12, 600)
         steer.set(-1.0)
-        frac_lo = _pin_high_fraction(12, 150)
-        check("GPIO12 duty follows steering", frac_hi > frac_lo, "right: %.1f%%  left: %.1f%%" % (frac_hi * 100, frac_lo * 100))
+        duty_lo = steer.servo.status()["sysfs_duty"]
+        frac_lo = _pin_high_fraction(12, 600)
+        amp = -steer.amplitude_us if steer.cfg.get("invert") else steer.amplitude_us
+        check("GPIO12 sysfs duty follows steering", (int(duty_hi), int(duty_lo)) == (
+            int((steer.center_us + amp) * 1000), int((steer.center_us - amp) * 1000)),
+            "right: %s ns  left: %s ns" % (duty_hi, duty_lo))
+        check("GPIO12 pad duty follows steering", frac_hi > frac_lo, "right: %.1f%%  left: %.1f%%" % (frac_hi * 100, frac_lo * 100))
         for pos in (-0.5, 0.0, 0.5, 0.0):
             steer.set(pos)
             time.sleep(0.25)
@@ -176,9 +236,10 @@ def test_camera(b):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--batt-min", type=float, default=6.4, help="2S LiPo: 3.2 V/cell empty")
-    ap.add_argument("--batt-max", type=float, default=8.4, help="2S LiPo: 4.2 V/cell full")
-    ap.add_argument("--skip", default="", help="comma list: cpu,power,hailo,battery,pwm,camera")
+    ap.add_argument("--batt-min", type=float, default=6.4, help="supply floor (2S LiPo: 3.2 V/cell empty)")
+    ap.add_argument("--batt-max", type=float, default=None,
+                    help="optional ceiling, e.g. 8.4 for a 2S LiPo (default none: the car runs on a DC supply too)")
+    ap.add_argument("--skip", default="", help="comma list: cpu,power,hailo,battery,encoder,imu,pwm,camera")
     ap.add_argument("--bench-seconds", type=int, default=3)
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
@@ -189,6 +250,7 @@ def main():
         for name, fn in (("cpu", lambda: test_cpu(b)), ("power", lambda: test_power(b)),
                          ("hailo", lambda: test_hailo(b, a.bench_seconds)),
                          ("battery", lambda: test_battery(b, a.batt_min, a.batt_max)),
+                         ("encoder", lambda: test_encoder(b)), ("imu", lambda: test_imu(b)),
                          ("pwm", lambda: test_pwm(b)), ("camera", lambda: test_camera(b))):
             if name in skip:
                 print("\n=== %s: skipped ===" % name)

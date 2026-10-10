@@ -1,5 +1,6 @@
 """RP5Board: one object that owns every subsystem, created lazily on first use."""
 from .adc import MCP3202, BatteryMonitor
+from .bno085 import BNO085
 from .camera import Camera
 from .cpu import CpuMonitor
 from .encoder import AS5600
@@ -33,6 +34,7 @@ class RP5Board:
         self._servo_kwargs = servo_kwargs or {}
         self._cpu = self._power = self._hailo = self._camera = self._adc = self._battery = None
         self._encoder = None
+        self._imu = None
         self._servos = {}
 
     @property
@@ -77,6 +79,13 @@ class RP5Board:
             self._encoder = AS5600()
         return self._encoder
 
+    @property
+    def imu(self) -> BNO085:
+        """BNO085 (starts its worker process on first use; enable sensors yourself)."""
+        if self._imu is None:
+            self._imu = BNO085()
+        return self._imu
+
     def servo(self, gpio) -> Servo:
         if gpio not in self._servo_pins:
             raise ValueError("servo pins configured: %s" % (self._servo_pins,))
@@ -116,6 +125,8 @@ class RP5Board:
             self._camera.close()
         if self._encoder is not None:
             self._encoder.close()
+        if self._imu is not None:
+            self._imu.close()
 
     def __enter__(self):
         return self

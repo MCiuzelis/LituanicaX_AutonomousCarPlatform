@@ -6,11 +6,12 @@
 
 Serves
   http://<pi>:8080/        the dashboard page (web/index.html): MJPEG camera, resolution
-                           switching, mp4 recording, all telemetry, keyboard driving over a
-                           WebSocket
+                           switching, training-data recording (H.264 + per-frame IMU / odometry,
+                           recorder.py), all telemetry, keyboard driving over a WebSocket
   tcp  <pi>:8081           command/health link for car_client.py on a PC
   /ws/det, /api/vision     Hailo object detection on the camera (Vision class): boxes for the
                            page overlay, and on/off + model/threshold/class filter settings
+  /ws/imu, /api/imu/*      BNO085 attitude / acceleration / yaw rate in the car frame (Imu class)
 
 Protocol on both the WebSocket and the tcp link (one JSON object per line):
   client -> pi   {"t": -1..1, "s": -1..1}   throttle (negative = brake) and steering, sent
@@ -25,6 +26,7 @@ import asyncio
 import io
 import json
 import logging
+import math
 import os
 import socket
 import statistics
@@ -32,20 +34,20 @@ import sys
 import threading
 import time
 from collections import deque
-from fractions import Fraction
 
 import numpy as np
 from aiohttp import web
-from picamera2.encoders import JpegEncoder, LibavH264Encoder
-from picamera2.outputs import FileOutput, PyavOutput
+from picamera2.encoders import JpegEncoder
+from picamera2.outputs import FileOutput
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "vision"))
-from hardware import Drive, Camera, BoardPower, BatteryMonitor, HailoBoard  # noqa: E402
+from hardware import Drive, Camera, BoardPower, BatteryMonitor, HailoBoard, BNO085, CarFrame, HardwareError  # noqa: E402
+from recorder import Recording, list_recordings, delete_recording  # noqa: E402
 
 HTTP_PORT, TCP_PORT = 8080, 8081
-MAX_THROTTLE = 0.20          # fraction of full forward the server will ever apply
+MAX_THROTTLE = 0.40          # fraction of full forward the server will ever apply
 DEADMAN_S = 0.4              # stop if no command arrives on any link for this long
 TELEMETRY_HZ = 4             # telemetry sampling + WebSocket push rate
 HEALTH_HZ = 5                # compact health line rate on the tcp link
@@ -56,11 +58,17 @@ CAMERA_MODES = [(640, 360, 120), (640, 480, 120), (800, 600, 120), (1024, 576, 1
                 (1280, 720, 120), (1280, 720, 100), (1280, 720, 60), (1536, 864, 120),
                 (1920, 1080, 56), (2304, 1296, 56), (2304, 1296, 30)]
 DEFAULT_MODE = (1280, 720, 60)
+BUFFERS_SMALL, BUFFERS_LARGE = 16, 10   # camera buffers for modes up to 1536x864 / larger
+PREVIEW_FPS = 30             # MJPEG preview to the page: every Nth camera frame, at most this rate
+# Recording takes every Nth camera frame, at most this rate (YOLO training needs no more; the Pi 5
+# has no H.264 hardware and x264 cannot keep up with e.g. 1536x864@120 or 2304x1296@56)
+REC_FPS_SMALL, REC_FPS_LARGE = 60, 30    # modes up to 1536x864 / larger
 WEB_DIR = os.path.join(ROOT, "web")
 REC_DIR = os.path.join(ROOT, "recordings")
 MODEL_DIR = os.path.join(ROOT, "models")
 STOCK_HEF = "/usr/share/hailo-models/yolov8s_h8.hef"   # COCO yolov8s: same arch/input as ours
 DET_PUSH_HZ = 30             # max rate boxes are pushed to the page overlay
+IMU_PUSH_HZ = 25             # attitude / g-g plot push rate (/ws/imu); the IMU itself runs at 100 Hz
 COCO_NAMES = (
     "person bicycle car motorcycle airplane bus train truck boat traffic_light fire_hydrant "
     "stop_sign parking_meter bench bird cat dog horse sheep cow elephant bear zebra giraffe "
@@ -153,7 +161,8 @@ class StreamingOutput(io.BufferedIOBase):
 
 
 class CameraStream:
-    """Camera -> MJPEG stream for the page, plus optional H.264 mp4 recording to the SD card."""
+    """Camera -> MJPEG stream for the page, plus optional training-data recording to the SD card:
+    H.264 + per-frame IMU / odometry in recordings/<id>/ (recorder.Recording)."""
 
     def __init__(self, mode=DEFAULT_MODE):
         self.cam = Camera(pixel_format="YUV420")   # cheaper to JPEG/H.264-encode than RGB888
@@ -161,7 +170,7 @@ class CameraStream:
         self.lock = threading.Lock()
         self.mode = None           # (width, height, fps) currently streaming
         self.lores_size = None     # (640, h) RGB copy of every frame for the detector
-        self.rec = None            # (encoder, path, start_time) while recording
+        self.rec = None            # recorder.Recording while recording
         os.makedirs(REC_DIR, exist_ok=True)
         self.set_mode(*mode)
 
@@ -173,50 +182,52 @@ class CameraStream:
                 self.cam.cam.stop_encoder()
             # detector input: 640 wide, same aspect as main (ISP-scaled, costs no CPU)
             lo = (640, min(640, int(h) * 640 // int(w)) // 2 * 2)
-            m = self.cam.set_mode(int(w), int(h), float(fps), settle_s=0.0, lores=(*lo, "BGR888"))
+            # extra buffers absorb hiccups of the software H.264 encoder while recording (default 6)
+            nbuf = BUFFERS_SMALL if int(w) * int(h) <= 1536 * 864 else BUFFERS_LARGE
+            m = self.cam.set_mode(int(w), int(h), float(fps), settle_s=0.0, lores=(*lo, "BGR888"), buffer_count=nbuf)
             self.lores_size = lo
-            self.cam.cam.start_encoder(JpegEncoder(q=70), FileOutput(self.out))
+            self.jpeg = JpegEncoder(q=70)
+            self.jpeg.frame_skip_count = max(1, math.ceil(m.fps / PREVIEW_FPS - 0.01))
+            self.cam.cam.start_encoder(self.jpeg, FileOutput(self.out))
             self.mode = (m.width, m.height, m.fps)
             log.info("camera %dx%d @ %.1f fps", *self.mode)
             return self.mode
 
-    def start_recording(self):
+    def start_recording(self, imu=None, drive=None, control=None):
+        """Start a take (IMU / drive / control are sampled into it); returns its id."""
         with self.lock:
             if self.rec:
-                return self.rec[1]
+                return self.rec.id
             w, h, fps = self.mode
-            path = os.path.join(REC_DIR, time.strftime("rec_%Y%m%d_%H%M%S") + "_%dx%d.mp4" % (w, h))
-            enc = LibavH264Encoder(bitrate=int(2e6 * (w * h) / (1280 * 720)))   # ~2 Mbit/s at 720p
-            enc.framerate = Fraction(fps).limit_denominator(1000)                # PyAV wants a rational
-            self.cam.cam.start_encoder(enc, PyavOutput(path))
-            self.rec = (enc, path, time.monotonic())
-            log.info("recording -> %s", path)
-            return path
+            cap = REC_FPS_SMALL if w * h <= 1536 * 864 else REC_FPS_LARGE
+            skip = max(1, math.ceil(fps / cap - 0.01))
+            self.rec = Recording(REC_DIR, self.cam.cam, self.cam.mode, skip=skip, imu=imu, drive=drive, control=control)
+            log.info("recording -> %s (%.0f Mbit/s)", self.rec.dir, self.rec.bitrate / 1e6)
+            return self.rec.id
 
     def stop_recording(self):
         with self.lock:
             if not self.rec:
                 return None
-            enc, path, _ = self.rec
-            self.cam.cam.stop_encoder(enc)
-            self.rec = None
-            os.sync()
-            log.info("recording saved %s (%.1f MB)", path, os.path.getsize(path) / 1e6)
-            return path
+            rec, self.rec = self.rec, None
+            s = rec.stop()
+            log.info("recording saved %s: %d frames, %d dropped, %d without IMU, %.1f MB", rec.id, s["frames"],
+                     s["dropped_frames"], s["frames_without_imu"], s["video_bytes"] / 1e6)
+            return rec.id
 
     @staticmethod
     def recordings():
-        out = []
-        for n in sorted(os.listdir(REC_DIR), reverse=True):
-            if n.endswith(".mp4"):
-                st = os.stat(os.path.join(REC_DIR, n))
-                out.append({"name": n, "size_mb": round(st.st_size / 1e6, 1), "mtime": st.st_mtime})
-        return out
+        return list_recordings(REC_DIR)
 
     def status(self):
-        rec = None
-        if self.rec:
-            rec = {"file": os.path.basename(self.rec[1]), "seconds": round(time.monotonic() - self.rec[2], 1)}
+        rec, r = None, self.rec
+        if r:
+            rec = r.status()
+            rec["file"] = rec["id"]
+            if rec["disk_low"] and not getattr(r, "stopping", False):
+                log.warning("recording: less than 500 MB free, stopping")
+                r.stopping = True
+                threading.Thread(target=self.stop_recording, daemon=True).start()
         fs = os.statvfs(REC_DIR)
         m = self.cam.mode
         return {"mode": self.mode, "stream_fps": round(self.out.fps, 1), "modes": CAMERA_MODES,
@@ -423,12 +434,150 @@ class Vision:
         self._close()
 
 
+# ---------------------------------------------------------------- IMU
+class Imu:
+    """BNO085 (SENSORS at RATE_HZ, no magnetometer) reported in the car frame.
+
+    Opened in the background and retried, so the dashboard comes up without it. Attitude comes
+    from game_rv (gyro + accel, no magnetometer: the motor and battery leads disturb it), so yaw
+    is relative: it is zeroed at start-up and by zero_yaw(). The magnetometer is never enabled
+    (nor rv, which fuses it): it is useless here and its reports cut the hub's rate for the rest. The board -> car rotation and the
+    level reference live in config/imu.json (hardware.CarFrame); level() re-captures it.
+    """
+
+    SENSORS = ("game_rv", "accel", "gyro", "linear_accel", "gravity")
+    RATE_HZ = 200
+    RETRY_S = 5.0
+    GAP_S = 0.05                 # a game_rv gap above 50 ms counts as a dropout
+    WARMUP_S = 2.0
+
+    def __init__(self):
+        self.imu, self.error = None, None
+        self.frame = CarFrame.load()
+        self.yaw0 = 0.0
+        self.cal = None              # dynamic calibration enables as read back from the hub
+        self.gaps = {"count": 0, "max_ms": 0.0, "last": None, "prev_t": None, "since": None,
+                     "armed_at": float("inf")}
+        self._run = True
+        threading.Thread(target=self._open, daemon=True).start()
+
+    def _on_sample(self, r):
+        """Every game_rv sample (driver's draining thread): track gaps in the data itself."""
+        g = self.gaps
+        if g["prev_t"] is not None and r.timestamp > g["armed_at"]:
+            dt = r.timestamp - g["prev_t"]
+            if dt > self.GAP_S:
+                g["count"] += 1
+                g["last"] = time.time()
+            g["max_ms"] = max(g["max_ms"], dt * 1000)
+        g["prev_t"] = r.timestamp
+
+    def _open(self):
+        while self._run and self.imu is None:
+            imu = None
+            try:
+                imu = BNO085()
+                imu.enable(*self.SENSORS, rate_hz=self.RATE_HZ)
+                # gyro self-calibration is off at hub boot; the driver re-applies this after resets.
+                # accel learning stays OFF: it needs still poses in several orientations, which a
+                # driving car never gives, and the hub auto-saves what it learns to flash, so it
+                # could overwrite the calibration from tools/imu_cal.py
+                if not imu.set_calibration(accel=False, gyro=True, mag=False):
+                    log.warning("imu: enabling dynamic calibration failed")
+                self.cal = imu.calibration()
+                # fusion outputs come at ~12 Hz for the first ~0.75 s after enabling (hub start-up),
+                # so dropouts are counted from WARMUP_S on; later gaps (hub resets etc.) are real
+                self.gaps["armed_at"] = time.monotonic() + self.WARMUP_S
+                self.gaps["since"] = time.time() + self.WARMUP_S
+                imu.on("game_rv", self._on_sample)
+                self.imu, self.error = imu, None
+                log.info("imu: BNO085 fw %s, %s, rt priority %s", (imu.product or [{}])[0].get("version"),
+                         "levelled %s" % self.frame.level_time if self.frame.level_gravity else "NOT levelled",
+                         imu.rt_priority)
+                self.zero_yaw()
+            except Exception as e:  # noqa: BLE001 - keep the dashboard up, retry
+                self.error = str(e).splitlines()[0][:200]
+                log.warning("imu: %s (retry in %.0f s)", self.error, self.RETRY_S)
+                if imu is not None:
+                    imu.close()
+                time.sleep(self.RETRY_S)
+
+    def sample(self):
+        """Car-frame snapshot, or None while the IMU is down. Angles deg, rates deg/s, accel m/s^2.
+        roll + = right side down, pitch + = nose up, yaw + = turned left; acc = (forward, left, up)
+        without gravity; rate = (roll, pitch, yaw) rate, yaw + = turning left."""
+        imu = self.imu
+        if imu is None:
+            return None
+        r = imu.read("game_rv")
+        if r is None:
+            return None
+        q = r.values[:4]
+        att = self.frame.attitude(q)
+        la = self.frame.to_car(imu.linear_acceleration) or (0.0, 0.0, 0.0)
+        w = self.frame.to_car(imu.gyro) or (0.0, 0.0, 0.0)
+        yaw = (att[2] - self.yaw0 + 180.0) % 360.0 - 180.0
+        return {"roll": round(att[0], 2), "pitch": round(att[1], 2), "yaw": round(yaw, 1),
+                "tilt": round(self.frame.tilt(q), 2),
+                "acc": [round(x, 3) for x in la],
+                "rate": [round(math.degrees(x), 2) for x in w],
+                "age_ms": round((time.monotonic() - r.timestamp) * 1000, 1)}   # how old the attitude is
+
+    def zero_yaw(self):
+        att = self.imu and self.frame.attitude(self.imu.game_quaternion)
+        if att:
+            self.yaw0 = att[2]
+
+    def level(self):
+        """Current pose becomes roll = pitch = 0 (car still, on level ground); saved to config."""
+        if self.imu is None:
+            raise RuntimeError("IMU not running: %s" % self.error)
+        try:
+            g = CarFrame.capture_gravity(self.imu)
+        except HardwareError as e:
+            raise RuntimeError(str(e)) from e
+        frame = CarFrame(self.frame.forward, self.frame.up, path=self.frame.path)
+        frame.set_level(g)
+        frame.save()
+        self.frame = frame
+        self.zero_yaw()
+        log.info("imu: levelled, mount tilt %.2f deg, gravity %s", frame.mount_tilt_deg(), frame.level_gravity)
+        return frame.status()
+
+    def status(self):
+        imu = self.imu
+        if imu is None:
+            return {"up": False, "error": self.error, "frame": self.frame.status()}
+        st = imu.stats()
+        link = st["link"]
+        acc = {}
+        for n in ("game_rv", "accel", "gyro"):
+            r = imu.read(n)
+            acc[n] = r.accuracy if r else None
+        a = imu.acceleration
+        return {"up": imu.available(), "error": imu.last_error, "values": self.sample(),
+                "sensors": {n: {"hz": v["rate_hz"], "lost": v["lost"]} for n, v in st["sensors"].items()},
+                "accuracy": acc, "g": a and round(math.sqrt(sum(x * x for x in a)), 3),
+                "hub_resets": sum(v for k, v in link.items() if k.startswith("resets_") and k != "resets_start"),
+                "worker_restarts": link.get("worker_restarts", 0), "rt": link.get("rt_priority"),
+                "int_p99_us": (link.get("int_latency_us") or {}).get("p99"),
+                "gaps": {"count": self.gaps["count"], "max_ms": round(self.gaps["max_ms"], 1),
+                         "last": self.gaps["last"], "since": self.gaps["since"]},
+                "self_cal": self.cal and [k for k in ("accel", "gyro") if self.cal.get(k)],
+                "fw": (imu.product or [{}])[0].get("version"), "frame": self.frame.status()}
+
+    def close(self):
+        self._run = False
+        if self.imu is not None:
+            self.imu.close()
+
+
 # ---------------------------------------------------------------- telemetry
 class Telemetry:
     """Samples every subsystem at TELEMETRY_HZ into .data (a JSON-able dict)."""
 
-    def __init__(self, drive, camera, control, vision):
-        self.drive, self.camera, self.control, self.vision = drive, camera, control, vision
+    def __init__(self, drive, camera, control, vision, imu):
+        self.drive, self.camera, self.control, self.vision, self.imu = drive, camera, control, vision, imu
         self.power = BoardPower()
         self.battery = BatteryMonitor()
         self.hailo = self._hailo_info()
@@ -496,10 +645,17 @@ class Telemetry:
                     "hailo": self.hailo,
                     "control": self.control.status(),
                     "vision": self.vision.status(),
+                    "imu": self._imu_status(),
                 }
             except Exception as e:  # noqa: BLE001 - keep sampling after a transient failure
                 log.exception("telemetry: %s", e)
             time.sleep(max(0.0, 1.0 / TELEMETRY_HZ - (time.monotonic() - t0)))
+
+    def _imu_status(self):
+        try:
+            return self.imu.status()
+        except Exception as e:  # noqa: BLE001 - an IMU hiccup must not blank the other telemetry
+            return {"up": False, "error": str(e).splitlines()[0][:200], "frame": self.imu.frame.status()}
 
     def health_line(self):
         """Compact health for the tcp link."""
@@ -578,10 +734,15 @@ async def api_mode(request):
 
 async def api_record(request):
     on = (await request.json()).get("on", True)
-    cam = request.app["camera"]
-    path = await asyncio.get_running_loop().run_in_executor(
-        None, cam.start_recording if on else cam.stop_recording)
-    return web.json_response({"recording": on, "file": path and os.path.basename(path)})
+    app = request.app
+    cam = app["camera"]
+    start = lambda: cam.start_recording(imu=app["imu"], drive=app["drive"], control=app["control"])  # noqa: E731
+    try:
+        rid = await asyncio.get_running_loop().run_in_executor(None, start if on else cam.stop_recording)
+    except Exception as e:  # noqa: BLE001 - show it on the page
+        log.exception("record: %s", e)
+        return web.json_response({"error": str(e)}, status=500)
+    return web.json_response({"recording": on, "file": rid})
 
 
 async def api_recordings(request):
@@ -589,11 +750,35 @@ async def api_recordings(request):
 
 
 async def api_recording_delete(request):
+    """Deletes a whole take (folder: video + IMU + metadata) or a legacy loose mp4."""
     name = os.path.basename(request.match_info["name"])
-    path = os.path.join(REC_DIR, name)
-    if os.path.isfile(path):
-        os.remove(path)
-    return web.json_response({"deleted": name})
+    cam = request.app["camera"]
+    if cam.rec and cam.rec.id == name:
+        return web.json_response({"error": "recording in progress"}, status=409)
+    ok = await asyncio.get_running_loop().run_in_executor(None, delete_recording, REC_DIR, name)
+    return web.json_response({"deleted": name if ok else None})
+
+
+async def api_recording_download(request):
+    """One take as an uncompressed tar (<id>.tar: the folder with video, csvs and meta), streamed."""
+    name = os.path.basename(request.match_info["name"])
+    if not os.path.isdir(os.path.join(REC_DIR, name)) or name.startswith("."):
+        raise web.HTTPNotFound()
+    resp = web.StreamResponse(headers={"Content-Type": "application/x-tar",
+                                       "Content-Disposition": 'attachment; filename="%s.tar"' % name})
+    await resp.prepare(request)
+    proc = await asyncio.create_subprocess_exec("tar", "-C", REC_DIR, "-cf", "-", name, stdout=asyncio.subprocess.PIPE)
+    try:
+        while True:
+            chunk = await proc.stdout.read(1 << 20)
+            if not chunk:
+                break
+            await resp.write(chunk)
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+        await proc.wait()
+    return resp
 
 
 async def stream(request):
@@ -624,12 +809,20 @@ async def api_vision(request):
     return web.json_response(vision.configure(**m))
 
 
+async def _read_until_closed(ws):
+    """Push-only sockets must still read: aiohttp handles the heartbeat's pongs inside receive(),
+    and without a reader it drops the connection every heartbeat + heartbeat/2 (7.5 s)."""
+    async for _ in ws:
+        pass
+
+
 async def ws_detections(request):
     """Latest boxes for the page overlay, pushed as soon as they exist (max DET_PUSH_HZ):
     {"seq", "lat_ms", "boxes": [[x1, y1, x2, y2, score, label], ...]}, coords 0..1 of the frame."""
     ws = web.WebSocketResponse(heartbeat=5)
     await ws.prepare(request)
     vision, loop, seen = request.app["vision"], asyncio.get_running_loop(), -1
+    reader = asyncio.ensure_future(_read_until_closed(ws))
     try:
         while not ws.closed:
             t0 = loop.time()
@@ -640,6 +833,44 @@ async def ws_detections(request):
             await asyncio.sleep(max(0.0, 1.0 / DET_PUSH_HZ - (loop.time() - t0)))
     except (ConnectionResetError, asyncio.CancelledError):
         pass
+    finally:
+        reader.cancel()
+    return ws
+
+
+async def api_imu_level(request):
+    """Current pose becomes level (roll = pitch = 0), saved to config/imu.json; 409 if moving."""
+    try:
+        frame = await asyncio.get_running_loop().run_in_executor(None, request.app["imu"].level)
+    except RuntimeError as e:
+        return web.json_response({"error": str(e)}, status=409)
+    return web.json_response({"frame": frame})
+
+
+async def api_imu_zero_yaw(request):
+    request.app["imu"].zero_yaw()
+    return web.json_response({"ok": True})
+
+
+async def ws_imu(request):
+    """Car-frame IMU snapshot (Imu.sample) at IMU_PUSH_HZ for the attitude / g-g display.
+    sample() is a locked read of the driver's latest values (well under 1 ms), so it runs on the
+    event loop: the shared executor is busy with MJPEG / detection waits of up to 1 s each."""
+    ws = web.WebSocketResponse(heartbeat=5)
+    await ws.prepare(request)
+    imu, loop = request.app["imu"], asyncio.get_running_loop()
+    reader = asyncio.ensure_future(_read_until_closed(ws))
+    try:
+        while not ws.closed:
+            t0 = loop.time()
+            s = imu.sample()
+            if s is not None:
+                await ws.send_json(s)
+            await asyncio.sleep(max(0.0, 1.0 / IMU_PUSH_HZ - (loop.time() - t0)))
+    except (ConnectionResetError, asyncio.CancelledError):
+        pass
+    finally:
+        reader.cancel()
     return ws
 
 
@@ -681,22 +912,27 @@ def main():
     camera = CameraStream()
     control = Control(drive)
     vision = Vision(camera)
-    telem = Telemetry(drive, camera, control, vision)
+    imu = Imu()
+    telem = Telemetry(drive, camera, control, vision, imu)
     threading.Thread(target=tcp_server, args=(control, telem), daemon=True).start()
 
     app = web.Application()
-    app.update(drive=drive, camera=camera, control=control, telem=telem, vision=vision)
+    app.update(drive=drive, camera=camera, control=control, telem=telem, vision=vision, imu=imu)
     app.add_routes([
         web.get("/", index),
         web.get("/stream.mjpg", stream),
         web.get("/ws", websocket),
         web.get("/ws/det", ws_detections),
         web.post("/api/vision", api_vision),
+        web.get("/ws/imu", ws_imu),
+        web.post("/api/imu/level", api_imu_level),
+        web.post("/api/imu/zero_yaw", api_imu_zero_yaw),
         web.get("/api/telemetry", api_telemetry),
         web.post("/api/mode", api_mode),
         web.post("/api/record", api_record),
         web.get("/api/recordings", api_recordings),
         web.delete("/api/recordings/{name}", api_recording_delete),
+        web.get("/api/recordings/{name}/download", api_recording_download),
         web.static("/recordings", REC_DIR),
     ])
     try:
@@ -707,6 +943,7 @@ def main():
         control.close()
         telem.close()
         vision.close()
+        imu.close()
         camera.close()
         drive.close()
 
