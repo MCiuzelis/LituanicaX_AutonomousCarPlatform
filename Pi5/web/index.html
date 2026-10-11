@@ -15,7 +15,7 @@
   main { display:grid; grid-template-columns: minmax(0,2fr) minmax(300px,1fr); gap:12px; padding:12px 16px; }
   @media (max-width:900px) { main { grid-template-columns:1fr; } }
   .panel { background:var(--panel); border-radius:8px; padding:12px; }
-  img#cam { width:100%; background:#000; border-radius:6px; display:block; }
+  canvas#cam { width:100%; aspect-ratio:16/9; background:#000; border-radius:6px; display:block; }
   .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:8px 0; }
   select, button, input { background:#2a323c; color:var(--fg); border:1px solid #3a4553; border-radius:6px; padding:5px 10px; font:inherit; }
   button.on { background:#264a7a; border-color:var(--acc); }
@@ -35,13 +35,15 @@
   #reclist button { padding:2px 8px; font-size:12px; }
   video { width:100%; border-radius:6px; background:#000; display:none; margin-top:8px; }
   .camwrap { position:relative; }
-  canvas#ov { position:absolute; left:0; top:0; width:100%; height:100%; pointer-events:none; }
   #hud { position:absolute; left:8px; top:8px; padding:2px 8px; border-radius:4px; background:rgba(0,0,0,.55);
          font:12px/1.5 ui-monospace, monospace; color:#fff; display:none; }
   input[type=range] { padding:0; vertical-align:middle; width:110px; }
   select#vmodel { max-width:220px; }
   canvas#imucv { width:100%; height:150px; display:block; background:#151a20; border-radius:6px; }
   .h2btn { font-size:11px; padding:1px 6px; text-transform:none; letter-spacing:0; }
+  #mappanel { margin-top:12px; }
+  canvas#mapcv { width:100%; height:460px; display:block; background:#151a20; border-radius:6px; touch-action:none; }
+  .lg { display:inline-block; width:10px; height:10px; border-radius:50%; vertical-align:middle; margin:0 3px 0 8px; }
 </style>
 </head>
 <body>
@@ -57,12 +59,13 @@
 <main>
   <section class="panel">
     <div class="camwrap">
-      <img id="cam" src="/stream.mjpg" alt="camera">
-      <canvas id="ov"></canvas>
+      <canvas id="cam"></canvas>
       <div id="hud"></div>
     </div>
     <div class="row">
       <label>Resolution <select id="mode"></select></label>
+      <label title="preview to this page (the detector's own frame, scaled; recordings stay full resolution)">preview
+        <select id="psize"><option value="480">480×270</option><option value="640" selected>640×360</option><option value="960">960×540</option></select></label>
       <span id="camstat" class="keys"></span>
       <button id="recbtn">● record</button><span id="recstat" class="keys"></span>
       <span style="flex:1"></span>
@@ -82,12 +85,32 @@
       <div><div class="keys">throttle</div><div class="big" id="c-t">0 %</div><div class="bar"><i id="b-t" style="width:0"></i></div></div>
       <div><div class="keys">steering</div><div class="big" id="c-s">0</div><div class="bar"><i id="b-s" style="width:50%;margin-left:50%"></i></div></div>
     </div>
+    <div id="mappanel">
+      <h2 style="margin-top:4px">Track map
+        <button id="mapreset" class="h2btn" title="forget all apples and the path (a take always starts a fresh map)">reset map</button>
+        <span id="mapmsg" class="keys"></span></h2>
+      <div class="row">
+        <label>view <select id="mapview"><option value="car">follow car (heading up)</option><option value="world">follow car (world up)</option><option value="fit">whole map</option></select></label>
+        <button id="mapzin" class="h2btn">+</button><button id="mapzout" class="h2btn">−</button>
+        <label><input id="mapov" type="checkbox" checked> on camera</label>
+        <label><input id="mapplan" type="checkbox" checked> autopilot path</label>
+        <span class="keys"><i class="lg" style="background:#4da3ff"></i>left <i class="lg" style="background:#ff8c42"></i>right
+          <i class="lg" style="background:#9aa4b2"></i>side unknown <i class="lg" style="border:1px solid #9aa4b2"></i>tentative
+          <i class="lg" style="background:#3fbf6f;border-radius:0;width:8px;height:2px"></i>centre line
+          <i class="lg" style="background:#d070ff;border-radius:0;width:8px;height:2px"></i>autopilot path (shadow: shown, not driven)
+          <span style="color:#e8e36a">+</span> detections now</span>
+      </div>
+      <canvas id="mapcv"></canvas>
+      <div id="mapstat" class="keys" style="margin-top:4px"></div>
+    </div>
     <p class="keys"><kbd>W</kbd> forward <kbd>S</kbd> brake <kbd>A</kbd>/<kbd>D</kbd> steer <kbd>space</kbd> stop &nbsp;·&nbsp;
-      commands go over WiFi (WebSocket); run <code>car_client.py --host &lt;pi-ip&gt;</code> on the PC for the tcp link.
+      commands go straight to the drive server (its own process, :8082) from a background worker of this page, sent on
+      every key change and 20×/s; run <code>car_client.py --host &lt;pi-ip&gt;</code> on the PC for the tcp link.
       Server caps throttle at <span id="cap">40</span> %; motor stops if no command for 0.4 s.</p>
   </section>
   <aside class="panel">
     <h2>Vision</h2><table id="t-vision"></table>
+    <h2>Track map</h2><table id="t-map"></table>
     <h2>Drive</h2><table id="t-drive"></table>
     <h2>IMU <button id="imulevel" class="h2btn" title="car still on level ground: this pose becomes roll = pitch = 0 (saved)">set level</button>
       <button id="imuyaw" class="h2btn">zero yaw</button> <span id="imustat" class="keys"></span></h2>
@@ -135,9 +158,20 @@ function render(d) {
     ['sd card free', fmt(cam.disk_free_gb,1)+' GB']]);
   const lk = c.links_ms||{};
   const age = k => (lk[k]==null) ? 'never' : (lk[k] < 1000 ? lk[k]+' ms ago' : fmt(lk[k]/1000,0)+' s ago');
-  table('t-links', [['wifi', w.up ? fmt(w.level_dbm,0)+' dBm' : 'down'], ['browser cmd', age('ws')], ['pc client cmd', age('tcp')]]);
+  const cs = ctlStats || {}, gm = c.gap_max_ms || {}, late = c.late || {};
+  const warnIf = (bad, x) => bad ? `<span style="color:var(--warn)">${x}</span>` : x;
+  table('t-links', [['wifi', w.up ? fmt(w.level_dbm,0)+' dBm' : 'down'],
+    ['drive server', c.server_pid ? `pid ${c.server_pid}${c.rt ? ' · realtime' : warnIf(true, ' · no rt priority')}` +
+      (c.server_restarts ? warnIf(true, ` · restarted ${c.server_restarts}×`) : '') : warnIf(true, 'down')],
+    ['this page → car', ctlUp ? (cs.n ? warnIf(cs.max > 150, `rtt ${fmt(cs.p50,0)} ms <span class="keys">p95 ${fmt(cs.p95,0)} · max ${fmt(cs.max,0)} (5 s)</span>`) : 'connected')
+      : warnIf(true, 'not connected')],
+    ['browser cmd', age('ws') + ` <span class="keys">· longest gap ${gm.ws ?? '–'} ms (10 s) · late ${late.ws ?? 0}</span>`],
+    ['pc client cmd', age('tcp') + (lk.tcp != null ? ` <span class="keys">· longest gap ${gm.tcp ?? '–'} ms · late ${late.tcp ?? 0}</span>` : '')],
+    ['dead-man stops', c.deadman ?? '–'],
+    ['video to this page', `${fmt(vidFps,0)} fps · ${vidAge==null ? '–' : fmt(vidAge,0)+' ms'} <span class="keys">sensor→encoded on the car · ${vidKB ? fmt(vidKB,0)+' kB/frame' : ''}</span>`]]);
   renderVision(d.vision||{}, cam);
   renderImu(d.imu||{});
+  renderMapTable(d.trackmap||{}, d.vision||{});
   const rec = cam.recording;
   $('recbtn').textContent = rec ? '■ stop recording' : '● record';
   $('recbtn').classList.toggle('rec', !!rec);
@@ -146,7 +180,8 @@ function render(d) {
     $('recstat').innerHTML = `${rec.id} · ${fmt(rec.seconds,0)} s · ${rec.frames} frames` +
       ` · <span style="color:var(--${warn ? 'warn' : 'ok'})">dropped ${rec.dropped} · ` +
       (rec.imu ? `imu ${rec.imu_samples} samples` + (rec.frames_no_imu ? ` · ${rec.frames_no_imu} frames w/o imu` : '') : 'NO IMU') +
-      (rec.error ? ` · ${rec.error}` : '') + '</span>';
+      (rec.error ? ` · ${rec.error}` : '') + '</span>' +
+      ((d.vision||{}).on ? ' · map ✓' : ' · <span style="color:var(--warn)">detection off: no apples in this take</span>');
   } else if (!recPending) $('recstat').textContent = recMsg;
   pill('p-wifi', w.up ? 'ok':'bad', w.up ? 'wifi '+fmt(w.level_dbm,0)+' dBm' : 'wifi down');
   pill('p-tcp', (lk.tcp!=null && lk.tcp<1000) ? 'ok':'', 'pc client');
@@ -156,7 +191,7 @@ function render(d) {
   $('b-t').style.background = (c.throttle||0) < 0 ? 'var(--bad)' : 'var(--acc)';
   $('c-s').textContent = fmt(c.steer,2);
   const s=(c.steer||0); $('b-s').style.width=Math.abs(s)*50+'%'; $('b-s').style.marginLeft=(s<0?50+s*50:50)+'%';
-  if (cam.mode) $('camstat').textContent = `${cam.mode[0]}×${cam.mode[1]} @ ${fmt(cam.mode[2],0)} fps set · ${fmt(cam.stream_fps,1)} fps streamed`;
+  if (cam.mode) $('camstat').textContent = `${cam.mode[0]}×${cam.mode[1]} @ ${fmt(cam.mode[2],0)} fps set · preview ${fmt(vidFps,0)} fps`;
   if (!modesFilled && cam.modes) {
     modesFilled = true;
     $('mode').innerHTML = cam.modes.map(m => `<option value="${m.join(',')}">${m[0]}×${m[1]} @ ${m[2]} fps</option>`).join('');
@@ -170,29 +205,49 @@ $('mode').onchange = async () => {
   $('camstat').textContent = 'switching…';
   const r = await fetch('/api/mode', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({w,h,fps})});
   if (!r.ok) { $('camstat').textContent = (await r.json()).error; return; }
-  $('cam').src = '/stream.mjpg?' + Date.now();
 };
 
-// ---- vision: boxes overlay (own websocket, up to 30 Hz) + controls
-let det = {boxes: []}, detAt = 0, vis = {};
-function connectDet() {
-  const s = new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws/det');
-  s.onmessage = ev => { det = JSON.parse(ev.data); detAt = performance.now(); requestAnimationFrame(drawOv); };
-  s.onclose = () => setTimeout(connectDet, 1000);
+// ---- camera preview: /ws/video, one message = [u32 header length][header JSON][JPEG]. The header carries
+// the boxes of exactly this frame, so boxes and picture are always in sync. Every frame is acked after
+// it is drawn; the car sends at most 2 unacked frames, always the newest (no queue builds up on WiFi).
+let vidWs = null, vidFps = 0, vidAge = null, vidKB = 0, vidTimes = [], vis = {}, lastHdr = null;
+const wsBase = (location.protocol==='https:'?'wss://':'ws://');
+function connectVideo() {
+  const s = new WebSocket(wsBase + location.host + '/ws/video?w=' + $('psize').value);
+  s.binaryType = 'arraybuffer';
+  s.onmessage = async ev => {
+    const n = new DataView(ev.data).getUint32(0, true);
+    const hdr = JSON.parse(new TextDecoder().decode(new Uint8Array(ev.data, 4, n)));
+    try {
+      const bmp = await createImageBitmap(new Blob([new Uint8Array(ev.data, 4 + n)], {type: 'image/jpeg'}));
+      drawFrame(bmp, hdr); bmp.close();
+    } catch (e) {}
+    if (s.readyState === 1) s.send('a');
+    const now = performance.now(); vidTimes.push(now); while (vidTimes.length && now - vidTimes[0] > 2000) vidTimes.shift();
+    vidFps = vidTimes.length > 1 ? (vidTimes.length - 1) / ((now - vidTimes[0]) / 1000) : 0;
+    vidAge = hdr.age_ms; vidKB = (ev.data.byteLength - 4 - n) / 1024;
+  };
+  s.onclose = () => { if (vidWs === s) setTimeout(connectVideo, 500); };
+  vidWs = s;
 }
-connectDet();
+connectVideo();
+$('psize').onchange = () => { const s = vidWs; vidWs = null; if (s) s.close(); connectVideo(); };
 function scoreColor(sc) { const t = Math.max(0, Math.min(1, (sc - 0.3) / 0.6)); return `hsl(${Math.round(t*120)},90%,55%)`; }
-function drawOv() {
-  const img = $('cam'), cv = $('ov'), dpr = window.devicePixelRatio || 1;
-  const W = img.clientWidth, H = img.clientHeight;
+function drawFrame(bmp, hdr) {
+  const cv = $('cam'), dpr = window.devicePixelRatio || 1;
+  const W = cv.clientWidth, H = cv.clientHeight;
   if (cv.width !== Math.round(W*dpr) || cv.height !== Math.round(H*dpr)) { cv.width = Math.round(W*dpr); cv.height = Math.round(H*dpr); }
   const g = cv.getContext('2d');
-  g.setTransform(dpr,0,0,dpr,0,0); g.clearRect(0,0,W,H);
-  const fresh = vis.on && performance.now() - detAt < 500;
-  $('hud').style.display = vis.on ? 'block' : 'none';
-  if (!fresh || !$('vshow').checked) return;
+  g.setTransform(dpr,0,0,dpr,0,0);
+  g.drawImage(bmp, 0, 0, W, H);
+  lastHdr = hdr;
+  $('hud').style.display = 'block';
+  $('hud').textContent = `video ${fmt(vidFps,0)} fps · ${fmt(hdr.age_ms,0)} ms old` +
+    (hdr.det ? ` · det ${fmt(vis.fps,0)} fps · ${hdr.boxes.length} ${vis.filter === 'apple' || vis.classes === 1 ? 'apples' : 'objects'}` : ' · detection off');
+  if (hdr.det && $('mapov').checked && tmap && tmap.proj) drawMapOnCamera(g, W, H, tmap.proj);
+  if (!hdr.det || !$('vshow').checked) return;
   g.lineWidth = 2; g.font = '12px ui-monospace, monospace'; g.textBaseline = 'bottom';
-  for (const [x1,y1,x2,y2,sc,lab] of det.boxes) {
+  for (const [x1,y1,x2,y2,sc,lab] of hdr.boxes) {
     const c = scoreColor(sc), x = x1*W, y = y1*H, w = (x2-x1)*W, h = (y2-y1)*H;
     g.strokeStyle = c; g.strokeRect(x, y, w, h);
     if ($('vlabels').checked) {
@@ -202,8 +257,6 @@ function drawOv() {
     }
   }
 }
-window.addEventListener('resize', () => requestAnimationFrame(drawOv));
-setInterval(() => requestAnimationFrame(drawOv), 250);   // clears stale boxes when detection stops
 async function setVision(body) {
   const r = await fetch('/api/vision', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
   const j = await r.json(); if (!r.ok) $('vstat').textContent = j.error;
@@ -253,7 +306,7 @@ function renderVision(v, cam) {
     ['detector input', v.lores ? `${v.lores[0]}×${v.lores[1]} ← sensor ${cam.sensor||'?'}${wide ? ' <span style="color:var(--warn)">(wider FoV than training)</span>' : ''}` : '–'],
     ['frames processed', v.frames ?? '–'],
   ]);
-  $('hud').textContent = v.on ? `${fmt(v.fps,0)} fps · ${fmt(L.p50,0)} ms · ${b.now??0} ${apples ? 'apples' : 'objects'}` : '';
+
 }
 
 // ---- IMU: attitude indicator + g-g plot (own websocket, 25 Hz) and status table
@@ -346,6 +399,144 @@ async function imuPost(path, busy) {
 $('imulevel').onclick = () => imuPost('/api/imu/level', 'hold still…');
 $('imuyaw').onclick = () => imuPost('/api/imu/zero_yaw', '');
 
+// ---- track map (own websocket, 10 Hz): apples of the last few seconds (rolling window) + boundaries +
+// the autopilot's suggestion (vision/map_worker.py; shadow mode: shown, never driven)
+const SIDE_COL = {'1': '#4da3ff', '-1': '#ff8c42', '0': '#9aa4b2'};
+let tmap = null, tmapAt = 0, trail = [], trailMap = null, mapZoom = 1.0;
+function connectMap() {
+  const s = new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws/map');
+  s.onmessage = ev => {
+    const m = JSON.parse(ev.data);
+    if (m.map_id !== trailMap) { trail = []; trailMap = m.map_id; }
+    trail = m.trail || [];
+    tmap = m; tmapAt = performance.now(); requestAnimationFrame(drawMap);
+  };
+  s.onclose = () => { tmap = null; setTimeout(connectMap, 1000); };
+}
+connectMap();
+function drawMapOnCamera(g, W, H, pr) {
+  g.lineWidth = 3;
+  for (const [k, side] of [['left', '1'], ['right', '-1']]) {
+    const pl = pr[k] || []; if (pl.length < 2) continue;
+    g.strokeStyle = SIDE_COL[side]; g.globalAlpha = 0.8; g.beginPath();
+    pl.forEach(([x, y], i) => i ? g.lineTo(x*W, y*H) : g.moveTo(x*W, y*H)); g.stroke();
+  }
+  g.globalAlpha = 1;
+  for (const [x, y, id, side] of (pr.lms || [])) {
+    g.fillStyle = SIDE_COL[String(side)]; g.beginPath(); g.arc(x*W, y*H, 4, 0, 2*Math.PI); g.fill();
+    g.strokeStyle = '#000'; g.lineWidth = 1; g.stroke();
+  }
+}
+function drawMap() {
+  const cv = $('mapcv'), dpr = window.devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
+  if (cv.width !== Math.round(W*dpr) || cv.height !== Math.round(H*dpr)) { cv.width = Math.round(W*dpr); cv.height = Math.round(H*dpr); }
+  const g = cv.getContext('2d'); g.setTransform(dpr,0,0,dpr,0,0); g.clearRect(0,0,W,H);
+  g.font = '11px ui-monospace, monospace'; g.textBaseline = 'top';
+  const m = tmap;
+  if (!m || !m.up) { g.fillStyle = '#8a94a3'; g.fillText(m ? 'no odometry yet (IMU / encoder)' : 'map link lost', 8, 8); return; }
+  const stale = performance.now() - tmapAt > 600;
+  const [px, py, pyaw] = m.pose, view = $('mapview').value;
+  // world (x fwd at reset, y left, mm) -> screen. car view: heading up, car at 75 % height
+  let sc, cx, cy, rot, ox = W/2, oy = H/2;
+  if (view === 'fit') {
+    const pts = trail.concat(m.lms.map(l => [l[1], l[2]]));
+    let x0 = px, x1 = px, y0 = py, y1 = py;
+    for (const [x, y] of pts) { x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y); }
+    sc = Math.min((H - 20) / (x1 - x0 + 600), (W - 20) / (y1 - y0 + 600)) * mapZoom; cx = (x0 + x1) / 2; cy = (y0 + y1) / 2; rot = 0;
+  } else {
+    sc = H / 5000 * mapZoom; cx = px; cy = py; rot = view === 'car' ? pyaw * Math.PI / 180 : 0;
+    if (view === 'car') oy = H * 0.72;
+  }
+  const cr = Math.cos(rot), sr = Math.sin(rot);
+  const S = (x, y) => { const dx = x - cx, dy = y - cy, a = dx*cr + dy*sr, b = -dx*sr + dy*cr; return [ox - b*sc, oy - a*sc]; };
+  // grid 0.5 m
+  g.strokeStyle = '#222a33'; g.lineWidth = 1;
+  const span = Math.max(W, H) / sc, gs = span > 12000 ? 1000 : 500;
+  const gx0 = Math.floor((cx - span) / gs) * gs, gy0 = Math.floor((cy - span) / gs) * gs;
+  g.beginPath();
+  for (let x = gx0; x <= cx + span; x += gs) { const [a1, b1] = S(x, cy - span), [a2, b2] = S(x, cy + span); g.moveTo(a1, b1); g.lineTo(a2, b2); }
+  for (let y = gy0; y <= cy + span; y += gs) { const [a1, b1] = S(cx - span, y), [a2, b2] = S(cx + span, y); g.moveTo(a1, b1); g.lineTo(a2, b2); }
+  g.stroke();
+  // path
+  if (trail.length > 1) {
+    g.strokeStyle = 'rgba(230,233,238,.45)'; g.lineWidth = 1.2; g.beginPath();
+    trail.forEach(([x, y], i) => { const [a, b] = S(x, y); i ? g.lineTo(a, b) : g.moveTo(a, b); }); g.stroke();
+  }
+  // boundaries + centre line
+  const poly = (pl, col, w, dash) => { if (pl.length < 2) return; g.strokeStyle = col; g.lineWidth = w; g.setLineDash(dash || []);
+    g.beginPath(); pl.forEach(([x, y], i) => { const [a, b] = S(x, y); i ? g.lineTo(a, b) : g.moveTo(a, b); }); g.stroke(); g.setLineDash([]); };
+  poly(m.left, SIDE_COL['1'], 3); poly(m.right, SIDE_COL['-1'], 3); poly(m.center, '#3fbf6f', 2, [6, 5]);
+  const pl = m.plan;
+  if (pl && $('mapplan').checked) {
+    poly(pl.path || [], '#d070ff', 3);
+    for (const [k, col] of [['left', SIDE_COL['1']], ['right', SIDE_COL['-1']]])
+      for (const [x, y] of pl[k] || []) { const [a, b] = S(x, y); g.strokeStyle = col; g.lineWidth = 2; g.strokeRect(a - 7, b - 7, 14, 14); }
+  }
+  // apples: [id, x, y, state 0 tentative / 1 confirmed, side, sigma, hits]
+  const r = Math.max(3, 40 * sc);
+  for (const [id, x, y, st, side, sig] of m.lms) {
+    const [a, b] = S(x, y), col = SIDE_COL[String(side)];
+    g.globalAlpha = 1;
+    g.beginPath(); g.arc(a, b, st === 0 ? r * 0.7 : r, 0, 2*Math.PI);
+    if (st === 0) { g.strokeStyle = col; g.lineWidth = 1; g.stroke(); } else { g.fillStyle = col; g.fill(); }
+    if (st === 1 && sig * sc > r * 1.5) { g.strokeStyle = col; g.globalAlpha = 0.25; g.beginPath(); g.arc(a, b, sig * sc, 0, 2*Math.PI); g.stroke(); }
+  }
+  g.globalAlpha = 1;
+  // detections of the last frame
+  g.strokeStyle = '#e8e36a'; g.lineWidth = 1.5;
+  for (const [x, y, ok] of m.det) { const [a, b] = S(x, y); g.globalAlpha = ok ? 1 : 0.5; g.beginPath();
+    g.moveTo(a - 4, b); g.lineTo(a + 4, b); g.moveTo(a, b - 4); g.lineTo(a, b + 4); g.stroke(); }
+  g.globalAlpha = 1;
+  // car: camera floor point + body behind it, camera field of view
+  const yaw = pyaw * Math.PI / 180, c = Math.cos(yaw), s = Math.sin(yaw);
+  const body = [[0, 60], [0, -60], [-280, -90], [-280, 90]].map(([f, l]) => S(px + f*c - l*s, py + f*s + l*c));
+  g.fillStyle = stale ? '#e0524d' : '#e8b33c'; g.beginPath(); body.forEach(([a, b], i) => i ? g.lineTo(a, b) : g.moveTo(a, b)); g.fill();
+  g.strokeStyle = 'rgba(232,179,60,.35)'; g.lineWidth = 1;
+  for (const k of [-1, 1]) { const ang = yaw + k * 0.84; const [a1, b1] = S(px, py), [a2, b2] = S(px + 3000*Math.cos(ang), py + 3000*Math.sin(ang));
+    g.beginPath(); g.moveTo(a1, b1); g.lineTo(a2, b2); g.stroke(); }
+  // scale bar
+  g.fillStyle = '#8a94a3'; g.strokeStyle = '#8a94a3'; g.lineWidth = 2;
+  g.beginPath(); g.moveTo(10, H - 12); g.lineTo(10 + 1000*sc, H - 12); g.stroke(); g.fillText('1 m', 14 + 1000*sc, H - 18);
+  if (stale) { g.fillStyle = '#e0524d'; g.fillText('map stale', 8, 8); }
+}
+window.addEventListener('resize', () => requestAnimationFrame(drawMap));
+$('mapview').onchange = () => requestAnimationFrame(drawMap);
+$('mapplan').onchange = () => requestAnimationFrame(drawMap);
+$('mapzin').onclick = () => { mapZoom = Math.min(8, mapZoom * 1.4); requestAnimationFrame(drawMap); };
+$('mapzout').onclick = () => { mapZoom = Math.max(0.15, mapZoom / 1.4); requestAnimationFrame(drawMap); };
+$('mapcv').addEventListener('wheel', e => { e.preventDefault(); mapZoom = Math.min(8, Math.max(0.15, mapZoom * (e.deltaY < 0 ? 1.15 : 1/1.15))); requestAnimationFrame(drawMap); }, {passive: false});
+$('mapreset').onclick = async () => {
+  const r = await fetch('/api/map', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({reset: true})});
+  $('mapmsg').textContent = r.ok ? 'reset' : (await r.json()).error; setTimeout(() => $('mapmsg').textContent = '', 3000);
+};
+function renderMapTable(t, v) {
+  const s = t.stats || {}, m = tmap || {};
+  const n = st => (m.lms || []).filter(l => l[3] === st).length;
+  const sides = side => (m.lms || []).filter(l => l[3] === 1 && l[4] === side).length;
+  const warn = (c, x) => c ? x : `<span style="color:var(--warn)">${x}</span>`;
+  table('t-map', [
+    ['state', t.error ? `<span style="color:var(--bad)">${t.error}</span>` : !t.up ? warn(false, 'waiting for IMU / encoder')
+      : v.on ? '<span style="color:var(--ok)">mapping</span>' : warn(false, 'detection off: odometry only')],
+    ['apples', `${n(1)} confirmed <span class="keys">(L ${sides(1)} · R ${sides(-1)}) · ${n(0)} tentative · window ${t.window_s ?? '–'} s</span>`],
+    ['track width', t.width_mm ? fmt(t.width_mm / 1000, 2) + ' m' : '–'],
+    ['match residual', s.resid_mm == null ? '–' : fmt(s.resid_mm, 0) + ' mm <span class="keys">(median, after correction)</span>'],
+    ['pose σ / pitch bias', `${t.sigma_xy ?? '–'} mm · ${fmt(t.pitch_bias, 2)}°`],
+    ['path correction', m.corr ? `${fmt(m.corr[0]/1000, 2)}, ${fmt(m.corr[1]/1000, 2)} m · ${fmt(m.corr[2], 1)}°` : '–'],
+    ['camera (suspension)', t.cam ? `h ${fmt(t.cam.h, 0)} mm · Δpitch ${fmt(t.cam.d_pitch, 2)}° · Δroll ${fmt(t.cam.d_roll, 2)}°` : '–'],
+    ['frames', `${s.frames ?? 0} · ${s.corrected ?? 0} corrected · dropped apples ${s.dropped ?? 0}`],
+    ['odometry', `${fmt(t.mm_per_turn, 2)} mm/turn <span class="keys">${(t.odo_source || '').startsWith('default') ? '(default guess)' : ''}</span>`],
+    ['suspension cal', (t.susp_source || '').startsWith('default') ? warn(false, 'not calibrated') : 'calibrated'],
+    ['autopilot (shadow)', (() => { const p = (m.plan || {}); if (!p.mode) return '–';
+      if (p.mode === 'lost') return warn(false, 'no path');
+      const st = p.steer == null ? '–' : (p.steer < -0.05 ? 'left ' : p.steer > 0.05 ? 'right ' : 'straight ') + fmt(Math.abs(p.steer), 2);
+      return `${st} · ${fmt(p.speed_mm_s / 1000, 1)} m/s <span class="keys">(${p.mode}, path known ${fmt(p.known_mm / 1000, 1)} m)</span>`; })()],
+    ['map worker', t.loop_ms ? `${fmt(t.loop_ms.p50, 1)} ms/frame <span class="keys">max ${fmt(t.loop_ms.max, 0)} · tick ${fmt(t.tick_ms, 1)} ms · backlog ${t.backlog ?? '–'}` +
+      `${t.worker_restarts ? ' · restarted ' + t.worker_restarts + '×' : ''}</span>` : '–'],
+  ]);
+  $('mapstat').textContent = m.up ? `pose ${fmt(m.pose[0]/1000, 2)}, ${fmt(m.pose[1]/1000, 2)} m · heading ${fmt(m.pose[2], 0)}° · ` +
+    `odometry only ${fmt(m.odo[0]/1000, 2)}, ${fmt(m.odo[1]/1000, 2)} m · path ${trail.length} pts` : '';
+}
+
 // ---- recording
 // one take = folder recordings/<id>/: <id>.mp4, <id>_frames.csv (IMU + odometry per video frame),
 // <id>_imu.csv (every IMU sample), <id>_drive.csv, <id>_meta.json (camera, crop, intrinsics, mounts)
@@ -388,25 +579,57 @@ $('reclist').onclick = async e => {
 $('recrefresh').onclick = loadRecordings;
 loadRecordings();
 
-// ---- keyboard driving (WiFi/WebSocket only)
-const keys = new Set(); let driving = false, timer = null;
+// ---- keyboard driving: a Web Worker owns the command WebSocket to the drive server (:8082, its own process
+// on the car). The worker sends on every key change and 20x/s, so drawing / decoding on this page can never
+// hold a command back; it measures the round trip of every command (the server acks at once).
+const CTL_WORKER = `
+let ws = null, url = '', cmd = {t: 0, s: 0}, on = false, n = 0, sent = new Map(), rtts = [];
+function connect() {
+  ws = new WebSocket(url);
+  ws.onopen = () => postMessage({up: true});
+  ws.onclose = () => { postMessage({up: false}); setTimeout(connect, 300); };
+  ws.onmessage = e => { const m = JSON.parse(e.data);
+    if (m.a !== undefined) { const t0 = sent.get(m.a); if (t0 !== undefined) { rtts.push([performance.now(), performance.now() - t0]); sent.delete(m.a); } }
+    else if (m.h) postMessage({health: m}); };
+}
+function send() {
+  if (!on || !ws || ws.readyState !== 1) return;
+  n += 1; sent.set(n, performance.now()); ws.send(JSON.stringify({t: cmd.t, s: cmd.s, n}));
+  if (sent.size > 200) sent.delete(sent.keys().next().value);
+}
+onmessage = e => { const m = e.data;
+  if (m.url) { url = m.url; connect(); }
+  if (m.on !== undefined) { on = m.on; if (!on) { cmd = {t: 0, s: 0}; if (ws && ws.readyState === 1) ws.send(JSON.stringify({t: 0, s: 0})); } }
+  if (m.cmd) { const changed = m.cmd.t !== cmd.t || m.cmd.s !== cmd.s; cmd = m.cmd; if (changed) send(); } };
+setInterval(send, 50);
+setInterval(() => { const now = performance.now(); rtts = rtts.filter(r => now - r[0] < 5000);
+  const v = rtts.map(r => r[1]).sort((a, b) => a - b), q = p => v[Math.min(v.length - 1, Math.floor(v.length * p))];
+  let lost = 0; for (const t0 of sent.values()) if (now - t0 > 1000) lost++;
+  postMessage({stats: {n: v.length, p50: q(0.5), p95: q(0.95), max: v[v.length - 1], lost}}); }, 500);
+`;
+let ctlUp = false, ctlStats = null;
+const ctl = new Worker(URL.createObjectURL(new Blob([CTL_WORKER], {type: 'text/javascript'})));
+ctl.onmessage = e => { const m = e.data; if (m.up !== undefined) ctlUp = m.up; if (m.stats) ctlStats = m.stats; };
+ctl.postMessage({url: wsBase + location.hostname + ':8082/ws/ctl'});
+const keys = new Set(); let driving = false;
 $('drivebtn').onclick = () => {
   driving = !driving; $('drivebtn').classList.toggle('on', driving);
   $('drivebtn').textContent = driving ? 'keyboard driving ON (click to stop)' : 'enable keyboard driving';
-  if (driving) timer = setInterval(send, 50); else { clearInterval(timer); keys.clear(); send(); }
+  keys.clear(); ctl.postMessage({on: driving}); update();
 };
-function send() {
+function update() {
   let t = 0, s = 0;
   if (keys.has('w')) t = Number($('lvl').value)/100;
   if (keys.has('s')) t = -1;
   if (keys.has('a')) s -= 1; if (keys.has('d')) s += 1;
   if (keys.has(' ')) { t = 0; s = 0; }
-  if (ws && ws.readyState === 1) ws.send(JSON.stringify({t, s}));
+  ctl.postMessage({cmd: {t, s}});
 }
-
-window.addEventListener('keydown', e => { if (!driving || e.target.tagName==='INPUT') return; keys.add(e.key.toLowerCase()); if (e.key===' ') e.preventDefault(); });
-window.addEventListener('keyup', e => keys.delete(e.key.toLowerCase()));
-window.addEventListener('blur', () => keys.clear());
+window.addEventListener('keydown', e => { if (!driving || e.target.tagName==='INPUT' || e.repeat) return;
+  keys.add(e.key.toLowerCase()); if (e.key===' ') e.preventDefault(); update(); });
+window.addEventListener('keyup', e => { if (keys.delete(e.key.toLowerCase())) update(); });
+window.addEventListener('blur', () => { keys.clear(); update(); });
+$('lvl').addEventListener('change', update);
 </script>
 </body>
 </html>

@@ -1,0 +1,105 @@
+{
+ "calibrated": "2026-10-04T15:51:11",
+ "source": "results/camera_cal/20261004_cal",
+ "camera": "IMX708 (wide lens), sensor 4608x2592; LensPosition 1.0 dioptre (manual focus, libcamera default)",
+ "intrinsics": {
+  "fx": 2092.508,
+  "fy": 2092.508,
+  "cx": 2304.0,
+  "cy": 1296.0,
+  "dist": [
+   -0.215129,
+   0.037814,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "units": "full-sensor pixels; per stream: CameraModel.K(ScalerCrop, size)",
+  "model": "OpenCV pinhole, dist = k1, k2, p1, p2, k3"
+ },
+ "extrinsics": {
+  "height_mm": 186.1,
+  "pitch_deg": 2.07,
+  "roll_deg": 0.041,
+  "frame": "origin on the floor under the camera, X forward, Y left, Z up; pitch + = down, roll + = left side down"
+ },
+ "quality": {
+  "board_rms_px": 1.465,
+  "line_rms_px": 0.814,
+  "boards": 4,
+  "corners": 192,
+  "lines": {
+   "door_gap_right": 61,
+   "door_jamb_left": 85,
+   "nightstand_right": 42,
+   "floor_seam_center": 58,
+   "skirting_right": 11
+  },
+  "sd": {
+   "f_px": 4.33,
+   "height_mm": 0.31,
+   "pitch_deg": 0.022
+  },
+  "covered_radius_px": 1782.0,
+  "covered_note": "distortion is measured out to this radius from the centre; the 1536x864 crop modes (1280x720, 640x360) lie inside it, full-FOV corners are extrapolated",
+  "checks": {
+   "bin2304": {
+    "boards": 4,
+    "rms_px": 0.713,
+    "crop": [
+     0,
+     0,
+     4608,
+     2592
+    ],
+    "size": [
+     2304,
+     1296
+    ]
+   },
+   "def1280": {
+    "boards": 4,
+    "rms_px": 0.704,
+    "crop": [
+     768,
+     432,
+     3072,
+     1728
+    ],
+    "size": [
+     1280,
+     720
+    ]
+   }
+  }
+ },
+ "target": {
+  "pattern": [
+   8,
+   6
+  ],
+  "square_mm": 30.0,
+  "boards": [
+   [
+    613.8,
+    -115.1,
+    -5.11
+   ],
+   [
+    479.7,
+    134.5,
+    176.58
+   ],
+   [
+    828.0,
+    125.8,
+    175.85
+   ],
+   [
+    965.7,
+    -173.0,
+    -5.26
+   ]
+  ]
+ }
+}

@@ -73,3 +73,6 @@ YoloTraining/runs/old_*/
 YoloTraining/runs/*/weights/*
 !YoloTraining/runs/apple_yolov8s_r2/weights/best.pt
 YoloTraining/runs/*.mp4
+
+# hailortcli drops its log in the cwd
+hailort.log

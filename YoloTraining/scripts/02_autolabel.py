@@ -45,7 +45,7 @@ def main():
     model = AutoModelForZeroShotObjectDetection.from_pretrained(args.model).to(dev).eval()
 
     args.labels.mkdir(parents=True, exist_ok=True)
-    prev_dir = ROOT / "data/preview"
+    prev_dir = args.labels.parent / args.labels.name.replace("labels", "preview")   # data/labels -> data/preview
     if args.preview:
         prev_dir.mkdir(parents=True, exist_ok=True)
 

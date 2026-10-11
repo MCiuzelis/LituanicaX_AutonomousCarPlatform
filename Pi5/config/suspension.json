@@ -1,0 +1,29 @@
+{
+ "h_per_pitch_mm_deg": 3.437,
+ "h_per_roll_mm_deg": -0.305,
+ "h_per_abs_roll_mm_deg": -1.35,
+ "pitch_gain": 1.0925,
+ "pitch_per_roll": 0.0481,
+ "roll_gain": 1.0539,
+ "source": "tools/suspension_cal.py fit results/suspension_cal/20261011_080454 (2026-10-11T08:09:00)",
+ "rest": {
+  "h_mm": 191.1,
+  "cam_pitch_deg": 11.392,
+  "cam_roll_deg": -0.192,
+  "imu_roll_deg": -0.034,
+  "imu_pitch_deg": 0.944
+ },
+ "quality": {
+  "samples": 94,
+  "pitch_span_deg": 9.53,
+  "roll_span_deg": 20.77,
+  "pitch_rms_deg": 0.233,
+  "roll_rms_deg": 0.086,
+  "h_rms_mm": 1.77,
+  "h_max_mm": 12.2,
+  "pitch_max_deg": 0.67,
+  "nose_up_max_deg": 0.56,
+  "board_rms_px": 0.27
+ },
+ "model": "camera pitch = rest - pitch_gain * d_pitch - pitch_per_roll * d_roll; camera roll = rest - roll_gain * d_roll; height = rest + h_per_pitch * d_pitch + h_per_abs_roll * |d_roll| + h_per_roll * d_roll; d_* = car pitch (nose up +) / roll (right side down +) change from the rest pose, deg"
+}

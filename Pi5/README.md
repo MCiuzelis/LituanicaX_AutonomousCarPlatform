@@ -5,7 +5,9 @@ dashboard / remote-control server, calibration tools and hardware tests.
 
 ```
 Pi5/
-  dashboard.py        web dashboard + control server  (http://rp5:8080, tcp :8081)
+  dashboard.py        web dashboard (http://rp5:8080): camera preview, detection, recording, map, telemetry
+  drive_server.py     throttle / steering / motor encoder + the command links (ws :8082, tcp :8081); its own
+                      process, started by dashboard.py (see "Dashboard")
   recorder.py         training-data recordings: video + per-frame IMU / odometry (see "Recordings")
   web/index.html      the dashboard page
   car_client.py       PC-side keyboard client for the tcp link (stdlib only, copy to the PC)
@@ -14,7 +16,7 @@ Pi5/
   tests/              hardware self-test, PWM sweep, CPU/Hailo stress + soak tests
   scripts/            boot / setup / diagnostics shell scripts
   config/             steering.json (tools/steering_cal.py), imu.json, camera.json (tools/camera_cal.py)
-  vision/             Hailo-8 object detection (see "Vision")
+  vision/             Hailo-8 object detection (see "Vision"), track map + planner (see "Track map", "Autonomy")
   results/            test outputs      recordings/  one folder per take      logs/  dashboard.log
   models/             *.hef detectors (built on the PC, not in git)
 ```
@@ -29,7 +31,8 @@ Changes made on the Pi: commit there, then `git pull rp5 main` on the PC and pus
 ## Safety
 
 * The motor can drive the car away. Nothing in this tree applies throttle without an explicit
-  request: the dashboard caps it at 40 % and stops the motor after 400 ms without a command,
+  request: the drive server caps it at 40 % and stops the motor after 400 ms without a command
+  (and when the dashboard that started it dies),
   `tools/drive_test.py` asks for a typed `yes`, and the tests only touch the steering servo.
 * **GPIO13 is the ESC throttle.** `esc-neutral.service` puts it at 1500 µs at boot and
   `hardware/esc.py` never removes that signal. Do not open GPIO13 as a plain `Servo`
@@ -44,20 +47,44 @@ Changes made on the Pi: commit there, then `git pull rp5 main` on the PC and pus
 scripts/dashboard_restart.sh          # (re)start detached, log in logs/dashboard.log
 python3 dashboard.py                  # or in the foreground
 ```
-Open `http://rp5:8080`: MJPEG camera with resolution switching (640x360 .. 1536x864 at up to
-120 fps, 1920x1080 / 2304x1296 at 56 fps; the preview to the page is capped at 30 fps), training-data
-recording (see "Recordings": playable / downloadable / deletable from the page), telemetry (drive,
-IMU, battery, board power, CPU, WiFi, Hailo, links) and keyboard driving (W/S/A/D/space) over a WebSocket.
+Open `http://rp5:8080`: camera preview (camera starts at 1536x864 @ 120 fps; resolution switching 640x360 .. 1536x864 at up to
+120 fps, 1920x1080 / 2304x1296 at 56 fps), training-data recording (see "Recordings": playable /
+downloadable / deletable from the page), telemetry (drive, IMU, battery, board power, CPU, WiFi, Hailo,
+links) and keyboard driving (W/S/A/D/space).
 
-`car_client.py --host <pi-ip>` on a PC drives over the tcp link (:8081) and shows the health
-line. Both links use one JSON object per line: `{"t": -1..1, "s": -1..1}` in (throttle, negative
-= brake; steering), health `{"h":1,"v":batt,"temp":..,"rps":..,"us":..,"st":..,"act":..,"lk":..,"stop":..}`
-out at 5 Hz. The freshest command from any link wins.
+**Three processes** (2026-10-11; before, everything shared one Python process and one GIL: with the
+track map in it the detector fell to 20-40 fps and keyboard commands stalled for up to ~0.5 s):
+
+| process | does | why separate |
+|---|---|---|
+| `dashboard.py` | camera, Hailo detection, preview, recording, telemetry, web page | |
+| `drive_server.py` (started by the dashboard) | ESC + steering + motor encoder (500 Hz), the command links, dead-man; network thread SCHED_FIFO | commands must never wait for anything else |
+| `vision/map_worker.py` (started by the dashboard) | track map + planner (shadow) | ~2.5-5 ms of Python per detection frame |
+
+**Driving**: the page's commands go from a Web Worker (unaffected by drawing on the page) straight to
+`ws://<pi>:8082/ws/ctl`: `{"t": -1..1, "s": -1..1, "n": seq}` on every key change and 20x/s; the server
+acks each one at once (`{"a": seq}`), and the Links panel shows the round trip (p50 / p95 / max) and,
+from the server's side, the longest gap between commands and how many arrived > 150 ms late.
+`car_client.py --host <pi-ip>` on a PC uses the tcp link (:8081, unchanged): `{"t","s"}` lines in, health
+`{"h":1,"v":batt,"temp":..,"rps":..,"us":..,"st":..,"act":..,"lk":..,"stop":..}` out at 5 Hz (also sent
+on the WebSocket). The freshest command wins; an `"auto"` command (autonomy, unix socket
+`/tmp/rc_drive.sock` from the dashboard) is ignored while a human link sent one in the last 0.5 s.
+State for the dashboard / recorder: shared memory `rc_drive_state` (`drive_server.DriveState`).
+If the drive server dies the dashboard restarts it; if the dashboard dies the drive server stops the car and exits.
+
+**Preview**: `/ws/video?w=480|640|960` sends the detector's own frame (960x540 lores, scaled) as JPEG
+together with the boxes found in that frame, so boxes and video are always in sync. The page acks every
+frame and the server keeps at most 2 unacked, always the newest: on a weak link the frame rate drops,
+the delay does not grow. 640x360 ~11-25 kB/frame at 30 fps; frame age on the car ~15 ms (detection
+off) / ~40 ms (on: includes the Hailo). `/stream.mjpg?w=..` serves the same frames without boxes.
+
+Measured 2026-10-11 (desk, -51 dBm): commands round trip 3-4 ms p50, max 6-21 ms, 0 lost, 0 late,
+including 60 s with detection 120 fps + recording + 960-wide preview + CPU at 93 %.
 
 HTTP API: `GET /api/telemetry`, `POST /api/mode {"w","h","fps"}` (409 while recording),
 `POST /api/record {"on":bool}`, `GET /api/recordings`, `DELETE /api/recordings/<id>` (the whole take),
 `GET /api/recordings/<id>/download` (take as .tar), `GET /recordings/<id>/<id>.mp4` (range requests),
-`GET /stream.mjpg`, `GET /ws`,
+`GET /stream.mjpg`, `GET /ws/video`, `GET /ws` (telemetry),
 `POST /api/vision {"on","hef","conf","filter"}`, `GET /ws/det` (detection boxes, see "Vision"),
 `GET /ws/imu` (car-frame attitude / accel / rates at 25 Hz), `POST /api/imu/level` (409 if the car
 moves), `POST /api/imu/zero_yaw`. Telemetry `imu`: values, per-sensor Hz / lost, accuracy, resets.
@@ -98,8 +125,10 @@ no magnetometer). All timestamps are CLOCK_MONOTONIC ns; frame time = SensorTime
 readout/2 (rolling shutter, middle row).
 
 Frame rate: the camera runs at the selected mode (e.g. 120 fps for detection); the recording takes
-every Nth frame, at most 60 fps up to 1536x864 and 30 fps above (`REC_FPS_SMALL/LARGE` in
-dashboard.py; the Pi 5 has no H.264 hardware). Measured 2026-10-10, 60 s takes: 1280x720@60,
+every Nth frame, at most 30 fps (`REC_FPS_SMALL/LARGE` in dashboard.py; the Pi 5 has no H.264
+hardware: x264 at 1536x864@60 took ~1.9 cores and pulled detection down to ~70 fps; at 30 fps
+detection keeps 120 fps while recording, CPU ~60 %, measured 2026-10-11). Takes before 2026-10-11 are
+60 fps. Measured 2026-10-10 (then at 60 fps), 60 s takes: 1280x720@60,
 1536x864 (120 -> 60), 1280x720 (120 -> 60) with detection on, 2304x1296 (56 -> 28): 0 dropped frames,
 0 frames without IMU, CPU 35-58 %, video ~1.3-2.1 MB/s. The mp4 is muxed on its own thread: the SD
 card stalls writes for up to ~8 s (ext4 commits) and writing from the camera thread dropped frames.
@@ -125,7 +154,7 @@ Apple detector for the track (trained in `YoloTraining/` on the PC). Needs `pyth
   `python3 vision/apple_detector.py --save 3`.
 * Dashboard: **▶ detection** under the video; model = any `models/*.hef` or the stock COCO
   yolov8s (`/usr/share/hailo-models/yolov8s_h8.hef`, "apple only" = COCO class 47). Boxes are
-  drawn over the MJPEG in the browser (not burned into recordings). The Vision panel shows
+  drawn by the browser on the preview frame they belong to (not burned into recordings). The Vision panel shows
   detection vs camera fps, dropped frames, delay from sensor timestamp to boxes (readout+ISP /
   Hailo / decode) and Hailo chip temperature. Use 1280x720 modes: that is the sensor mode
   (1536x864) the model was trained on.
@@ -136,6 +165,115 @@ CPU ~27 %. Only one process can own the Hailo: turn detection off before running
 
 WiFi only (the Pi 5 antenna sits under the Hailo HAT, so Bluetooth was dropped). Ethernet is
 for updates. NetworkManager keyfiles: wlan0 = 192.168.88.126, eth0 = 192.168.88.129.
+
+## Track map (apples from many frames -> track boundaries)
+
+`vision/track_map.py` (numpy; `TrackMapper`) keeps a **rolling** map of the apples around the car and
+chains them into a left and a right track boundary. Nothing is remembered from earlier laps: an apple
+not seen for `window_s` (4 s) or more than `window_behind_mm` (1 m) behind the camera is forgotten, and
+the path shown is the last `trail_s` (10 s). So the car works on any track from the first metre, and
+the map cannot fill up with drifted copies of earlier laps (lap-to-lap drift was 0.3-0.5 m). Live it
+runs in its own process (`vision/map_worker.py`, `dashboard.MapProcess`: fed every game_rv sample, the
+encoder at 100 Hz and every detection frame in 10 ms batches; ~25-45 apples in the window);
+`tools/replay_map.py` runs the identical code over a recorded take.
+
+* **Odometry**: rear-axle dead reckoning, encoder distance (`config/odometry.json` `mm_per_turn`;
+  |turns|, the ESC cannot reverse) along the IMU heading, pose history of the last 10 s. The encoder
+  is on the motor shaft (gearbox + open differential to the wheels): an unloaded inner wheel spinning
+  in a corner and gear lash on throttle <-> brake both reach it, so the filter trusts it less than a
+  wheel encoder (`odo_scale_sigma` 10 %, `odo_lat_sigma` 5 %) and leans on the apples.
+* **Late detections**: boxes arrive ~30 ms after the exposure (`Vision` passes each frame's exposure
+  middle `t_mid` + ScalerCrop). Each frame is placed with the pose **and camera attitude at t_mid**
+  from the history, then associated (Mahalanobis gate, range-dependent noise: radial >> sideways),
+  and the matches with confirmed apples correct the pose (small Kalman update of x, y, heading). The
+  correction is applied to the odometry frame, so the path driven since the exposure moves with it.
+* **Camera motion**: the IMU is on the camera bracket. Car roll / pitch are **high-passed** (2 s):
+  suspension motion moves the camera, a sloped driveway does not (the apples lie on the same slope;
+  `Params.attitude`: `highpass` | `absolute` vs the level reference | `static` = ignore the IMU).
+  Height vs pitch / roll comes from `config/suspension.json` (`tools/suspension_cal.py`).
+* **Apples**: box bottom-centre on the floor (for a ~80 mm apple this is within 1 cm of its contact
+  point, independent of its size); boxes cut by the frame edge are not used. New apples start
+  tentative, are confirmed after 5 hits, dropped when they are in view (0.45-2.2 m) for 40
+  frames without a detection, and forgotten outside the rolling window (above).
+* **Boundaries** (10 Hz): apples the car passes get their side; confirmed apples 0.6 m behind to 4 m
+  ahead are chained (max gap 1.4 m, max bend 55 deg, never across the other chain) into left / right
+  polylines + centre line + track width, car frame and world.
+* Tunables: `Params` in vision/track_map.py; overrides in an optional `config/track_map.json`
+  (e.g. `{"attitude": "static"}`). Pitch-bias estimation (`estimate_pitch`) exists but is off: on the
+  2026-10-10 takes it ran to its limit, soaking up the unmeasured odometry scale.
+
+Dashboard: **Track map** panel under the video (top-down: follow car heading-up / world-up / whole
+map, wheel or +/- to zoom; apples blue = left, orange = right, grey = side unknown, hollow =
+tentative; yellow + = this frame's detections; path; boundaries + centre line; violet = the
+autopilot's path with the apples it took as its left / right gates, see "Autonomy")
+and the mapped apples + boundaries projected back onto the camera image ("on camera"). Telemetry
+`trackmap`; `/ws/map` (10 Hz), `POST /api/map {"reset": true}` (refused while recording).
+
+**Recording**: every take gets the map (the map is reset when the take starts, so its world frame is
+the take's start: camera floor point, X = car heading, Y left, mm):
+
+| file | content |
+|---|---|
+| `<id>_det.csv` | every detection box of every camera frame (120 fps, not just the video's frames; join `_frames.csv` on `sensor_ts_ns`): raw box 0..1 + score, then status (used / edge / range), floor point (camera frame), its noise, world point, the apple it was matched to / started, camera pitch / roll / height used, pose, correction |
+| `<id>_pose.csv` | 50 Hz fused pose, odometry-only pose, car roll / pitch, the high-passed part, camera pitch / roll / height, pose sigma |
+| `<id>_landmarks.csv` | 10 Hz: every active apple (estimated position, sigma, state, side, hits, misses, position in the car frame) |
+| `<id>_track.jsonl` | 10 Hz: left / right boundary + centre line in the car frame, apple ids per side, width |
+| `<id>_map.json` | final map: the apples of the last window, the last trail_s of path, parameters, odometry / suspension config, statistics |
+
+Review / re-tune offline (`results/trackmap/<id>/`; only the raw box columns are read, so any take
+can be re-mapped with other parameters):
+```
+python3 tools/replay_map.py run recordings/<id> --png [--video] [--attitude static] [--mm-per-turn 30]
+python3 tools/detect_take.py recordings/<id>     # older takes without _det.csv: run the HEF on the mp4 (dashboard stopped)
+```
+`--video` writes `<id>_review.mp4`: detections, mapped apples / boundaries projected back into the
+image, inset map. If the projected dots slide off the apples as the car drives, the odometry scale or
+the camera pitch is off.
+
+**Calibration the map needs** (in this order):
+1. `tools/odometry_cal.py`: push the car exactly 4 m straight, it counts the encoder turns (repeat a
+   few times, q saves the median; works with the dashboard running). **Not measured yet**: `mm_per_turn` 23.25 is the Sim's
+   guess. The 2026-10-10 takes cannot settle it (estimates 13-57 mm/turn depending on the method:
+   the IMU was not calibrated then, so camera pitch and scale cannot be separated, and the loop
+   has almost no straights); `replay_map.py fit-scale` exists for takes with a good IMU.
+2. `tools/suspension_cal.py capture` / `fit --write`: one 8x6 board flat ~0.5 m in front, press the
+   car down in every direction for ~60 s -> camera height vs IMU pitch / roll, and checks that the
+   IMU really turns with the camera (gain ~1). Pose math verified on the 2026-10-10 calibration
+   image (`check`): single boards give h 191-197 mm, pitch 11.3-11.8 deg vs 193.4 / 11.53 fitted.
+
+Measured 2026-10-11 (live, car still, 1280x720@120 + detection): map loop 0.35 ms p50, CPU 36 %,
+detection 120 fps / 30.6 ms. Replay of the 2026-10-10 takes (static attitude, unmeasured scale):
+~130 detection frames/s on the Pi, median match residual ~20-27 mm; laps drift against each other.
+
+## Autonomy (planner; shadow mode so far)
+
+`vision/planner.py` turns the map into a steering + speed command; `vision/map_worker.py` runs it at
+10 Hz and the page shows its suggestion (violet path, "autopilot (shadow)" row) while you drive. It
+**does not drive** yet: the drive server already accepts `"auto"` commands (human links win), but
+nothing sends them.
+
+* **Path = gates**: Delaunay triangulation of the confirmed apples around the car; every edge about a
+  track width long (0.45-1.5 m) is a gate (one apple left, one right). A beam search walks gate
+  midpoints through neighbouring triangles from the gate the car is in, scoring constant width,
+  smooth turns and length, never using an apple on both sides. Fallback: the map's chained boundaries
+  (centre line, or one side shifted by half the width). The chained boundaries alone fail in sharp
+  corners: looking into a corner the outer row lies straight ahead and gets chained onto the inner one.
+* **Steering**: pure pursuit from the rear axle (lookahead 0.65 m + 0.25 s of travel), curvature ->
+  servo with the measured full lock (1.45 1/m = 0.69 m radius at ~1.2 m/s, both ways, ~67 ms
+  servo + chassis lag; measured 2026-10-11 from yaw rate / speed).
+* **Speed**: lateral acceleration <= 0.25 g in the curve ahead, and never faster than the known path
+  allows (0.8 s); no path -> hold the last steering 0.3 s, then stop.
+
+`tools/autonomy_eval.py recordings/<id> ... [--plot p.png] [--csv c.csv] [--no-gates]` replays takes
+through the map + planner and compares, every 0.1 s, its curvature with what the car really drove
+(yaw rate / speed after the lag), and checks the left / right apples it used against the path the
+driver took over the next 1.5 m. 2026-10-11 takes (keyboard driving: bang-bang steering, ~1.2 m/s,
+some apples hit), with gates: a path 98-100 % of the time, known p50 1.4-1.8 m ahead, turn direction
+agrees with the driven one 79-92 %, right-side apples on the wrong side of the driven path 0.4-6 %,
+left (inside of these mostly-left loops) 8-22 %; the video shows the car cutting / hitting inside
+apples at several of those moments, so part of that is the driver's line, not the map.
+Chained boundaries only (`--no-gates`): turn direction 73-93 %, left wrong side 13-40 %.
+Needs scipy (python3-scipy, installed on the Pi).
 
 ## Camera calibration (3D from detections)
 
@@ -245,6 +383,10 @@ Every class derives from `hardware.base.Subsystem`: `available()` cheap presence
 | `drive_test.py` | ramp forward throttle until the encoder sees motion, hold, stop (asks for `yes`; ESC switched on by hand) |
 | `encoder_watch.py` | print AS5600 angle / turns / velocity while turning the shaft |
 | `camera_cal.py capture / fit <run> [--write]` | camera calibration from checkerboards on the floor -> `config/camera.json` (see "Camera calibration") |
+| `odometry_cal.py` | push the car exactly 4 m straight -> `config/odometry.json` mm per motor turn (track map) |
+| `suspension_cal.py capture / fit <run> [--write]` | camera height / attitude vs IMU from a board on the floor -> `config/suspension.json` |
+| `replay_map.py run / fit-scale <take>` | re-run the track map over a take (map png, review video) / estimate the odometry scale |
+| `detect_take.py <take>` | run the detector over a take's video (takes recorded without detection) |
 | `imu_level.py [--show]` | capture the IMU level reference (car still, level, nominal pose) into `config/imu.json`; dashboard stopped |
 
 ## Tests

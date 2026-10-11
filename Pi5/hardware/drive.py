@@ -27,12 +27,13 @@ from .steering import Steering
 class Drive(Subsystem):
     name = "drive"
 
-    def __init__(self, max_throttle=1.0, filter_samples=15):
+    def __init__(self, max_throttle=1.0, filter_samples=15, sample_hz=None):
         self.esc = HobbywingESC()
         self.enc = AS5600()
         self.enc.zero()
         self.steering = Steering()
         self.max_throttle = float(max_throttle)
+        self._period = 1.0 / sample_hz if sample_hz else 0.0   # None: sample as fast as the bus allows (~1.5 kHz)
         self._filter = deque(maxlen=filter_samples)
         self._dps = 0.0
         self._turns = 0.0
@@ -42,7 +43,11 @@ class Drive(Subsystem):
         self.stop()
 
     def _sample(self):
+        nxt = time.monotonic()
         while not self._stop_evt.is_set():
+            if self._period:
+                nxt += self._period
+                time.sleep(max(0.0, nxt - time.monotonic()))
             _, self._turns, vel = self.enc.read_fast()
             self._filter.append(vel)
             if len(self._filter) >= 3:

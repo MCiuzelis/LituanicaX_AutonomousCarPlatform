@@ -1,0 +1,10 @@
+{
+ "mm_per_turn": 55.074,
+ "cam_ahead_of_rear_axle_mm": 176.5,
+ "source": "tools/odometry_cal.py: pushed 4000 mm, runs 1-2 (72.55, 72.71 turns; run 3 discarded: tape moved), 2026-10-11T07:49:59",
+ "runs_mm_per_turn": [
+  55.134,
+  55.013
+ ],
+ "geometry": "measured by hand 2026-10-11: wheelbase 186.5 mm, camera 10 mm behind the front axle, lens 194 mm above the floor"
+}

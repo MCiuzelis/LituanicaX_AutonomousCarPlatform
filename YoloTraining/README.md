@@ -42,6 +42,14 @@ YoloTraining/
 | check | `uv run scripts/06_predict_video.py data/videos/<clip>.mp4` | annotated mp4 in `runs/` |
 | check | `scripts/08_compare_hef.py` (instructions in its docstring) | HEF-on-Hailo vs PyTorch accuracy |
 
+## Staged, not trained yet: 2026-10-11 (morning light, new layouts)
+`data/videos_20261011/` (6 takes, 1536x864 @ 60 + sensor CSVs + live map logs) went through steps 1, 2
+and 4b into `data/staging_20261011/` (`frames/` 995 deduplicated driving frames, `labels/` Grounding
+DINO 18003 boxes, `labels_r2/` + 555 boxes from the current model, `preview*/`); kept out of `data/frames`
+so the training set is unchanged until it is merged: copy `frames/*` -> `data/frames/` and
+`labels_r2/*` -> `data/labels_r2/`, then steps 3 + 4 (pick a 20261011 take for val, e.g. `083825`).
+Steps 02 / 07 now write their previews next to their `--labels` / `--out` folder.
+
 ## Labeling notes
 - Grounding DINO base (`IDEA-Research/grounding-dino-base`), prompt
   `apple. basket. box. leaf. stone. shoe. car.`; only `apple` boxes are kept, the other phrases

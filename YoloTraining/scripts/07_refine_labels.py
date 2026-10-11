@@ -53,7 +53,7 @@ def main():
     if args.out.exists():
         shutil.rmtree(args.out)
     args.out.mkdir(parents=True)
-    prev = ROOT / "data/preview_r2"
+    prev = args.out.parent / args.out.name.replace("labels", "preview")   # data/labels_r2 -> data/preview_r2
     if args.preview:
         shutil.rmtree(prev, ignore_errors=True)
         prev.mkdir()

@@ -5,64 +5,70 @@
     then open http://rp5:8080  (or http://<pi-ip>:8080)
 
 Serves
-  http://<pi>:8080/        the dashboard page (web/index.html): MJPEG camera, resolution
+  http://<pi>:8080/        the dashboard page (web/index.html): camera preview, resolution
                            switching, training-data recording (H.264 + per-frame IMU / odometry,
-                           recorder.py), all telemetry, keyboard driving over a WebSocket
-  tcp  <pi>:8081           command/health link for car_client.py on a PC
-  /ws/det, /api/vision     Hailo object detection on the camera (Vision class): boxes for the
-                           page overlay, and on/off + model/threshold/class filter settings
+                           recorder.py), all telemetry, keyboard driving
+  /ws/video                camera preview for the page: each message = one JPEG of the detector's own
+                           frame + the boxes found in THAT frame (so video and boxes are in sync);
+                           the page acks every frame, so nothing queues up on a slow WiFi link (Preview)
+  /ws/det, /api/vision     Hailo object detection on the camera (Vision class): boxes, and on/off +
+                           model/threshold/class filter settings
   /ws/imu, /api/imu/*      BNO085 attitude / acceleration / yaw rate in the car frame (Imu class)
+  /ws/map, /api/map        track map: apples of the last few seconds (rolling window) and the track
+                           boundaries + the planner's suggestion (shadow mode); vision/map_worker.py,
+                           its own process (MapProcess); recorded into every take
 
-Protocol on both the WebSocket and the tcp link (one JSON object per line):
-  client -> pi   {"t": -1..1, "s": -1..1}   throttle (negative = brake) and steering, sent
-                                            continuously (~20 Hz) while driving
-  pi -> client   {"h":1, "v":batt, "temp":c, "rps":.., "us":pulse, "st":steer, "act":link,
-                  "lk":{"ws":age_ms,"tcp":age_ms}, "stop":bool}   at HEALTH_HZ
-
-Safety: throttle is capped at MAX_THROTTLE. If no command arrives on ANY link for DEADMAN_S
-the motor goes to neutral and the steering to centre. The freshest command from any link wins.
+Driving does NOT go through this process: drive_server.py (started from here, its own process with a
+realtime network thread) owns throttle, steering and the motor encoder and serves the page's command
+WebSocket (:8082/ws/ctl) and car_client.py's tcp link (:8081). Nothing here (camera, Hailo, recorder,
+map) can delay a command. This process reads the drive state from shared memory (DriveLink).
+Safety (drive_server.py): throttle capped at 40 %, neutral + centre if no command for 0.4 s.
 """
 import asyncio
-import io
 import json
 import logging
 import math
 import os
+import queue
+import signal
 import socket
 import statistics
+import struct
+import subprocess
 import sys
 import threading
 import time
 from collections import deque
+from multiprocessing.connection import Connection
 
 import numpy as np
 from aiohttp import web
-from picamera2.encoders import JpegEncoder
-from picamera2.outputs import FileOutput
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "vision"))
-from hardware import Drive, Camera, BoardPower, BatteryMonitor, HailoBoard, BNO085, CarFrame, HardwareError  # noqa: E402
+from hardware import Camera, BoardPower, BatteryMonitor, HailoBoard, BNO085, CarFrame, HardwareError  # noqa: E402
 from recorder import Recording, list_recordings, delete_recording  # noqa: E402
+import drive_server  # noqa: E402
 
-HTTP_PORT, TCP_PORT = 8080, 8081
-MAX_THROTTLE = 0.40          # fraction of full forward the server will ever apply
-DEADMAN_S = 0.4              # stop if no command arrives on any link for this long
+HTTP_PORT = 8080
 TELEMETRY_HZ = 4             # telemetry sampling + WebSocket push rate
-HEALTH_HZ = 5                # compact health line rate on the tcp link
 # (width, height, fps). Sensor modes: 1536x864@120, 2304x1296@56, 4608x2592@14; the ISP scales
 # any smaller output from the chosen one. tests/camera_sweep.py showed the software MJPEG
 # encoder keeps up with all of these (1536x864@120 at ~16 % CPU on YUV420).
 CAMERA_MODES = [(640, 360, 120), (640, 480, 120), (800, 600, 120), (1024, 576, 120),
                 (1280, 720, 120), (1280, 720, 100), (1280, 720, 60), (1536, 864, 120),
                 (1920, 1080, 56), (2304, 1296, 56), (2304, 1296, 30)]
-DEFAULT_MODE = (1280, 720, 60)
+DEFAULT_MODE = (1536, 864, 120)   # full 1536x864 sensor mode: detection at 120 fps, recordings at 60
 BUFFERS_SMALL, BUFFERS_LARGE = 16, 10   # camera buffers for modes up to 1536x864 / larger
-PREVIEW_FPS = 30             # MJPEG preview to the page: every Nth camera frame, at most this rate
+PREVIEW_FPS = 30             # preview to the page: at most this rate (the page's acks may slow it further)
+PREVIEW_SIZES = {"480": (480, 270), "640": (640, 360), "960": (960, 540)}   # scaled from the detector frame
+PREVIEW_DEFAULT = "640"
+PREVIEW_QUALITY = 70
 # Recording takes every Nth camera frame, at most this rate (YOLO training needs no more; the Pi 5
-# has no H.264 hardware and x264 cannot keep up with e.g. 1536x864@120 or 2304x1296@56)
-REC_FPS_SMALL, REC_FPS_LARGE = 60, 30    # modes up to 1536x864 / larger
+# has no H.264 hardware: x264 at 1536x864@60 took ~1.9 cores and pulled detection down to ~70 fps,
+# at 30 fps detection keeps 120 fps while recording; measured 2026-10-11)
+REC_FPS_SMALL, REC_FPS_LARGE = 30, 30    # modes up to 1536x864 / larger
 WEB_DIR = os.path.join(ROOT, "web")
 REC_DIR = os.path.join(ROOT, "recordings")
 MODEL_DIR = os.path.join(ROOT, "models")
@@ -70,6 +76,8 @@ STOCK_HEF = "/usr/share/hailo-models/yolov8s_h8.hef"   # COCO yolov8s, 640x640 i
 DET_INPUT = (960, 544)       # input (w, h) of models/apple_yolov8s.hef; the lores stream follows the loaded model
 DET_PUSH_HZ = 30             # max rate boxes are pushed to the page overlay
 IMU_PUSH_HZ = 25             # attitude / g-g plot push rate (/ws/imu); the IMU itself runs at 100 Hz
+MAP_PUSH_HZ = 10             # track map push rate (/ws/map); the map itself updates on every detection frame
+VIDEO_CREDITS = 2            # preview frames in flight to one page before it must ack
 COCO_NAMES = (
     "person bicycle car motorcycle airplane bus train truck boat traffic_light fire_hydrant "
     "stop_sign parking_meter bench bird cat dog horse sheep cow elephant bear zebra giraffe "
@@ -82,97 +90,275 @@ COCO_NAMES = (
 log = logging.getLogger("dashboard")
 
 
-# ---------------------------------------------------------------- control arbiter
-class Control:
-    """Applies the freshest command from any link; a watchdog stops the car when all go quiet."""
+# ---------------------------------------------------------------- drive (separate process)
+class DriveLink:
+    """drive_server.py as a child process + a read view of its shared-memory state.
 
-    def __init__(self, drive):
-        self.drive = drive
-        self.lock = threading.Lock()
-        self.last = {}                  # link name -> monotonic time of its last command
-        self.throttle = self.steer = 0.0
-        self.active = None              # link that sent the command currently applied
-        self.stopped = True             # True once the dead-man (or nobody) has stopped the car
-        self._run = True
-        threading.Thread(target=self._watchdog, daemon=True).start()
+    Looks like the old in-process Drive / Control to the rest of this file and to recorder.py:
+    .turns .rps .rpm .steering.position .esc.current_us .status(), .throttle .active .stopped
+    .link_ages_ms() .control_status(). command() goes to the server as link "auto" (any human
+    command in the last 0.5 s wins over it); the page and car_client.py talk to the server directly."""
+
+    class _Steering:
+        def __init__(self, link):
+            self._l = link
+
+        @property
+        def position(self):
+            return self._l.read()["steer_pos"]
+
+    class _Esc:
+        def __init__(self, link):
+            self._l = link
+
+        @property
+        def current_us(self):
+            return self._l.read()["esc_us"]
+
+    def __init__(self):
+        self.steering, self.esc = self._Steering(self), self._Esc(self)
+        self.proc, self.state, self.restarts = None, None, 0
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self._cache, self._cache_t = None, 0.0
+        self._start()
+        threading.Thread(target=self._monitor, daemon=True).start()
+
+    def _start(self):
+        subprocess.run(["pkill", "-f", "[d]rive_server.py"], check=False)   # a stale one from a killed dashboard
+        time.sleep(0.3)
+        self.proc = subprocess.Popen([sys.executable, os.path.join(ROOT, "drive_server.py")], cwd=ROOT)
+        t_end = time.monotonic() + 15.0
+        while time.monotonic() < t_end:
+            try:
+                st = drive_server.DriveState()
+                if st.read()["pid"] == self.proc.pid:
+                    self.state = st
+                    log.info("drive server pid %d (rt priority %s)", self.proc.pid, bool(st.read()["rt"]))
+                    return
+                st.close()
+            except FileNotFoundError:
+                pass
+            if self.proc.poll() is not None:
+                raise RuntimeError("drive server exited with %s (see the log)" % self.proc.returncode)
+            time.sleep(0.1)
+        raise RuntimeError("drive server did not come up")
+
+    def _monitor(self):
+        while True:
+            time.sleep(1.0)
+            if self.proc.poll() is not None:
+                log.error("drive server exited (%s): restarting", self.proc.returncode)
+                self.restarts += 1
+                try:
+                    if self.state is not None:
+                        st, self.state = self.state, None
+                        st.close()
+                    self._start()
+                except Exception as e:  # noqa: BLE001 - keep trying
+                    log.error("drive server restart failed: %s", e)
+
+    def read(self):
+        """Server state (dict of drive_server.FIELDS), at most 1 ms old."""
+        now = time.monotonic()
+        if self._cache is None or now - self._cache_t > 0.001:
+            st = self.state
+            self._cache = st.read() if st is not None else dict.fromkeys(drive_server.FIELDS, 0.0)
+            self._cache_t = now
+        return self._cache
+
+    def _send(self, msg):
+        try:
+            self.sock.sendto(json.dumps(msg).encode(), drive_server.SOCK)
+        except OSError:
+            pass
 
     def command(self, link, throttle, steer):
-        t = max(-1.0, min(MAX_THROTTLE, float(throttle)))
-        s = max(-1.0, min(1.0, float(steer)))
-        with self.lock:
-            self.last[link] = time.monotonic()
-            self.throttle, self.steer, self.active, self.stopped = t, s, link, False
-            if t >= 0:
-                self.drive.forward(t)
-            else:
-                self.drive.brake(-t)
-            self.drive.steer(s)
+        self._send({"link": link, "t": throttle, "s": steer})
 
-    def link_ages_ms(self):
-        now = time.monotonic()
-        return {k: int((now - v) * 1000) for k, v in self.last.items()}
+    def send_health(self, volts, temp):
+        self._send({"health": {"v": volts, "temp": temp}})
+
+    # ---- drive view (recorder.py, telemetry, track map)
+    @property
+    def turns(self):
+        return self.read()["turns"]
+
+    @property
+    def rps(self):
+        return self.read()["rps"]
+
+    @property
+    def rpm(self):
+        return self.rps * 60.0
 
     def status(self):
-        return {"throttle": self.throttle, "steer": self.steer, "active": self.active,
-                "stopped": self.stopped, "max_throttle": MAX_THROTTLE, "links_ms": self.link_ages_ms()}
+        s = self.read()
+        return {"pulse_us": s["esc_us"], "rps": round(s["rps"], 2), "rpm": round(s["rps"] * 60),
+                "turns": round(s["turns"], 2), "steer": s["steer_pos"]}
 
-    def _watchdog(self):
+    # ---- control view
+    @property
+    def throttle(self):
+        return self.read()["throttle"]
+
+    @property
+    def active(self):
+        a = int(self.read()["active"])
+        return drive_server.LINKS[a - 1] if a else None
+
+    @property
+    def stopped(self):
+        return bool(self.read()["stopped"])
+
+    def link_ages_ms(self):
+        s, now = self.read(), time.monotonic()
+        return {k: int((now - s["last_" + k]) * 1000) for k in drive_server.LINKS if s["last_" + k]}
+
+    def control_status(self):
+        s = self.read()
+        return {"throttle": s["throttle"], "steer": s["steer"], "active": self.active, "stopped": bool(s["stopped"]),
+                "max_throttle": s["max_throttle"], "links_ms": self.link_ages_ms(),
+                "gap_max_ms": {"ws": round(s["gap_ws_ms"]), "tcp": round(s["gap_tcp_ms"])},
+                "late": {"ws": int(s["late_ws"]), "tcp": int(s["late_tcp"])}, "deadman": int(s["deadman"]),
+                "commands": int(s["commands"]), "rt": bool(s["rt"]), "ws_clients": int(s["ws_clients"]),
+                "server_pid": int(s["pid"]), "server_restarts": self.restarts, "port": drive_server.WS_PORT}
+
+    def close(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(5.0)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        if self.state is not None:
+            self.state.close()
+
+
+# ---------------------------------------------------------------- camera preview
+class Preview:
+    """JPEG preview of the detector's frames for the page, with each frame's own boxes.
+
+    While detection runs, Vision hands over every result (frame + boxes); the newest is scaled to
+    the requested PREVIEW_SIZES and encoded at <= PREVIEW_FPS. With detection off this captures the
+    lores stream itself. JPEG encoding and scaling release the GIL. Readers: /ws/video (one message
+    per frame, sent only when the page has acked the previous ones) and /stream.mjpg."""
+
+    def __init__(self, camera):
+        self.camera = camera
+        self.lock = threading.Lock()
+        self.frames = {}               # size key -> (seq, payload bytes, jpeg bytes)
+        self.wanted = {PREVIEW_DEFAULT: 0.0}   # size key -> last time a reader asked for it
+        self.subs = set()              # (loop, asyncio.Event) of waiting readers
+        self._offer, self._offer_evt = None, threading.Event()
+        self.seq = 0
+        self.times = deque(maxlen=60)
+        self.enc_ms = deque(maxlen=120)
+        self._run = True
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def offer(self, lores, header):
+        """Vision result thread: newest detection frame (RGB lores array) + its header. Cheap."""
+        self._offer = (lores, header, time.monotonic())
+        self._offer_evt.set()
+
+    def want(self, key):
+        self.wanted[key] = time.monotonic()
+
+    def subscribe(self, loop):
+        item = (loop, asyncio.Event())
+        with self.lock:
+            self.subs.add(item)
+        return item
+
+    def unsubscribe(self, item):
+        with self.lock:
+            self.subs.discard(item)
+
+    def latest(self, key):
+        return self.frames.get(key)
+
+    def _capture(self):
+        """Own lores frame while detection is off."""
+        cam = self.camera
+        with cam.lock:
+            req = cam.cam.cam.capture_request()
+        try:
+            md = req.get_metadata()
+            lo = req.make_array("lores")
+        finally:
+            req.release()
+        return lo, {"boxes": [], "det": False, "ts": md.get("SensorTimestamp")}
+
+    def _loop(self):
+        import cv2
+        import simplejpeg
+        nxt = time.monotonic()
         while self._run:
-            time.sleep(0.05)
-            with self.lock:
-                now = time.monotonic()
-                fresh = [k for k, v in self.last.items() if now - v < DEADMAN_S]
-                if not self.stopped and not fresh:
-                    log.warning("dead-man: no command for %.0f ms on any link -> stop", DEADMAN_S * 1000)
-                    self.drive.stop()
-                    self.drive.steer(0)
-                    self.throttle = self.steer = 0.0
-                    self.active, self.stopped = None, True
+            off = self._offer
+            if off is not None and time.monotonic() - off[2] < 0.25:   # detection running: wait for its next frame
+                self._offer_evt.wait(1.5 / PREVIEW_FPS)
+            self._offer_evt.clear()
+            now = time.monotonic()
+            if now < nxt:
+                time.sleep(nxt - now)
+                continue                   # then take the newest frame that arrives
+            try:
+                off = self._offer
+                if off is not None and now - off[2] < 0.25:
+                    lo, hdr = off[0], dict(off[1])
+                else:
+                    lo, hdr = self._capture()
+                nxt = now + 1.0 / PREVIEW_FPS
+                keys = [k for k, t in self.wanted.items() if now - t < 3.0 or k == PREVIEW_DEFAULT]
+                a = time.monotonic()
+                self.seq += 1
+                for k in keys:
+                    w, h = PREVIEW_SIZES[k]
+                    img = lo if lo.shape[1] <= w else cv2.resize(lo, (w, h), interpolation=cv2.INTER_LINEAR)
+                    jpg = simplejpeg.encode_jpeg(np.ascontiguousarray(img), quality=PREVIEW_QUALITY, colorspace="RGB")
+                    ts = hdr.get("ts")
+                    hd = dict(hdr, seq=self.seq, w=img.shape[1], h=img.shape[0],
+                              age_ms=round((time.monotonic_ns() - ts) / 1e6, 1) if ts else None)
+                    hb = json.dumps(hd, separators=(",", ":")).encode()
+                    self.frames[k] = (self.seq, struct.pack("<I", len(hb)) + hb + jpg, jpg)
+                self.enc_ms.append((time.monotonic() - a) * 1000)
+                self.times.append(time.monotonic())
+                with self.lock:
+                    subs = list(self.subs)
+                for loop, ev in subs:
+                    loop.call_soon_threadsafe(ev.set)
+            except Exception as e:  # noqa: BLE001 - camera switching etc.: try again
+                log.warning("preview: %s", e)
+                time.sleep(0.2)
+
+    @property
+    def fps(self):
+        recent = [x for x in list(self.times) if x > time.monotonic() - 2.0]
+        return (len(recent) - 1) / (recent[-1] - recent[0]) if len(recent) > 2 else 0.0
+
+    def status(self):
+        return {"fps": round(self.fps, 1), "enc_ms": _pct(list(self.enc_ms), 0.5),
+                "sizes": sorted(k for k, t in self.wanted.items() if time.monotonic() - t < 3.0),
+                "readers": len(self.subs)}
 
     def close(self):
         self._run = False
 
 
-# ---------------------------------------------------------------- camera stream
-class StreamingOutput(io.BufferedIOBase):
-    """Receives JPEG frames from the picamera2 encoder; readers wait() for a new one."""
-
-    def __init__(self):
-        self.frame, self.count = None, 0
-        self.cond = threading.Condition()
-        self.times = deque(maxlen=30)
-
-    def write(self, buf):
-        with self.cond:
-            self.frame, self.count = buf, self.count + 1
-            self.times.append(time.monotonic())
-            self.cond.notify_all()
-
-    def wait(self, seen, timeout=1.0):
-        """Block until a frame newer than `seen` arrives; returns (frame, count)."""
-        with self.cond:
-            self.cond.wait_for(lambda: self.count != seen, timeout)
-            return self.frame, self.count
-
-    @property
-    def fps(self):
-        if len(self.times) < 2:
-            return 0.0
-        return (len(self.times) - 1) / max(1e-6, self.times[-1] - self.times[0])
-
-
 class CameraStream:
-    """Camera -> MJPEG stream for the page, plus optional training-data recording to the SD card:
-    H.264 + per-frame IMU / odometry in recordings/<id>/ (recorder.Recording)."""
+    """Camera: full-resolution main stream (recordings: H.264 + per-frame IMU / odometry in
+    recordings/<id>/, recorder.Recording) + the lores stream sized for the detector (Vision, and the
+    page preview: Preview). Nothing JPEG-encodes the main stream any more."""
 
     def __init__(self, mode=DEFAULT_MODE):
-        self.cam = Camera(pixel_format="YUV420")   # cheaper to JPEG/H.264-encode than RGB888
-        self.out = StreamingOutput()
+        self.cam = Camera(pixel_format="YUV420")   # cheaper to H.264-encode than RGB888
+        self.preview = None        # Preview (its frame rate is reported here)
         self.lock = threading.Lock()
         self.mode = None           # (width, height, fps) currently streaming
         self.lores_size = None     # RGB copy of every frame for the detector, scaled to fit det_input
         self.det_input = DET_INPUT
         self.rec = None            # recorder.Recording while recording
+        self.trackmap = None       # MapProcess: its log goes into every take
         os.makedirs(REC_DIR, exist_ok=True)
         self.set_mode(*mode)
 
@@ -180,8 +366,6 @@ class CameraStream:
         with self.lock:
             if self.rec:
                 raise RuntimeError("stop the recording before switching resolution")
-            if self.mode is not None:
-                self.cam.cam.stop_encoder()
             # detector input: same aspect as main, as large as fits the model input (ISP-scaled, costs no
             # CPU); never larger than main, the detector letterboxes whatever is left
             nw, nh = self.det_input
@@ -191,9 +375,6 @@ class CameraStream:
             nbuf = BUFFERS_SMALL if int(w) * int(h) <= 1536 * 864 else BUFFERS_LARGE
             m = self.cam.set_mode(int(w), int(h), float(fps), settle_s=0.0, lores=(*lo, "BGR888"), buffer_count=nbuf)
             self.lores_size = lo
-            self.jpeg = JpegEncoder(q=70)
-            self.jpeg.frame_skip_count = max(1, math.ceil(m.fps / PREVIEW_FPS - 0.01))
-            self.cam.cam.start_encoder(self.jpeg, FileOutput(self.out))
             self.mode = (m.width, m.height, m.fps)
             log.info("camera %dx%d @ %.1f fps", *self.mode)
             return self.mode
@@ -214,6 +395,8 @@ class CameraStream:
             cap = REC_FPS_SMALL if w * h <= 1536 * 864 else REC_FPS_LARGE
             skip = max(1, math.ceil(fps / cap - 0.01))
             self.rec = Recording(REC_DIR, self.cam.cam, self.cam.mode, skip=skip, imu=imu, drive=drive, control=control)
+            if self.trackmap is not None:
+                self.trackmap.start_log(self.rec.dir, self.rec.id)    # fresh map: the take's world frame
             log.info("recording -> %s (%.0f Mbit/s)", self.rec.dir, self.rec.bitrate / 1e6)
             return self.rec.id
 
@@ -222,6 +405,11 @@ class CameraStream:
             if not self.rec:
                 return None
             rec, self.rec = self.rec, None
+            if self.trackmap is not None:
+                tm = self.trackmap.stop_log()
+                if tm:
+                    rec.meta["files"].update(tm["files"])
+                    rec.meta["track_map"] = tm["meta"]
             s = rec.stop()
             log.info("recording saved %s: %d frames, %d dropped, %d without IMU, %.1f MB", rec.id, s["frames"],
                      s["dropped_frames"], s["frames_without_imu"], s["video_bytes"] / 1e6)
@@ -242,17 +430,14 @@ class CameraStream:
                 threading.Thread(target=self.stop_recording, daemon=True).start()
         fs = os.statvfs(REC_DIR)
         m = self.cam.mode
-        return {"mode": self.mode, "stream_fps": round(self.out.fps, 1), "modes": CAMERA_MODES,
+        return {"mode": self.mode, "stream_fps": round(self.preview.fps, 1) if self.preview else None,
+                "preview": self.preview.status() if self.preview else None, "modes": CAMERA_MODES,
                 "sensor": m and "%dx%d" % m.sensor.size,
                 "recording": rec, "disk_free_gb": round(fs.f_bavail * fs.f_frsize / 1e9, 2)}
 
     def close(self):
         self.stop_recording()
         with self.lock:
-            try:
-                self.cam.cam.stop_encoder()
-            except Exception:  # noqa: BLE001 - best effort on shutdown
-                pass
             self.cam.close()
 
 
@@ -281,6 +466,8 @@ class Vision:
         self.cfg = {"on": False, "hef": default if os.path.exists(default) else STOCK_HEF,
                     "conf": 0.35, "filter": "apple"}
         self.det, self.names, self.error = None, [], None
+        self.on_boxes = None       # callback(t_mid_s, boxes, crop, seq, sensor_ts_ns): the track map
+        self.preview = None        # Preview: gets every result's frame + boxes (video and boxes in sync)
         self.chip_temp, self._next_temp = None, 0.0
         self.frames = self.dropped = 0
         self._last_ts = None
@@ -360,7 +547,7 @@ class Vision:
                 log.exception("vision publish: %s", e)
 
     def _publish(self, boxes, tag, infer_s):
-        ts_sensor, ts_py = tag
+        ts_sensor, ts_py, t_mid, crop, lo = tag
         now = time.monotonic_ns()
         self.t_done.append(time.monotonic())
         self.lat_total.append((now - ts_sensor) / 1e6)
@@ -374,7 +561,13 @@ class Vision:
                            "boxes": [[round(b[0], 4), round(b[1], 4), round(b[2], 4), round(b[3], 4),
                                       round(b[4], 3), self.names[b[5]] if b[5] < len(self.names) else b[5]]
                                      for b in boxes]}
+            latest = self.latest
             self.cond.notify_all()
+        if self.preview is not None:
+            self.preview.offer(lo, {"boxes": latest["boxes"], "det": True, "ts": ts_sensor, "lat_ms": latest["lat_ms"],
+                                    "det_seq": latest["seq"]})
+        if self.on_boxes is not None and crop:
+            self.on_boxes(t_mid, boxes, crop, self.latest["seq"], ts_sensor)
 
     def _loop(self):
         while self._run:
@@ -393,7 +586,8 @@ class Vision:
                 with self.camera.lock:                     # a mode switch waits for this frame
                     req = self.camera.cam.cam.capture_request()
                 try:
-                    ts = req.get_metadata().get("SensorTimestamp")
+                    md = req.get_metadata()
+                    ts = md.get("SensorTimestamp")
                     lo = req.make_array("lores")
                 finally:
                     req.release()
@@ -406,7 +600,11 @@ class Vision:
                 if self._last_ts and fps and (ts - self._last_ts) / 1e9 > 1.5 / fps:
                     self.dropped += round((ts - self._last_ts) / 1e9 * fps) - 1
                 self._last_ts = ts
-                self.det.submit(lo, (ts, time.monotonic_ns()))   # result thread publishes it
+                # exposure middle of the middle row (as recorder.py's t_mid): when the boxes "happened"
+                m = self.camera.cam.mode
+                readout_ns = 1e9 / m.sensor.max_fps if m else 0.0
+                t_mid = (ts - md.get("ExposureTime", 0) * 500 + readout_ns / 2) * 1e-9
+                self.det.submit(lo, (ts, time.monotonic_ns(), t_mid, tuple(md.get("ScalerCrop", ())), lo))
                 if time.monotonic() > self._next_temp:
                     self.chip_temp, self._next_temp = self.det.chip_temp_c(), time.monotonic() + 2.0
             except Exception as e:  # noqa: BLE001 - report on the page, keep the dashboard up
@@ -586,12 +784,129 @@ class Imu:
             self.imu.close()
 
 
+# ---------------------------------------------------------------- track map (separate process)
+class MapProcess:
+    """vision/map_worker.py (track map + planner) as a child process.
+
+    A feeder thread forwards, every PERIOD_S, the raw game_rv samples (board-frame quaternions; the
+    worker converts them to car attitude), the encoder turns and the detection frames
+    (Vision.on_boxes) in one message. The worker answers at 10 Hz with the finished JSON snapshot,
+    which /ws/map forwards as is. Recording: start_log() resets the map and logs into the take,
+    stop_log() returns the take's map files + metadata."""
+
+    PERIOD_S = 0.01
+
+    def __init__(self, imu, drive):
+        self.imu, self.drive = imu, drive
+        self.lock = threading.Lock()              # serialises sends on the pipe
+        self._dets = deque(maxlen=2000)
+        self.sub = None
+        self.snap_json, self.st = json.dumps({"up": False}), {"up": False}
+        self.snap_at = 0.0
+        self.replies = queue.Queue()
+        self.restarts, self.error = 0, None
+        self.conn = self.proc = None
+        self._start()
+        self._run = True
+        threading.Thread(target=self._feeder, daemon=True).start()
+
+    def _start(self):
+        a, b = socket.socketpair()
+        self.conn = Connection(a.detach())
+        fd = b.detach()
+        self.proc = subprocess.Popen([sys.executable, "-m", "vision.map_worker", str(fd)], cwd=ROOT, pass_fds=(fd,))
+        os.close(fd)
+        threading.Thread(target=self._reader, args=(self.conn,), daemon=True).start()
+        log.info("track map worker pid %d", self.proc.pid)
+
+    def _reader(self, conn):
+        while True:
+            try:
+                msg = conn.recv()
+            except (EOFError, OSError):
+                return
+            if msg[0] == "snap":
+                self.snap_json, self.st, self.snap_at = msg[1], msg[2], time.monotonic()
+            elif msg[0] == "stopped":
+                self.replies.put(msg[1])
+
+    def _send(self, msg):
+        with self.lock:
+            self.conn.send(msg)
+
+    def on_boxes(self, t_mid, boxes, crop, seq, sensor_ts):
+        """Vision result thread: keep it cheap."""
+        self._dets.append((t_mid, boxes, crop, seq, sensor_ts))
+
+    def _feeder(self):
+        while self._run:
+            t0 = time.monotonic()
+            try:
+                dev = self.imu.imu
+                if dev is not None and self.sub is None:
+                    self.sub = dev.subscribe("game_rv", maxlen=20000)
+                imu = [(r.timestamp, *r.values[:4]) for r in self.sub.drain()] if self.sub is not None else []
+                dets = []
+                while self._dets:
+                    dets.append(self._dets.popleft())
+                self._send(("data", imu, [(t0, self.drive.turns)], dets))
+                self.error = None
+            except (OSError, EOFError, ValueError) as e:
+                if self._run and self.proc.poll() is not None:
+                    log.error("track map worker exited (%s): restarting", self.proc.returncode)
+                    self.restarts += 1
+                    self._start()
+                elif self._run:
+                    self.error = str(e)
+                    time.sleep(0.1)
+            except Exception as e:  # noqa: BLE001 - keep feeding
+                if self.error is None:
+                    log.exception("track map feeder: %s", e)
+                self.error = "%s: %s" % (type(e).__name__, str(e)[:160])
+            time.sleep(max(0.0, self.PERIOD_S - (time.monotonic() - t0)))
+
+    def reload_frame(self):
+        self._send(("frame",))
+
+    def reset(self):
+        self._send(("reset",))
+
+    def start_log(self, directory, rid):
+        self._send(("start_log", directory, rid))
+
+    def stop_log(self):
+        """Ends the take's map log -> {"files", "meta"} for the take's _meta.json (None if none)."""
+        while not self.replies.empty():
+            self.replies.get_nowait()
+        try:
+            self._send(("stop_log",))
+            return self.replies.get(timeout=20.0)
+        except (queue.Empty, OSError) as e:
+            log.error("track map: no log from the worker (%s)", e)
+            return None
+
+    def status(self):
+        st = dict(self.st)
+        st.update(age_ms=int((time.monotonic() - self.snap_at) * 1000) if self.snap_at else None,
+                  worker_restarts=self.restarts, error=self.error or st.get("error"))
+        return st
+
+    def close(self):
+        self._run = False
+        try:
+            self._send(("quit",))
+            self.proc.wait(5.0)
+        except Exception:  # noqa: BLE001
+            self.proc.kill()
+
+
 # ---------------------------------------------------------------- telemetry
 class Telemetry:
     """Samples every subsystem at TELEMETRY_HZ into .data (a JSON-able dict)."""
 
-    def __init__(self, drive, camera, control, vision, imu):
-        self.drive, self.camera, self.control, self.vision, self.imu = drive, camera, control, vision, imu
+    def __init__(self, drive, camera, vision, imu, trackmap):
+        self.drive, self.camera, self.vision, self.imu = drive, camera, vision, imu
+        self.trackmap = trackmap
         self.power = BoardPower()
         self.battery = BatteryMonitor()
         self.hailo = self._hailo_info()
@@ -647,19 +962,22 @@ class Telemetry:
             t0 = time.monotonic()
             try:
                 ps = self.power.sample()
+                batt = round(self.battery.read(samples=8).battery_volts, 3)
+                self.drive.send_health(batt, ps.temp_c)       # for the drive server's health lines
                 self.data = {
                     "time": time.time(),
                     "cpu": {"temp_c": ps.temp_c, "arm_freq_mhz": ps.arm_freq_mhz,
                             "throttled_hex": ps.throttled_hex, "util": self._cpu_util()},
                     "power": {"total_w": ps.total_w, "ext5v_v": ps.ext5v_v},
-                    "battery_v": round(self.battery.read(samples=8).battery_volts, 3),
+                    "battery_v": batt,
                     "drive": self.drive.status(),
                     "camera": self.camera.status(),
                     "wifi": self._wifi(),
                     "hailo": self.hailo,
-                    "control": self.control.status(),
+                    "control": self.drive.control_status(),
                     "vision": self.vision.status(),
                     "imu": self._imu_status(),
+                    "trackmap": self.trackmap.status(),
                 }
             except Exception as e:  # noqa: BLE001 - keep sampling after a transient failure
                 log.exception("telemetry: %s", e)
@@ -671,60 +989,8 @@ class Telemetry:
         except Exception as e:  # noqa: BLE001 - an IMU hiccup must not blank the other telemetry
             return {"up": False, "error": str(e).splitlines()[0][:200], "frame": self.imu.frame.status()}
 
-    def health_line(self):
-        """Compact health for the tcp link."""
-        d = self.data.get("drive", {})
-        h = {"h": 1, "v": self.data.get("battery_v"), "temp": self.data.get("cpu", {}).get("temp_c"),
-             "rps": d.get("rps"), "us": d.get("pulse_us"), "st": d.get("steer"),
-             "act": self.control.active, "stop": self.control.stopped, "lk": self.control.link_ages_ms()}
-        return json.dumps(h, separators=(",", ":")) + "\n"
-
     def close(self):
         self._run = False
-
-
-# ---------------------------------------------------------------- tcp command link
-def serve_lines(conn, link, control, telem):
-    """Blocking: read {"t","s"} lines from conn, write health at HEALTH_HZ, until it drops."""
-    conn.settimeout(0.2)
-    buf, next_health = b"", time.monotonic()
-    try:
-        while True:
-            try:
-                chunk = conn.recv(4096)
-                if not chunk:
-                    break
-                buf += chunk
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    if line.strip():
-                        try:
-                            m = json.loads(line)
-                            control.command(link, m.get("t", 0.0), m.get("s", 0.0))
-                        except (ValueError, TypeError):
-                            pass
-            except socket.timeout:
-                pass
-            if time.monotonic() >= next_health:
-                next_health += 1.0 / HEALTH_HZ
-                conn.sendall(telem.health_line().encode())
-    except OSError as e:
-        log.info("%s link closed: %s", link, e)
-    finally:
-        conn.close()
-
-
-def tcp_server(control, telem):
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("", TCP_PORT))
-    srv.listen(2)
-    log.info("tcp control link on :%d", TCP_PORT)
-    while True:
-        conn, addr = srv.accept()
-        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        log.info("tcp client %s", addr)
-        threading.Thread(target=serve_lines, args=(conn, "tcp", control, telem), daemon=True).start()
 
 
 # ---------------------------------------------------------------- http / websocket
@@ -796,22 +1062,70 @@ async def api_recording_download(request):
 
 
 async def stream(request):
-    """MJPEG: one multipart chunk per camera frame."""
-    out = request.app["camera"].out
+    """MJPEG of the preview frames (no boxes; the page uses /ws/video). ?w=480|640|960"""
+    pv, key = request.app["preview"], request.query.get("w", PREVIEW_DEFAULT)
+    key = key if key in PREVIEW_SIZES else PREVIEW_DEFAULT
     resp = web.StreamResponse(headers={"Content-Type": "multipart/x-mixed-replace; boundary=frame",
                                        "Cache-Control": "no-cache"})
     await resp.prepare(request)
-    loop, seen = asyncio.get_running_loop(), -1
+    sub, seen = pv.subscribe(asyncio.get_running_loop()), -1
     try:
         while True:
-            frame, seen = await loop.run_in_executor(None, out.wait, seen)
-            if frame is None:
+            pv.want(key)
+            await sub[1].wait()
+            sub[1].clear()
+            f = pv.latest(key)
+            if f is None or f[0] == seen:
                 continue
-            await resp.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n" % len(frame))
-            await resp.write(frame + b"\r\n")
+            seen = f[0]
+            await resp.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n" % len(f[2]))
+            await resp.write(f[2] + b"\r\n")
     except (ConnectionResetError, asyncio.CancelledError):
         pass
+    finally:
+        pv.unsubscribe(sub)
     return resp
+
+
+async def ws_video(request):
+    """Preview for the page: binary messages [u32 header length][header JSON][JPEG]; the header has
+    the boxes of exactly this frame (+ seq, sensor ts, age). ?w=480|640|960. Flow control: at most
+    VIDEO_CREDITS frames unacknowledged (the page sends "a" after drawing one), and always the newest
+    frame: on a slow link the frame rate drops instead of the delay growing."""
+    pv, key = request.app["preview"], request.query.get("w", PREVIEW_DEFAULT)
+    key = key if key in PREVIEW_SIZES else PREVIEW_DEFAULT
+    ws = web.WebSocketResponse(heartbeat=5)
+    await ws.prepare(request)
+    sub = pv.subscribe(asyncio.get_running_loop())
+    state = {"credits": VIDEO_CREDITS}
+
+    async def acks():
+        async for msg in ws:
+            if msg.type == web.WSMsgType.TEXT:
+                state["credits"] = min(VIDEO_CREDITS, state["credits"] + 1)
+                sub[1].set()
+    reader = asyncio.ensure_future(acks())
+    seen = -1
+    try:
+        while not ws.closed:
+            pv.want(key)
+            try:
+                await asyncio.wait_for(sub[1].wait(), 1.0)
+            except asyncio.TimeoutError:
+                continue
+            sub[1].clear()
+            f = pv.latest(key)
+            if f is None or f[0] == seen or state["credits"] <= 0:
+                continue
+            seen = f[0]
+            state["credits"] -= 1
+            await ws.send_bytes(f[1])
+    except (ConnectionResetError, asyncio.CancelledError):
+        pass
+    finally:
+        reader.cancel()
+        pv.unsubscribe(sub)
+    return ws
 
 
 async def api_vision(request):
@@ -858,6 +1172,7 @@ async def api_imu_level(request):
         frame = await asyncio.get_running_loop().run_in_executor(None, request.app["imu"].level)
     except RuntimeError as e:
         return web.json_response({"error": str(e)}, status=409)
+    request.app["trackmap"].reload_frame()
     return web.json_response({"frame": frame})
 
 
@@ -888,27 +1203,52 @@ async def ws_imu(request):
     return ws
 
 
-async def websocket(request):
-    """Telemetry push at TELEMETRY_HZ; incoming messages are drive commands."""
+async def api_map(request):
+    """{"reset": true} clears the map (refused while recording: the take's map would be cut)."""
+    m = await request.json()
+    svc = request.app["trackmap"]
+    if m.get("reset"):
+        if request.app["camera"].rec:
+            return web.json_response({"error": "recording: the map resets when a take starts"}, status=409)
+        svc.reset()
+    return web.json_response(svc.status())
+
+
+async def ws_map(request):
+    """Track map snapshots as the worker serialised them (vision/map_worker.py), each one once."""
     ws = web.WebSocketResponse(heartbeat=5)
     await ws.prepare(request)
-    control, telem = request.app["control"], request.app["telem"]
+    svc = request.app["trackmap"]
+    reader = asyncio.ensure_future(_read_until_closed(ws))
+    last = None
+    try:
+        while not ws.closed:
+            js = svc.snap_json
+            if js is not last:
+                last = js
+                await ws.send_str(js)
+            await asyncio.sleep(1.0 / (2 * MAP_PUSH_HZ))
+    except (ConnectionResetError, asyncio.CancelledError):
+        pass
+    finally:
+        reader.cancel()
+    return ws
 
-    async def push():
+
+async def websocket(request):
+    """Telemetry push at TELEMETRY_HZ. (Drive commands go to drive_server.py, :8082/ws/ctl.)"""
+    ws = web.WebSocketResponse(heartbeat=5)
+    await ws.prepare(request)
+    telem = request.app["telem"]
+    reader = asyncio.ensure_future(_read_until_closed(ws))
+    try:
         while not ws.closed:
             await ws.send_json(telem.data)
             await asyncio.sleep(1.0 / TELEMETRY_HZ)
-    task = asyncio.ensure_future(push())
-    try:
-        async for msg in ws:
-            if msg.type == web.WSMsgType.TEXT:
-                try:
-                    m = json.loads(msg.data)
-                    control.command("ws", m.get("t", 0.0), m.get("s", 0.0))
-                except (ValueError, TypeError):
-                    pass
+    except (ConnectionResetError, asyncio.CancelledError):
+        pass
     finally:
-        task.cancel()
+        reader.cancel()
     return ws
 
 
@@ -922,25 +1262,33 @@ async def serve(app):
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    drive = Drive(max_throttle=MAX_THROTTLE)
+    drive = DriveLink()                      # drive_server.py: throttle / steering / encoder + command links
     camera = CameraStream()
-    control = Control(drive)
+    preview = Preview(camera)
+    camera.preview = preview
     vision = Vision(camera)
+    vision.preview = preview
     imu = Imu()
-    telem = Telemetry(drive, camera, control, vision, imu)
-    threading.Thread(target=tcp_server, args=(control, telem), daemon=True).start()
+    trackmap = MapProcess(imu, drive)
+    vision.on_boxes = trackmap.on_boxes
+    camera.trackmap = trackmap
+    telem = Telemetry(drive, camera, vision, imu, trackmap)
 
     app = web.Application()
-    app.update(drive=drive, camera=camera, control=control, telem=telem, vision=vision, imu=imu)
+    app.update(drive=drive, camera=camera, control=drive, telem=telem, vision=vision, imu=imu, trackmap=trackmap,
+               preview=preview)
     app.add_routes([
         web.get("/", index),
         web.get("/stream.mjpg", stream),
+        web.get("/ws/video", ws_video),
         web.get("/ws", websocket),
         web.get("/ws/det", ws_detections),
         web.post("/api/vision", api_vision),
         web.get("/ws/imu", ws_imu),
         web.post("/api/imu/level", api_imu_level),
         web.post("/api/imu/zero_yaw", api_imu_zero_yaw),
+        web.get("/ws/map", ws_map),
+        web.post("/api/map", api_map),
         web.get("/api/telemetry", api_telemetry),
         web.post("/api/mode", api_mode),
         web.post("/api/record", api_record),
@@ -949,13 +1297,16 @@ def main():
         web.get("/api/recordings/{name}/download", api_recording_download),
         web.static("/recordings", REC_DIR),
     ])
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))   # pkill / dashboard stop: finalise a take first
     try:
         asyncio.run(serve(app))
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, SystemExit):
         pass
     finally:
-        control.close()
         telem.close()
+        preview.close()
+        camera.stop_recording()  # a running take is finalised first (its map log included)
+        trackmap.close()
         vision.close()
         imu.close()
         camera.close()
