@@ -79,13 +79,25 @@ POSE_COLUMNS = ["t_ns", "x_mm", "y_mm", "yaw_deg", "odo_x_mm", "odo_y_mm", "odo_
 LM_COLUMNS = ["t_ns", "id", "state", "side", "x_mm", "y_mm", "sigma_mm", "hits", "misses", "first_ns", "last_ns",
               "car_x_mm", "car_y_mm"]
 STATE_NAME = {0: "tentative", 1: "confirmed", 2: "archived"}
+PLAN_COLUMNS = ["t_ns", "mode", "why", "steer", "v_target_mm_s", "known_mm", "confidence", "n_left", "n_right",
+                "n_confirmed", "n_tentative", "speed_mm_s", "input_age_ms", "sent", "yaw_rate_dps", "k_cmd",
+                "e_mm", "psi_deg", "k_ff", "frames_skipped",
+                # 2026-10-16: which limit set the speed, remembered apples, where pure pursuit / the target point is
+                "lim_curve", "lim_known", "lim_conf", "n_virtual", "virtual_used", "target_x", "target_y",
+                "lookahead_mm"]
+VOTE_MAX = 8.0          # cap of an apple's side memory (votes: 20 per second of planning, whatever the plan rate)
+PASSED_VOTES = 6.0      # an apple the car drove past on one side counts this much for that side
 SIDE_NAME = {1: "L", -1: "R", 0: ""}
 
 
 @dataclass
 class Params:
     history_s: float = 10.0            # pose / IMU history kept for late detections
-    attitude: str = "highpass"         # "highpass": suspension motion only; "absolute": vs config/imu.json level;
+    imu_lag_s: float = 0.0175          # the BNO085 game_rv describes the car this long before its timestamp: replays
+                                       # of 144236 / 144507 (2026-10-11, corners at 110-145 deg/s) created half as many
+                                       # duplicate apples with the IMU shifted 15-20 ms earlier (0: 1264 / 2951 new
+                                       # apples, 17.5 ms: ~700 / ~1460; 40 ms: worse again)
+    attitude: str = "highpass"        # "highpass": suspension motion only; "absolute": vs config/imu.json level;
                                        # "static": ignore IMU roll / pitch (comparison / uncalibrated IMU)
     level_tau_s: float = 2.0           # high-pass time constant (slower changes = ground slope)
     max_speed_mm_s: float = 8000.0     # encoder steps faster than this are glitches
@@ -94,10 +106,22 @@ class Params:
     sigma_px_rad: float = 0.0025       # box-edge jitter as an angle (~1.5 px of the 960x540 lores)
     sigma_pitch_rad: float = 0.006     # uncorrected camera pitch (suspension, paving) ~0.35 deg
     sigma_az_rad: float = 0.004        # sideways angular noise
+    det_every: int = 1                 # map every n-th detection frame only (test: CPU vs map quality)
     min_range_mm: float = 300.0
     max_use_range_mm: float = 3500.0   # boxes beyond: not used
-    max_init_range_mm: float = 3000.0  # new apples only start within this range
-    edge_margin: float = 0.004         # boxes touching the frame edge (cut apples) are not used
+    max_init_range_mm: float = 2500.0  # new apples only start within this range: 1 deg of camera pitch error moves an
+                                       # apple ~0.8 m at 3 m but ~0.36 m at 2 m (far rows came out as clouds 1-2 m too
+                                       # close after hard acceleration); 3000 -> 2500 mm: planner turn direction 85 -> 91 %
+                                       # on 144236, wrong-side boundaries 11 -> 9 % on 144507
+    edge_margin: float = 0.004         # boxes touching the frame edge (cut apples) are not used ...
+    edge_fit: bool = True              # ... except a box cut by the left / right edge only: its bottom (the range) is
+                                       # intact and an apple is round, so its centre = the uncut side -/+ half the
+                                       # box height (as a width). Such observations keep / refine apples the map
+                                       # already has (the inner apples of a corner leave the view sideways: 2026-10-15
+                                       # 145819 lost 6 confirmed apples in 0.4 s at the turn-in) but never start
+                                       # apples nor correct the pose, with edge_fit_sigma x the noise
+    edge_fit_min_visible: float = 0.4  # at least this fraction of the reconstructed width in the image
+    edge_fit_sigma: float = 2.0
     # association / lifecycle
     gate_chi2: float = 9.21            # 99 % for 2 dof
     gate_max_mm: float = 400.0
@@ -105,8 +129,13 @@ class Params:
     confirm_hits: int = 5
     tentative_timeout_s: float = 0.4
     tentative_max_misses: int = 4
-    confirmed_max_misses: int = 40     # consecutive frames in view without a detection -> gone
+    confirmed_max_misses: int = 40     # consecutive frames in view without a detection -> gone ...
+    confirmed_min_unseen_s: float = 0.6  # ... and not detected for this long (40 frames = 0.33 s at 120 fps: in a
+                                       # 150 deg/s turn-in the apples at the side of the view went before the path
+                                       # reached them, 2026-10-15)
     miss_range_mm: tuple = (450.0, 2200.0)
+    miss_edge_margin: float = 0.08     # a miss only counts this far inside the image (at 0.03 the apples leaving the
+                                       # view sideways in a turn, or cut by its edge, counted as missed)
     # rolling window: the map is local and short-lived, so it works on any track from the first
     # metre and never piles up laps (odometry drifts ~0.3-0.5 m per lap; old laps would be ghosts)
     window_s: float = 4.0              # apples not seen for this long are forgotten
@@ -135,6 +164,8 @@ class Params:
     bound_max_gap_mm: float = 1400.0
     bound_max_turn_deg: float = 55.0
     default_width_mm: float = 1000.0
+    bounds_every_s: float = 0.2        # the chained boundaries (track width, logs; the planner makes its own sides)
+                                       # are redone this often: they cost ~2 ms per tick on the Pi
 
 
 def load_params(path=PARAMS_CONFIG):
@@ -273,12 +304,13 @@ class _Buf:
 
 # ---------------------------------------------------------------- landmarks
 class Landmark:
-    __slots__ = ("id", "x", "P", "hits", "misses", "first_t", "last_t", "state", "side", "score")
+    __slots__ = ("id", "x", "P", "hits", "misses", "first_t", "last_t", "state", "side", "score", "votes")
 
     def __init__(self, lid, x, P, t, score):
         self.id, self.x, self.P = lid, np.asarray(x, float), np.asarray(P, float)
         self.hits, self.misses, self.first_t, self.last_t = 1, 0, t, t
         self.state, self.side, self.score = 0, 0, score
+        self.votes = 0.0                # side memory from the planner: + left / - right, |votes| <= VOTE_MAX
 
     @property
     def sigma(self):
@@ -328,10 +360,15 @@ class TrackMapper:
         self.width = self.p.default_width_mm
         self.bounds = None
         self.local_apples = np.zeros((0, 2))
+        self.local_ids = []             # landmark id of each local_apples row
+        self.local_votes = np.zeros(0)  # side score of each row: planner votes + PASSED_VOTES if the car passed it
+        self.display_bounds = None      # {"left", "right"} car frame, set by the planner: drawn instead of self.bounds
         self.last_frame = None          # last processed detection frame (for the UI)
         self._last_pose_log = -1.0
+        self._last_tick_log = -1.0
+        self._bounds_t = -1.0
         self.stats = {"frames": 0, "boxes": 0, "used": 0, "matched": 0, "corrected": 0, "created": 0,
-                      "confirmed": 0, "dropped": 0, "forgotten": 0, "enc_glitches": 0, "no_odometry": 0,
+                      "confirmed": 0, "dropped": 0, "forgotten": 0, "enc_glitches": 0, "no_odometry": 0, "skipped": 0,
                       "resid_mm": None}
         self._resid = []
         self.match_d = deque(maxlen=200000)   # (observation range, distance to its apple before the update)
@@ -339,6 +376,7 @@ class TrackMapper:
     # ---- inputs ------------------------------------------------------------------------------
     def add_imu(self, t, roll, pitch, yaw):
         """Car attitude (CarFrame.attitude: deg, roll right-down +, pitch nose-up +, yaw left +)."""
+        t -= self.p.imu_lag_s
         yr = math.radians(yaw)
         prev = self._imu_prev
         if prev is None:
@@ -359,12 +397,19 @@ class TrackMapper:
     def add_detections(self, t_mid, boxes, crop, seq=None, sensor_ts=None):
         """boxes: [(x1, y1, x2, y2, score, cls)] normalised 0..1 of the frame showing `crop`
         (ScalerCrop, sensor px). t_mid: exposure time of the frame (s)."""
+        self._n_det_in = getattr(self, "_n_det_in", 0) + 1
+        if self.p.det_every > 1 and self._n_det_in % self.p.det_every:
+            return
         self._dets.append({"t": t_mid, "boxes": list(boxes), "crop": tuple(crop), "seq": seq, "sensor_ts": sensor_ts})
 
     # ---- processing --------------------------------------------------------------------------
-    def step(self):
+    def step(self, budget_s=None, max_queue_s=None):
         """Integrate odometry as far as the IMU covers it, then every queued detection frame the
-        odometry has reached. Returns the number of frames processed."""
+        odometry has reached. Returns the number of frames processed.
+        budget_s: stop after this much CPU time (the rest stays queued); max_queue_s: frames this much
+        older than the newest queued one are skipped (the map worker sheds load instead of falling behind:
+        2026-10-11 its plans were up to 2 s late and stopped reaching the car)."""
+        t_start = time.perf_counter()
         imu_t = self.imu.last_t
         n = 0
         if imu_t is not None:
@@ -389,8 +434,14 @@ class TrackMapper:
                 self.stats["no_odometry"] += 1
                 self._log_frame(f, None)
                 continue
+            if max_queue_s is not None and self._dets and self._dets[-1]["t"] - f["t"] > max_queue_s:
+                self.stats["skipped"] += 1
+                self._log_frame(f, None, "skipped")
+                continue
             self._process(f)
             n += 1
+            if budget_s is not None and time.perf_counter() - t_start > budget_s:
+                break
         if odo_t is not None:
             keep = odo_t - self.p.history_s
             self.odo.trim(keep)
@@ -471,9 +522,10 @@ class TrackMapper:
         return {"R": R, "h": h, "d_roll": dr, "d_pitch": dp, "roll": roll, "pitch": pitch}
 
     # ---- geometry ----------------------------------------------------------------------------
-    def floor_points(self, u, v, R, h):
-        """Sensor pixels -> floor points (N, 2) in the camera floor frame (NaN: above the horizon)."""
-        x, y = self.cam.undistort(u, v)
+    def floor_points(self, u, v, R, h, rays=None):
+        """Sensor pixels -> floor points (N, 2) in the camera floor frame (NaN: above the horizon).
+        rays: their cam.undistort(u, v) if already known (it does not depend on the pose)."""
+        x, y = self.cam.undistort(u, v) if rays is None else rays
         d = np.stack([x, y, np.ones_like(x)], -1) @ R.T
         with np.errstate(divide="ignore", invalid="ignore"):
             t = -h / d[:, 2]
@@ -492,12 +544,15 @@ class TrackMapper:
         nx, ny = self.cam.from_sensor(u, v, crop)
         return np.stack([nx, ny], -1)
 
-    def _obs_cov(self, xy, h):
+    def _obs_cov(self, xy, h, scale=None):
+        """scale: per-observation noise factor (edge_fit boxes)."""
         d = np.hypot(xy[:, 0], xy[:, 1])
         p = self.p
         sa = math.hypot(p.sigma_px_rad, p.sigma_pitch_rad)
         sr = np.hypot(p.sigma_base_mm, (d * d + h * h) / h * sa)
         st = np.hypot(p.sigma_base_mm, d * p.sigma_az_rad)
+        if scale is not None:
+            sr, st = sr * scale, st * scale
         u = xy / np.maximum(d, 1.0)[:, None]
         uu = u[:, :, None] * u[:, None, :]
         S = sr[:, None, None] ** 2 * uu + st[:, None, None] ** 2 * (np.eye(2) - uu)
@@ -514,22 +569,40 @@ class TrackMapper:
         boxes = f["boxes"]
         status = ["ok"] * len(boxes)
         m = p.edge_margin
-        use = []
-        for i, b in enumerate(boxes):
-            if b[3] >= 1 - m or b[0] <= m or b[2] >= 1 - m:
-                status[i] = "edge"
-            else:
-                use.append(i)
         crop = f["crop"]
+        aspect = crop[3] / crop[2] if crop and crop[2] else 9.0 / 16.0      # image height / width
+        use, xc, fit = [], [], []
+        for i, b in enumerate(boxes):
+            cut_l, cut_r = b[0] <= m, b[2] >= 1 - m
+            if b[3] >= 1 - m or (cut_l and cut_r):
+                status[i] = "edge"
+                continue
+            if not (cut_l or cut_r):
+                use.append(i)
+                xc.append((b[0] + b[2]) / 2)
+                fit.append(False)
+                continue
+            w = (b[3] - b[1]) * aspect                  # a round apple: as wide as high (in pixels)
+            if (not p.edge_fit or b[1] <= m or w <= 0          # cut at the top too: no height, no width
+                    or (b[2] - b[0]) < p.edge_fit_min_visible * w):
+                status[i] = "edge"
+                continue
+            status[i] = "edge_fit"
+            use.append(i)
+            xc.append(b[2] - w / 2 if cut_l else b[0] + w / 2)
+            fit.append(True)
+        fit = np.array(fit, bool)
         if use:
             bx = np.array([boxes[i][:4] for i in use], float)
-            u, v = self.cam.to_sensor((bx[:, 0] + bx[:, 2]) / 2, bx[:, 3], crop)
+            u, v = self.cam.to_sensor(np.array(xc), bx[:, 3], crop)
         else:
             u = v = np.zeros(0)
 
+        rays = self.cam.undistort(u, v) if len(use) else None
+
         def observe():
             c = self.camera_at(t)
-            xy = self.floor_points(u, v, c["R"], c["h"]) if len(use) else np.zeros((0, 2))
+            xy = self.floor_points(u, v, c["R"], c["h"], rays) if len(use) else np.zeros((0, 2))
             return c, xy
 
         cam, xy = observe()
@@ -541,15 +614,19 @@ class TrackMapper:
         sel = np.nonzero(ok)[0]
         idx = [use[k] for k in sel]                 # box index of each observation
         u, v = u[sel], v[sel]
+        if rays is not None:
+            rays = (rays[0][sel], rays[1][sel])
         xy = xy[sel]
+        fit = fit[sel] if len(fit) else np.zeros(0, bool)
+        scale = np.where(fit, p.edge_fit_sigma, 1.0)
         st["used"] += len(idx)
 
         pose = self.pose(t)
         active = [lm for lm in self.lms if lm.state < 2]
-        matches = self._associate(xy, cam["h"], pose, active)
+        matches = self._associate(xy, cam["h"], pose, active, scale)
 
         corr = np.zeros(3)
-        conf = [(k, j) for k, j in matches if active[j].state == 1]
+        conf = [(k, j) for k, j in matches if active[j].state == 1 and not fit[k]]
         if p.correct and len(conf) >= p.min_matches:
             corr = self._correct(xy, cam["h"], pose, active, conf)
             if corr is not None:
@@ -561,7 +638,7 @@ class TrackMapper:
                 corr = np.zeros(3)
 
         # update / create landmarks with the (corrected) observations
-        S, sr, stt = self._obs_cov(xy, cam["h"]) if len(xy) else (np.zeros((0, 2, 2)), [], [])
+        S, sr, stt = self._obs_cov(xy, cam["h"], scale) if len(xy) else (np.zeros((0, 2, 2)), [], [])
         R2 = _rot2(pose[2])
         w = pose[:2] + xy @ R2.T if len(xy) else np.zeros((0, 2))
         Sw = R2 @ S @ R2.T
@@ -586,7 +663,7 @@ class TrackMapper:
         matched_obs = {k for k, _ in matches}
         pos_cov = self.Pp[:2, :2]
         for k in range(len(xy)):
-            if k in matched_obs or np.hypot(*xy[k]) > p.max_init_range_mm:
+            if k in matched_obs or fit[k] or np.hypot(*xy[k]) > p.max_init_range_mm:
                 continue
             if any(np.hypot(*(lm.x - w[k])) < p.new_min_sep_mm for lm in active):
                 continue
@@ -610,12 +687,12 @@ class TrackMapper:
             self.on_frame(res)
         return res
 
-    def _associate(self, xy, h, pose, active):
+    def _associate(self, xy, h, pose, active, scale=None):
         """Greedy nearest-first matching under a Mahalanobis gate -> [(obs k, landmark j)]."""
         if not len(xy) or not active:
             return []
         p = self.p
-        S, _, _ = self._obs_cov(xy, h)
+        S, _, _ = self._obs_cov(xy, h, scale)
         R2 = _rot2(pose[2])
         w = pose[:2] + xy @ R2.T
         Sw = R2 @ S @ R2.T
@@ -655,33 +732,32 @@ class TrackMapper:
             prior[3, 3] = self.pb_var
         prior_inv = np.linalg.inv(prior + np.eye(npar) * 1e-9)
 
+        def terms(pp):
+            """Per pair (vectorised): H (n, 2, npar), weight (n, 2, 2), apple - observation (n, 2)."""
+            K = np.array([k for k, _ in pp])
+            X = np.array([active[j].x for _, j in pp])
+            P = np.array([active[j].P for _, j in pp])
+            H = np.zeros((len(pp), 2, npar))
+            H[:, 0, 0] = H[:, 1, 1] = 1.0
+            H[:, :, 2] = (w[K] - pose[:2]) @ _J.T
+            if npar == 4:                                    # camera pitch down + -> point comes closer
+                d = np.hypot(xy[K, 0], xy[K, 1])
+                H[:, :, 3] = (xy[K] / d[:, None]) @ R2.T * (-(d * d + h * h) / h * math.pi / 180.0)[:, None]
+            return H, _inv2(Sw[K] + P), X - w[K]
+
         def solve(pp):
-            A, b = prior_inv.copy(), np.zeros(npar)
-            for k, j in pp:
-                lm = active[j]
-                H = np.zeros((2, npar))
-                H[:, :2] = np.eye(2)
-                H[:, 2] = _J @ (w[k] - pose[:2])
-                if npar == 4:                                # camera pitch down + -> point comes closer
-                    d = math.hypot(*xy[k])
-                    H[:, 3] = R2 @ (xy[k] / d) * (-(d * d + h * h) / h * math.pi / 180.0)
-                Wk = _inv2(Sw[k] + lm.P)
-                A += H.T @ Wk @ H
-                b += H.T @ Wk @ (lm.x - w[k])
+            H, W, r = terms(pp)
+            HtW = np.einsum("nia,nij->naj", H, W)
+            A = prior_inv + np.einsum("naj,njb->ab", HtW, H)
+            b = np.einsum("naj,nj->a", HtW, r)
             cov = np.linalg.inv(A)
             return cov @ b, cov
 
         def chi2(pp, dlt):
-            out = []
-            for k, j in pp:
-                lm = active[j]
-                pred = w[k] + dlt[:2] + dlt[2] * (_J @ (w[k] - pose[:2]))
-                if npar == 4:
-                    d = math.hypot(*xy[k])
-                    pred = pred + R2 @ (xy[k] / d) * (-(d * d + h * h) / h * math.pi / 180.0) * dlt[3]
-                r = lm.x - pred
-                out.append((float(r @ _inv2(Sw[k] + lm.P) @ r), float(np.hypot(*r))))
-            return out
+            H, W, r = terms(pp)
+            res = r - H @ dlt                                # apple - predicted observation
+            x2 = np.einsum("ni,nij,nj->n", res, W, res)
+            return list(zip(x2.tolist(), np.hypot(res[:, 0], res[:, 1]).tolist()))
 
         dlt, cov = solve(pairs)
         c2 = chi2(pairs, dlt)
@@ -725,7 +801,8 @@ class TrackMapper:
         d = np.hypot(rel[:, 0], rel[:, 1])
         uv = self.project(rel, cam["R"], cam["h"], crop)
         lo, hi = self.p.miss_range_mm
-        inview = (d > lo) & (d < hi) & (uv[:, 0] > 0.03) & (uv[:, 0] < 0.97) & (uv[:, 1] > 0.03) & (uv[:, 1] < 0.97)
+        e = self.p.miss_edge_margin
+        inview = (d > lo) & (d < hi) & (uv[:, 0] > e) & (uv[:, 0] < 1 - e) & (uv[:, 1] > 0.03) & (uv[:, 1] < 0.97)
         for lm, iv in zip(cand, inview):
             if iv:
                 lm.misses += 1
@@ -741,7 +818,7 @@ class TrackMapper:
                 if lm.misses >= p.tentative_max_misses or t - lm.last_t > p.tentative_timeout_s:
                     continue
             else:
-                if lm.misses >= p.confirmed_max_misses and t - lm.last_t > 0.3:
+                if lm.misses >= p.confirmed_max_misses and t - lm.last_t > p.confirmed_min_unseen_s:
                     self.stats["dropped"] += 1
                     continue
                 if (t - lm.last_t > p.window_s
@@ -772,8 +849,13 @@ class TrackMapper:
         else:
             rel = np.zeros((0, 2))
         self.local_apples = rel                  # confirmed apples in the car frame (vision/planner.py)
-        self.bounds = self._boundaries(conf, rel, pose)
-        if self.log is not None:
+        self.local_ids = [lm.id for lm in conf]
+        self.local_votes = np.array([lm.votes + PASSED_VOTES * lm.side for lm in conf], float)
+        if self.bounds is None or not (0.0 <= t - self._bounds_t < self.p.bounds_every_s):
+            self.bounds = self._boundaries(conf, rel, pose)
+            self._bounds_t = t
+        if self.log is not None and t - self._last_tick_log >= 0.095:     # logs at 10 Hz however often tick() runs
+            self._last_tick_log = t
             self._log_tick(t, pose, R2)
         return self.bounds
 
@@ -850,6 +932,17 @@ class TrackMapper:
         return {"left": left, "right": right, "center": center, "ids_left": ids[1], "ids_right": ids[-1],
                 "width": self.width, "left_w": to_w(left), "right_w": to_w(right), "center_w": to_w(center)}
 
+    def vote_sides(self, left_ids, right_ids, weight=1.0):
+        """The planner's left / right assignment of this tick (vision/planner.py plan_with_map): each apple
+        remembers it, so the next plans keep it on the same side when the other row is out of view or
+        the geometry is ambiguous (a corner seen head-on)."""
+        lset, rset = set(left_ids), set(right_ids)
+        for lm in self.lms:
+            if lm.id in lset:
+                lm.votes = min(VOTE_MAX, lm.votes + weight)
+            elif lm.id in rset:
+                lm.votes = max(-VOTE_MAX, lm.votes - weight)
+
     # ---- outputs ------------------------------------------------------------------------------
     def snapshot(self, with_proj=True):
         """JSON-able state for the dashboard (world mm, rounded). Small by construction: the rolling
@@ -860,7 +953,7 @@ class TrackMapper:
             return {"map_id": self.map_id, "up": False, "stats": self.stats}
         o = self.odo_pose()
         R = lambda v: int(round(v))   # noqa: E731
-        lms = [[lm.id, R(lm.x[0]), R(lm.x[1]), lm.state, lm.side, R(lm.sigma), lm.hits] for lm in self.lms]
+        lms = [[lm.id, R(lm.x[0]), R(lm.x[1]), lm.state, _side(lm), R(lm.sigma), lm.hits] for lm in self.lms]
         f = self.last_frame
         det = []
         if f is not None and t is not None and t - f["t"] < 0.3:
@@ -899,8 +992,8 @@ class TrackMapper:
                 uv = self.project(rel[ok], cam["R"], cam["h"], crop)
                 for lm, (x, y) in zip([lm for lm, k in zip(near, ok) if k], uv):
                     if not np.isnan(x):
-                        out["lms"].append([round(float(x), 4), round(float(y), 4), lm.id, lm.side])
-        b = self.bounds or {}
+                        out["lms"].append([round(float(x), 4), round(float(y), 4), lm.id, _side(lm)])
+        b = self.display_bounds or self.bounds or {}
         for key in ("left", "right"):
             pl = [q for q in b.get(key, []) if q[0] > 250]
             if len(pl) >= 2:
@@ -932,7 +1025,7 @@ class TrackMapper:
         }
 
     # ---- recording ----------------------------------------------------------------------------
-    def _log_frame(self, f, res):
+    def _log_frame(self, f, res, why="no_odometry"):
         if self.log is None:
             return
         crop = list(f["crop"]) if f["crop"] else [""] * 4
@@ -941,7 +1034,7 @@ class TrackMapper:
         if res is None:
             for i, b in enumerate(f["boxes"] or [None]):
                 raw = [i, *("%.5f" % x for x in b[:4]), "%.4f" % b[4], b[5]] if b else [-1] + [""] * 6
-                rows.append(base + raw + ["no_odometry"] + [""] * (len(DET_MAP_COLUMNS) - 1))
+                rows.append(base + raw + [why] + [""] * (len(DET_MAP_COLUMNS) - 1))
             self.log.put("det", rows)
             return
         cam, pose, corr = res["cam"], res["pose"], res["corr"]
@@ -960,7 +1053,7 @@ class TrackMapper:
                 rows.append(base + raw + [res["status"][i]] + [""] * 8 + frame_cols)
                 continue
             lm = res["lm"].get(k)
-            rows.append(base + raw + ["used", "%.1f" % res["xy"][k][0], "%.1f" % res["xy"][k][1], "%.1f" % res["sr"][k],
+            rows.append(base + raw + ["edge_fit" if res["status"][i] == "edge_fit" else "used", "%.1f" % res["xy"][k][0], "%.1f" % res["xy"][k][1], "%.1f" % res["sr"][k],
                                       "%.1f" % res["st"][k], "%.1f" % res["w"][k][0], "%.1f" % res["w"][k][1],
                                       lm.id if lm else "", STATE_NAME[lm.state] if lm else ""] + frame_cols)
         self.log.put("det", rows)
@@ -997,6 +1090,13 @@ class TrackMapper:
                                "ids_right": b.get("ids_right", [])})
 
 
+def _side(lm):
+    """Side to show for an apple: passed by the car, else the planner's memory once it is fairly sure."""
+    if lm.side:
+        return lm.side
+    return 1 if lm.votes >= 2 else -1 if lm.votes <= -2 else 0
+
+
 def _nearest_on_polyline(q, P):
     if len(P) == 1:
         return P[0]
@@ -1018,6 +1118,11 @@ class MapLog:
         <id>_landmarks.csv  every active apple (estimated position, sigma, state, side) at 10 Hz
         <id>_track.jsonl    left / right boundary + centre line in the car frame at 10 Hz
         <id>_map.json       the final map at stop (apples, path, parameters, statistics)
+        <id>_plan.csv       every planner step as it ran live (50 Hz, vision/map_worker.py): mode, why there is
+                            no path, steering, target speed and the limit that set it, apples per side, input age,
+                            the steering terms, the target point
+        <id>_planpath.jsonl what the planner saw and wanted, 10 Hz, car frame mm: the path (every 3rd point), the
+                            apples it used on each side (remembered ones included), the target point, mode, steer
     """
 
     def __init__(self, directory, rid):
@@ -1025,14 +1130,18 @@ class MapLog:
         p = lambda s: os.path.join(directory, rid + s)   # noqa: E731
         self.paths = {"det": p("_det.csv"), "pose": p("_pose.csv"), "landmarks": p("_landmarks.csv"),
                       "track": p("_track.jsonl"), "map": p("_map.json")}
-        self.f = {k: open(self.paths[k], "w", newline="") for k in ("det", "pose", "landmarks", "track")}
-        self.w = {k: csv.writer(self.f[k]) for k in ("det", "pose", "landmarks")}
+        self.paths["plan"] = p("_plan.csv")
+        self.paths["planpath"] = p("_planpath.jsonl")
+        self.f = {k: open(self.paths[k], "w", newline="") for k in ("det", "pose", "landmarks", "track", "plan",
+                                                                    "planpath")}
+        self.w = {k: csv.writer(self.f[k]) for k in ("det", "pose", "landmarks", "plan")}
+        self.w["plan"].writerow(PLAN_COLUMNS)
         self.w["det"].writerow(DET_RAW_COLUMNS + DET_MAP_COLUMNS)
         self.w["pose"].writerow(POSE_COLUMNS)
         self.w["landmarks"].writerow(LM_COLUMNS)
         self.q = queue.Queue(maxsize=100000)
         self.dropped = 0
-        self.rows = {"det": 0, "pose": 0, "landmarks": 0, "track": 0}
+        self.rows = {"det": 0, "pose": 0, "landmarks": 0, "track": 0, "plan": 0, "planpath": 0}
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -1053,9 +1162,9 @@ class MapLog:
                 break
             if item:
                 kind, payload = item
-                if kind == "track":
-                    self.f["track"].write(json.dumps(payload, separators=(",", ":")) + "\n")
-                    self.rows["track"] += 1
+                if kind in ("track", "planpath"):
+                    self.f[kind].write(json.dumps(payload, separators=(",", ":")) + "\n")
+                    self.rows[kind] += 1
                 else:
                     self.w[kind].writerows(payload)
                     self.rows[kind] += len(payload)

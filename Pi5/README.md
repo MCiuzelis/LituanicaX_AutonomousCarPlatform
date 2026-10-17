@@ -59,12 +59,13 @@ track map in it the detector fell to 20-40 fps and keyboard commands stalled for
 |---|---|---|
 | `dashboard.py` | camera, Hailo detection, preview, recording, telemetry, web page | |
 | `drive_server.py` (started by the dashboard) | ESC + steering + motor encoder (500 Hz), the command links, dead-man; network thread SCHED_FIFO | commands must never wait for anything else |
-| `vision/map_worker.py` (started by the dashboard) | track map + planner (shadow) | ~2.5-5 ms of Python per detection frame |
+| `vision/map_worker.py` (started by the dashboard) | track map + planner (20 Hz; plans go to the drive server, driven only when armed) | ~2-3 ms of Python per detection frame + ~6 ms per plan; skips frames > 80 ms behind |
 
 **Driving**: the page's commands go from a Web Worker (unaffected by drawing on the page) straight to
 `ws://<pi>:8082/ws/ctl`: `{"t": -1..1, "s": -1..1, "n": seq}` on every key change and 20x/s; the server
 acks each one at once (`{"a": seq}`), and the Links panel shows the round trip (p50 / p95 / max) and,
 from the server's side, the longest gap between commands and how many arrived > 150 ms late.
+In autonomous mode the page sends `{"arm": true|false, "max": level, "n": seq}` instead (see "Autonomy").
 `car_client.py --host <pi-ip>` on a PC uses the tcp link (:8081, unchanged): `{"t","s"}` lines in, health
 `{"h":1,"v":batt,"temp":..,"rps":..,"us":..,"st":..,"act":..,"lk":..,"stop":..}` out at 5 Hz (also sent
 on the WebSocket). The freshest command wins; an `"auto"` command (autonomy, unix socket
@@ -117,7 +118,7 @@ which camera / mode / take it is from; **delete** removes the folder (video + IM
 | `<id>.mp4` | H.264 (x264 ultrafast, ~0.2 bit/pixel), fragmented mp4 (playable up to the last second after a power cut); tags title = id, comment = camera / mode. Pixels are clean (nothing drawn in) |
 | `<id>_frames.csv` | **one row per video frame** (row i = frame i, `pts_us` = video pts): sensor timestamp, exposure, gains, lux, lens position, and the IMU / odometry interpolated to the middle of that frame's exposure: car roll / pitch / yaw + quaternion, body rates, linear accel, **camera -> world quaternion** and camera pitch / roll / heading (CameraModel conventions, ready for `cam.ground(u, v, pitch_deg=, roll_deg=)`), encoder turns / rps, steering, ESC pulse, dropped frames before it |
 | `<id>_imu.csv` | every IMU sample (game_rv, gyro, linear_accel, accel, gravity ~150-200 Hz; no magnetometer), raw board frame, same clock |
-| `<id>_drive.csv` | encoder turns / rps, steering, ESC pulse, throttle command at 100 Hz |
+| `<id>_drive.csv` | encoder turns / rps, steering, ESC pulse, throttle command at 100 Hz; since 2026-10-11 afternoon also the active link, `cmd_age_ms` (age of the newest command: a WiFi stall shows as it growing; dead-man at 400), `wifi_dbm`, `auto_state` (0 off / 1 driving / 2 braking) and the autonomy target speed |
 | `<id>_meta.json` | camera (id `cam0` = CSI CAM0, front IMX708; mount height / pitch / roll; intrinsics; full `config/camera.json`), this stream's ScalerCrop, K and distortion, IMU mount (`config/imu.json`), column descriptions, git commit, summary (frames, measured fps, dropped, frames without IMU, IMU rates) |
 
 World frame of a take: X = car heading at its first frame, Y left, Z up (yaw is relative, game_rv has
@@ -245,24 +246,181 @@ Measured 2026-10-11 (live, car still, 1280x720@120 + detection): map loop 0.35 m
 detection 120 fps / 30.6 ms. Replay of the 2026-10-10 takes (static attitude, unmeasured scale):
 ~130 detection frames/s on the Pi, median match residual ~20-27 mm; laps drift against each other.
 
-## Autonomy (planner; shadow mode so far)
+## Autonomy
 
-`vision/planner.py` turns the map into a steering + speed command; `vision/map_worker.py` runs it at
-10 Hz and the page shows its suggestion (violet path, "autopilot (shadow)" row) while you drive. It
-**does not drive** yet: the drive server already accepts `"auto"` commands (human links win), but
-nothing sends them.
+**On the page**: enable keyboard driving, set the throttle % (the same value is the autonomous throttle
+ceiling, so autonomy never drives faster than holding W would), press **autonomous mode**, then
+**hold SPACE**: the car follows the violet path. **Release SPACE -> it brakes to a stop.** W/A/S/D take
+over at once while held (manual override); releasing them with SPACE still held hands back to autonomy.
+A banner over the video says what is happening (hold SPACE / waiting for a path / AUTO DRIVING / AUTO
+BRAKING / MANUAL OVERRIDE / no link), the Track map table has "autopilot plan" (steering, target
+speed, path mode, confidence, which limit sets the speed) and "autonomy" (state, speed, ceiling,
+plan age).
+
+How it is wired: `vision/map_worker.py` runs map tick + planner at 20 Hz and sends `{"plan": {"s", "v",
+"m"}}` straight to the drive server (unix socket; not through the dashboard). The page's control
+worker sends `{"arm": true, "max": level}` at 20 Hz while SPACE is held. `drive_server.Control.auto_loop`
+(50 Hz, realtime thread) drives only while some page's arm message is < 0.25 s old and the plan is
+< 0.3 s old and wants > 0 m/s. Speed control (since 2026-10-11 evening; it was bang-bang ceiling /
+coast / brake, 10-24 switches a second, jerky): PI on the throttle as a fraction of the page's level
+(`KP_PER_MM`, `KI_PER_MM`), target speed rate-limited (+1.5 / -3 m/s^2), motor speed low-passed;
+more than 250 mm/s too fast -> brake 25-80 %. Otherwise (released, WiFi gap, planner silent, path lost)
+-> brake 60 % until the motor says < 120 mm/s, then neutral.
+Arming is kept **per page**: a second dashboard tab cannot cancel it (2026-10-11: two tabs made
+autonomy drop 10-20 times a second); the page shows a red banner when more than one control page is
+connected. A manual command only overrides autonomy when a key is pressed (t or s not 0); in
+autonomous mode, releasing W/A/S/D without SPACE stops the manual command at once (before, the last W
+throttle stayed on until S: fixed 2026-10-11). Simulated in
+`tests/autonomy_sim.py` (no hardware; 8 scenarios: drive, slow down, release, link loss, planner
+quiet, path lost, manual override, plan without arming; + a second page, smooth throttle, W released
+in autonomous mode, W released with SPACE held): stop in 0.5-0.8 s from ~1 m/s.
+Every take now also has `<id>_plan.csv` (the live planner at 20 Hz: mode, why there is no path, steering,
+target speed, apples per side, input age) and `_drive.csv` has the autonomy state and target; the
+page's autopilot row shows why there is no path. `scripts/dashboard_restart.sh` keeps the previous log
+as `logs/dashboard.log.1`. `tools/analysis/auto_throttle.py` summarises throttle / brake behaviour.
 
 * **Path = gates**: Delaunay triangulation of the confirmed apples around the car; every edge about a
   track width long (0.45-1.5 m) is a gate (one apple left, one right). A beam search walks gate
   midpoints through neighbouring triangles from the gate the car is in, scoring constant width,
-  smooth turns and length, never using an apple on both sides. Fallback: the map's chained boundaries
-  (centre line, or one side shifted by half the width). The chained boundaries alone fail in sharp
-  corners: looking into a corner the outer row lies straight ahead and gets chained onto the inner one.
-* **Steering**: pure pursuit from the rear axle (lookahead 0.65 m + 0.25 s of travel), curvature ->
-  servo with the measured full lock (1.45 1/m = 0.69 m radius at ~1.2 m/s, both ways, ~67 ms
-  servo + chassis lag; measured 2026-10-11 from yaw rate / speed).
-* **Speed**: lateral acceleration <= 0.25 g in the curve ahead, and never faster than the known path
-  allows (0.8 s); no path -> hold the last steering 0.3 s, then stop.
+  smooth turns and length, never using an apple on both sides.
+* **Side memory** (2026-10-11 pm): every plan votes its left / right apples back into the map
+  (`Landmark.votes`, +-8; an apple the car passed counts 6 for its side). The gate search never uses an
+  apple with >= 4 votes on the other side and pays a cost for weaker disagreement, so sides stop
+  flipping between frames. The map draws apples in their remembered side colour, and the blue / orange
+  lines are now the sides the planner actually uses (before, they were the map's own straight-on
+  chaining, which in corners joined the inner row to the outer one: the "blue line to an orange apple").
+* **Rows** (2026-10-11 late): apples closer than 0.6 x track width (<= 520 mm) are one row (union-find;
+  along a row p50 ~350 mm, across the track >= ~550 mm). Two apples of one row never make a gate (two
+  apples apart they look like a perfect 0.8 m gate: the path crossed the outer row in corners), and a
+  row whose net side memory is >= 6 (one passed apple) lends its side to all its apples, so the outer
+  row seen first in a corner keeps its side. A row with strong memory both ways (bridged by a stray
+  apple) lends nothing. Only gate paths vote (a wrong one-row guess used to become the whole row's
+  memory: the "everything orange" screenshots). The start gate no longer has to straddle the car's
+  axis (deep in a hairpin the whole track is to one side).
+* **One row in view** ("row" mode, deep in sharp corners): the visible row is chained from the apple
+  nearest the car (within its row group; across a gap <= 0.7 m only nearly straight on - a 1.3 m jump
+  reached the other row in hairpins) and followed half a track width inside it. Its side comes from the
+  rows / votes, else from geometry at the row's apple nearest the car. A gate path from < 0.6 s ago beats
+  a one-row guess.
+* **Path memory**: the last gate path is kept in map coordinates; with nothing usable in view it is
+  followed for up to 1.5 s (mode "memory", confidence 0.5) instead of stopping, because a stopped car
+  sees the same nothing forever (the sim's hairpin stall, the "refuses to start" in corners).
+* **Racing line**: instead of the gate midpoints, the smoothest line through the gates that keeps 220 mm
+  from every gate apple (bounded least squares on the squared curvature, `racing_line()`), starting at
+  the car's position and heading. On a 90 deg / 0.75 m corner the peak curvature drops 1.40 -> 1.11 1/m.
+* "How far the path is known" is the farthest path point from the camera (it was the forward x, which
+  in a sharp corner stays small: the path was rejected as too short and the car stopped).
+* **Smoothing**: the gate midpoints (one per apple pair) form a kinked polyline; it is resampled every
+  40 mm and smoothed with a Gaussian along its length (sigma 250 mm, `smooth_sigma_mm`), so the car
+  follows and the page draws a curve. Steering metrics on the replays are unchanged at 250 mm; 400 mm
+  starts cutting corners.
+* **Steering** (`control` "ff", 2026-10-11 late): the path's curvature where the car will be (feed-forward,
+  50 ms further on for the servo) + feedback on the sideways and heading error, critically damped over
+  `ff_dist_mm` 600 mm of travel (k = k_path - e / D^2 - 2 psi / D, speed independent), times `steer_gain`
+  (default **1.0** now; dashboard slider, config/planner.json), plus `steer_trim` -0.05 (at 0 the car
+  curved right); curvature -> servo with the measured full lock (1.45 1/m = 0.69 m radius, ~67 ms servo +
+  chassis lag). It is computed from the **predicted** pose: along the arc the car is driving (speed, yaw
+  rate) for the input's age + `actuation_lag_s` 0.08 s - heading included (at 135 deg/s the car turns
+  ~18 deg in 0.14 s). Pure pursuit ("pp", lookahead 0.65 m + 0.25 s) asked for 0.24 1/m half a second
+  before a 0.75 m corner and only ramped up when its target reached the bend - with ~0.2 s of loop delay
+  the car ran wide into the outer row (needing gain 1.5-1.6); "ff" asks 0.98-1.04 of the driven corner
+  curvature at gain 1.0 on the manual takes.
+* **Speed** (brakes whenever the path is not straight or not certain): lateral acceleration <= 0.15 g
+  for the commanded curvature, and able to brake (1.5 m/s^2) to every path point's curve speed before
+  reaching it (it was the 75th percentile curvature of the whole path, so a corner that was a small part
+  of it barely slowed the car), never faster than the known path allows in 1 s, and top speed x
+  confidence (one-sided path / memory 0.5, < 4 gates 0.7, halved per 0.5 steering jump between plans);
+  at least 0.4 m/s while any path exists; no path -> 0 (the drive server brakes), steering held 0.3 s.
+
+**Closed-loop simulator** `tools/track_sim.py [--track loop|hairpin|bean] [--laps 2] [--vmax 1500]
+[--plot p.png] [--set planner_field=v] [--map map_field=v] [--seed n]`: the real TrackMapper + Planner
+drive a simulated car (measured steering + lag, camera projection with pitch wobble and misses, 120 fps,
+delivery delays, 20 Hz plans) on synthetic two-row tracks with 0.75 m corners. Replays of manual takes
+cannot show what the planner's own steering leads to; this can. 4 seeds x 3 tracks x 2 laps: the old
+control (pure pursuit on the midline, gain 1.55) touched 70 apples, the current defaults 17 (24/24 laps,
+0 off track; at 2 m/s: 16).
+
+**Map worker timing** (the "stops and refuses to start" of 2026-10-11): with 30-60 apples in view the
+worker needed 4.8 ms per detection frame (x 120 fps) + 9 ms per plan; competing with camera / Hailo /
+x264 it fell behind, its plans were up to 2 s late (input age p90 120-200 ms even while driving, interval
+p90 110-200 ms) and plans older than 0.15 s are not sent -> "planner quiet -> braking", and no restart
+while it stayed behind. Now: undistort once per frame and stop iterating when converged, vectorised pose
+correction, chained boundaries at 5 Hz -> 2.5 ms per frame, ~6 ms per plan; the worker plans first and
+maps frames only until the next plan is due, skipping frames > 80 ms behind (`skipped` in the map stats,
+"skipped" rows in `_det.csv`). `tools/worker_rt_replay.py recordings/<id> --burn 4` feeds a take to the
+real worker process at real speed with all 4 cores busy: old 7.1 / 15.5 plans/s with up to 3.6 s gaps,
+new 19.9 / 20.1 plans/s, input age p50 35 ms, no gap > 0.35 s (144122 stationary with ~35 apples /
+144507 laps). `_plan.csv` also logs yaw rate, commanded curvature, e / psi / feed-forward and skipped
+frames; plan messages carry their input age ("a").
+Since 2026-10-11 evening the worker plans at **50 Hz** (`PLAN_HZ`; side votes and the steering-jump
+confidence are per second, not per plan) and the drive server applies a new plan's steering at once while
+autonomy drives (it waited for its next 50 Hz step). `tools/analysis/map_bench.py recordings/<id>
+--plan-hz 50`: map + plans ~0.33 core at 2.8 GHz (0.49 at 2.4); real worker with 4 cores busy: 50.1
+plans/s, interval p99 32 ms / max 42 ms, input age p50 34 ms. The closed-loop sim shows no difference
+between 20 / 33 / 50 Hz on the loop / hairpin tracks (the latency prediction already covers it); the
+larger delays are detection (~30 ms), the IMU (below) and the servo (~67 ms, 50 Hz PWM frames).
+
+**CPU**: overclocked to 2.8 GHz (`arm_freq=2800` in /boot/firmware/config.txt, backup
+config.txt.bak_20261011_pre_oc; the firmware sets 0.94 V) + `performance` governor
+(/etc/systemd/system/cpu-performance.service). 10 min stress-ng --verify on all cores: 0 errors, max
+67.5 C, never throttled (active cooler). 3.0 GHz + 50 mV did not boot (tested with `reboot "0 tryboot"`,
+which falls back to config.txt after a failed boot - use that for any further trial).
+
+**IMU lag** (`tools/analysis/imu_lag.py recordings/<id>`: camera yaw rate from apple bearings at 120 fps
+vs the IMU streams): the gyro reports describe the car ~17 ms before their timestamps (r 0.96-0.98, 3
+takes), game_rv another ~4.5 ms. 200 Hz is how often a sample comes, not how old it is: the delay is in
+the BNO085 (sensor low-pass + hub processing; the driver's timestamps follow the SH-2 base / delay
+fields of the INT edge correctly), possibly a few ms of it in the camera timestamp convention (libcamera
+SensorTimestamp = frame start; t_mid assumes start of readout). `tools/imu_latency_test.py` (dashboard
+stopped, turn the car by hand) measures raw_gyro / gyro / game_rv / girv against each other: if girv or
+raw_gyro is much earlier, the map should use it instead of game_rv.
+
+**2026-10-16 (first full autonomous lap, 2304x1296 / 56 fps / 96 deg mode)**: (1) *Turned in early, hit apexes*
+(143705: 13 of 40 inside apples touched): the path went straight from the camera to the first racing-line
+point, often 20-30 deg to the side, so the heading-error term alone asked for full lock (`_plan.csv`: k_ff ~0,
+psi -20..-33 deg) - lowering the gain only scaled it. Every path now starts along the car's heading
+(`_from_car`): track_sim inside touches 19 -> 12. (2) *Coasting in corners*: not the throttle ceiling - the
+planner's target fell to 0.45-0.75 m/s (one-row / memory confidence 0.5, steering-jump halving) and the speed
+loop rose at only 1.5 m/s^2. Now confidence 0.8 / 0.8 / 0.85, jump penalty halved, corners 2.0 m/s^2, min
+0.6 m/s; drive server accel 3 m/s^2, stronger PI, brakes from 150 mm/s over target
+(`tools/analysis/speed_limits.py` shows which limit set the target). Sim mean speed 1.21 -> 1.30 m/s, same
+touches. (3) *Started next to the left row, drove into it*: the first "gate" was crossed lengthwise / the gap
+to the next straight's row looked like the track. Now a path must cross every gate at >= 35 deg, the car must
+be on the track side of the first gate's two rows, and the one-row fallback prefers rows near the car.
+track_sim starts 30-60 deg turned towards a row (`--start-offset/--start-yaw/--start-at`) now succeed (60 deg
+on the hairpin track is physically too tight). **Autonomy tuning** panel on the page: planner
+`TUNABLES` (gain, steer calmness, preview, apex margin, top speed, corner accel, bend braking, min speed,
+one-row / memory speed) -> config/planner.json, drive server `DRIVE_TUNABLES` (accel, decel, PI, start
+throttle, brake threshold / softness) -> config/drive.json, applied at once. Logs: `_plan.csv` + limits,
+virtual apples, target; `_planpath.jsonl` (10 Hz path / sides / target); `_drive.csv` + throttle fraction,
+filtered speed, ceiling, last plan; meta has the planner params + drive tuning.
+`tools/analysis/apex_clearance.py` (body clearance of passed apples by inside / outside of turns),
+`edge_bearing.py` (lens model at the image edges: the 96 deg mode is ~1 deg off at the outer 10 %).
+
+**Rows as chains, one-side fallback, boundary memory** (2026-10-15 evening, `tools/side_eval.py`: every plan
+scored against the side each apple was really passed on). Rows were distance groups (union-find, 0.48 m):
+where a corner wraps round, the inner row's end came within 0.34-0.43 m of the outer row and both became one
+"mixed" row without protection - the planner built a gate inside the outer row of a left corner and steered
+right (150022). Now rows are chains: shortest links first, <= 2 per apple, the second continuing the first
+(bend <= 60 deg), links up to 0.68 m, near-duplicates (< 0.18 m) one node; no gate inside a row even with
+mixed memory; a mixed row takes the side holding 3x more memory. The one-row fallback tries every row (side
+from memory, else geometry: the car is on the track side of a boundary), offsets it half a width towards
+the track and takes the one reaching furthest (a firm side counts 1 m): before, it took the row nearest the
+car, often the inner row's 0.4 m stub, and stopped. `BoundaryMemory`: apples a gate path put on a side (and
+apples passed) are kept in map coordinates for 8 s; map apples within 0.25 m inherit the side, remembered
+apples the map has lost are planned with again. Plans with a wrong-side apple within 1.5 m ahead, 8 takes
+(4572 moving plans): 10.1 % -> 3.4 % (150022 23 -> 0.3 %, 145819 14 -> 1.8 %); one-row fallback in 150022
+26 -> 13 % of the time; track_sim 4 seeds x 4 tracks: 26 -> 13 apples touched, all laps.
+The 2026-10-15 15:32 take stalled for darkness (5 lux, gain 16, exposure capped at 7.9 ms by 120 fps):
+half the apples were not detected.
+
+**Map fixes from the same takes**: (1) the BNO085 game_rv lags ~17.5 ms (`imu_lag_s`): replays with the
+IMU shifted 15-20 ms earlier create half as many duplicate apples in 110-145 deg/s corners (144507: 2951
+-> 1458), the smeared double rows the planner then paired wrongly. (2) New apples only start within
+2.5 m (`max_init_range_mm`, was 3 m): 1 deg of pitch error moves an apple ~0.8 m at 3 m but ~0.36 m at
+2 m, and after hard acceleration far rows appeared as clouds 1-2 m too close (high-pass pitch
+undershoot); ignoring the IMU attitude, `absolute` attitude or a longer high-pass were all worse on the
+planner replays. `tools/analysis/plan_views.py` shows the video frame next to what the planner saw.
 
 `tools/autonomy_eval.py recordings/<id> ... [--plot p.png] [--csv c.csv] [--no-gates]` replays takes
 through the map + planner and compares, every 0.1 s, its curvature with what the car really drove
@@ -274,6 +432,47 @@ left (inside of these mostly-left loops) 8-22 %; the video shows the car cutting
 apples at several of those moments, so part of that is the driver's line, not the map.
 Chained boundaries only (`--no-gates`): turn direction 73-93 %, left wrong side 13-40 %.
 Needs scipy (python3-scipy, installed on the Pi).
+First autonomous laps (2026-10-11 13:31-13:36, gain 1.6 set by hand): servo response is linear
+(0.87-1.03 of 1.45 1/m x command above 0.2), so the understeer came from the planner: its pure-pursuit
+curvature was ~0.6-0.9 of what the manually driven corners needed; gain 1.5-1.6 brings it to
+0.87-1.01 (`autonomy_eval.py ... --set steer_gain=1.5` prints "corners asked/needed"). With side
+memory + row fallback on the afternoon manual takes: path lost <= 2 %, turn direction agrees 83-96 %.
+
+**Faster speed policy** (2026-10-16 evening, autonomous takes 1016_152200-152748: laps at 1.2-1.3 m/s, "slow,
+coasts"). The car followed its target closely (throttle never at the 40 % ceiling, u ~0.6); the *target* was
+low: top speed 1500 set it 41-75 % of the time, "known path / 1 s" another 25-43 % - the path's end stays put
+while the car approaches it, so the target fell to 0.6-0.8 m/s before every corner (brake -0.4..-0.8) although
+the curve allowed 1.2-3.5 m/s, then rose only as new path came into view. Corners: 1.1-1.6 m/s^2 lateral at
+0.86-1.08 m/s; the manual laps 2026-10-11: 2.8-3.7 m/s^2 at 1.4-1.6 m/s. Now: the path beyond the known one may
+be a full-lock corner, so the car must be able to brake to that corner's speed (x `known_end_frac`) by the end
+of the known path; curvatures above full lock no longer lower the speed (the error feedback asked for more than
+the car can steer); top speed 2500, corner grip 2800 (config/planner.json had 2000: set to 2800). Drive
+server: `brake_max` tunable (was 0.8 fixed, now 1.0; brake 0.4-0.8 slowed only ~1.2 m/s^2 median), I term
+not integrated while P alone saturates. track_sim (`--acc/--dec/--grip` added; 4 tracks x 3 seeds x 2 laps,
+--dec 1800, --vmax 2500): old 1.30 m/s, 23.2 s per 2 laps, 4 apples touched; new 1.94 m/s, 15.5 s, 3 touched,
+none off; brakes 1.2 m/s^2: same; grip 3000 instead of 4000: 7 touched, none off; "race" preset 2.15 m/s.
+The tuning panel is grouped (speed / corners + steering / throttle + brakes), shows changed sliders with a
+reset arrow, and has presets calm / default / race (speed + throttle settings only) and reset all.
+Pi backup: results/backup_20261016_pre_aggressive/. At 2304x1296 @ 56 fps the detector ran at only 37-41 fps
+(1536x864: ~100 fps).
+
+**"Turns to the outside at some corner entries"** (2026-10-17, 19 takes 1017_145132-152035, 1.5-1.8 m/s). Two
+causes. (1) *Weave*: steering +-0.6..1.0 and yaw rate +-70..110 deg/s at 2.2-2.5 Hz on the straights while
+e / psi stay small; a corner entered in the outward phase looks like a turn to the outside. Steering 1.2-4 Hz RMS
+0.07-0.15 at ~1.2 m/s (10-16) -> 0.2-0.37 at 1.5-1.7 m/s. The pose prediction (along the arc for input age +
+actuation lag) is a yaw-rate damping term ~ v x latency / ff_dist on a yaw rate ~75 ms old; with ff_dist fixed
+in mm it grows with speed and resonates. track_sim reproduces it once its delays match the car (`--odo-lag 0.05
+--det-lag 0.06 --steer-delay 0.09`: input age ~45-60 ms as live, steering -> gyro 80-100 ms measured); more
+prediction (actuation_lag_s 0.12-0.15) made it worse (0.43-0.50). Fix: errors corrected over
+max(ff_dist_mm, v x `ff_time_s`) (0.5 s, slider "steer calmness s"): weave 0.27 -> 0.11 at 2.3 m/s, unchanged at
+1.3 m/s. (2) *Path flips*: gate paths resting on one apple a side alternated between two gates (lookahead target
++-300-400 mm sideways every 2-4 plans, full lock each way): live logs 0.66 % of such plans flip vs 0.04 % with 2+
+gates (35 % of gate plans are weak, mostly at corner entries). Fix: a weak path that disagrees with the fresh
+remembered path by > 250 mm must hold for 0.15 s first, the remembered path is followed meanwhile (`weak_*`
+params). `tools/analysis/flip_eval.py` (open-loop replay of the takes): gate flips 29 -> 12. track_sim, both
+fixes, realistic delays, 3 seeds x 4 tracks x 2 laps @ 2.3 m/s: weave 0.288 -> 0.122, 1.71 -> 1.83 m/s, apples
+touched 4 -> 4, none off. `tools/analysis/overlay_video.py --plan`: video with boxes + scores, the live planned
+path (violet), the boundary apples used (blue / orange) and a HUD. Pi backup: results/backup_20261017_pre_weave/.
 
 ## Camera calibration (3D from detections)
 

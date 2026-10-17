@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from tools.replay_map import load_take
 from vision.track_map import TrackMapper
-from vision.planner import Planner
+from vision.planner import Planner, plan_with_map
 
 take, out = sys.argv[1], sys.argv[2]
 want = [float(x) for x in sys.argv[3].split(",")]
@@ -37,7 +37,7 @@ for t, _, kind, x in events:
         if b is not None:
             pr = m.odo_pose(nt - 0.1)
             v = math.hypot(o[0] - pr[0], o[1] - pr[1]) / 0.1 if pr else 0
-            p = pl.update(b, v, nt, apples=m.local_apples)
+            p = plan_with_map(pl, m, v, nt)
             rel_t = nt - t_first
             for w in want:
                 if abs(rel_t - w) < 0.05 and w not in snaps:

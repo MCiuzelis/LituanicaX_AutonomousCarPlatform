@@ -78,6 +78,7 @@ DET_PUSH_HZ = 30             # max rate boxes are pushed to the page overlay
 IMU_PUSH_HZ = 25             # attitude / g-g plot push rate (/ws/imu); the IMU itself runs at 100 Hz
 MAP_PUSH_HZ = 10             # track map push rate (/ws/map); the map itself updates on every detection frame
 VIDEO_CREDITS = 2            # preview frames in flight to one page before it must ack
+AUTO_STATES = ("off", "driving", "braking")   # drive_server.AUTO_OFF / _DRIVING / _BRAKING
 COCO_NAMES = (
     "person bicycle car motorcycle airplane bus train truck boat traffic_light fire_hydrant "
     "stop_sign parking_meter bench bird cat dog horse sheep cow elephant bear zebra giraffe "
@@ -118,8 +119,11 @@ class DriveLink:
     def __init__(self):
         self.steering, self.esc = self._Steering(self), self._Esc(self)
         self.proc, self.state, self.restarts = None, None, 0
+        self.closing = False
+        self.wifi_dbm = None           # set by Telemetry (4 Hz), recorded with every drive sample
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         self._cache, self._cache_t = None, 0.0
+        self.mm_per_turn = drive_server._mm_per_turn()
         self._start()
         threading.Thread(target=self._monitor, daemon=True).start()
 
@@ -146,7 +150,7 @@ class DriveLink:
     def _monitor(self):
         while True:
             time.sleep(1.0)
-            if self.proc.poll() is not None:
+            if self.proc.poll() is not None and not self.closing:
                 log.error("drive server exited (%s): restarting", self.proc.returncode)
                 self.restarts += 1
                 try:
@@ -221,9 +225,29 @@ class DriveLink:
                 "gap_max_ms": {"ws": round(s["gap_ws_ms"]), "tcp": round(s["gap_tcp_ms"])},
                 "late": {"ws": int(s["late_ws"]), "tcp": int(s["late_tcp"])}, "deadman": int(s["deadman"]),
                 "commands": int(s["commands"]), "rt": bool(s["rt"]), "ws_clients": int(s["ws_clients"]),
-                "server_pid": int(s["pid"]), "server_restarts": self.restarts, "port": drive_server.WS_PORT}
+                "server_pid": int(s["pid"]), "server_restarts": self.restarts, "port": drive_server.WS_PORT,
+                "auto": {"armed": bool(s["armed"]), "state": AUTO_STATES[int(s["auto_state"])],
+                         "v_target": round(s["auto_v"]), "ceiling": s["arm_max"], "arms": int(s["arms"]),
+                         "plan_age_ms": int((time.monotonic() - s["plan_t"]) * 1000) if s["plan_t"] else None,
+                         "plan_steer": round(s["plan_steer"], 2), "plan_v": round(s["plan_v"]),
+                         "plan_mode": drive_server.PLAN_MODES[int(s["plan_mode"])],
+                         "speed_mm_s": round(abs(s["rps"]) * self.mm_per_turn)}}
+
+    def link_sample(self):
+        """Extra _drive.csv columns (recorder.LINK_COLUMNS)."""
+        s, now = self.read(), time.monotonic()
+        newest = max(s["last_ws"], s["last_tcp"], s["last_auto"])
+        a = int(s["active"])
+        return (drive_server.LINKS[a - 1] if a else "", int((now - newest) * 1000) if newest else "",
+                "" if self.wifi_dbm is None else int(self.wifi_dbm), int(s["auto_state"]),
+                round(s["auto_v"]) if s["auto_state"] else "",
+                round(s["auto_u"], 3), round(s["auto_vmeas"]), round(s["arm_max"], 3),
+                drive_server.PLAN_MODES[int(s["plan_mode"])] if s["plan_t"] else "",
+                round(s["plan_steer"], 3) if s["plan_t"] else "", round(s["plan_v"]) if s["plan_t"] else "",
+                int((now - s["plan_t"]) * 1000) if s["plan_t"] else "")
 
     def close(self):
+        self.closing = True
         if self.proc and self.proc.poll() is None:
             self.proc.terminate()
             try:
@@ -852,7 +876,7 @@ class MapProcess:
                 self._send(("data", imu, [(t0, self.drive.turns)], dets))
                 self.error = None
             except (OSError, EOFError, ValueError) as e:
-                if self._run and self.proc.poll() is not None:
+                if self._run and self.proc.poll() is not None and not self.drive.closing:
                     log.error("track map worker exited (%s): restarting", self.proc.returncode)
                     self.restarts += 1
                     self._start()
@@ -870,6 +894,9 @@ class MapProcess:
 
     def reset(self):
         self._send(("reset",))
+
+    def set_planner(self, **params):
+        self._send(("planner", params))
 
     def start_log(self, directory, rid):
         self._send(("start_log", directory, rid))
@@ -963,6 +990,8 @@ class Telemetry:
             try:
                 ps = self.power.sample()
                 batt = round(self.battery.read(samples=8).battery_volts, 3)
+                wifi = self._wifi()
+                self.drive.wifi_dbm = wifi.get("level_dbm")
                 self.drive.send_health(batt, ps.temp_c)       # for the drive server's health lines
                 self.data = {
                     "time": time.time(),
@@ -972,7 +1001,7 @@ class Telemetry:
                     "battery_v": batt,
                     "drive": self.drive.status(),
                     "camera": self.camera.status(),
-                    "wifi": self._wifi(),
+                    "wifi": wifi,
                     "hailo": self.hailo,
                     "control": self.drive.control_status(),
                     "vision": self.vision.status(),
@@ -1214,6 +1243,68 @@ async def api_map(request):
     return web.json_response(svc.status())
 
 
+def _drive_tuning_save(over):
+    path = drive_server.DRIVE_CONFIG
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        cfg = {}
+    cfg.update(over)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(tmp, path)
+
+
+async def api_planner(request):
+    """Autonomy tuning. GET -> {"steer_gain", "planner": {field: {value, min, max, step, label, help}},
+    "drive": {...}}; POST {field: value, ...}: planner fields (vision/planner.py TUNABLES) go to the running
+    planner + config/planner.json, speed-control fields (drive_server.DRIVE_TUNABLES) to the drive server +
+    config/drive.json; values are clipped to their ranges, both kept across restarts."""
+    from vision.planner import TUNABLES, PlannerParams, save_config
+    if request.method == "POST":
+        m = await request.json()
+        if not isinstance(m, dict):
+            return web.json_response({"error": "{field: value}"}, status=400)
+        pl_over, dr_over = {}, {}
+        for k, v in m.items():
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                return web.json_response({"error": "%s: number" % k}, status=400)
+            if not math.isfinite(v):
+                return web.json_response({"error": "%s: number" % k}, status=400)
+            if k in TUNABLES:
+                lo, hi = TUNABLES[k][0], TUNABLES[k][1]
+                pl_over[k] = max(lo, min(hi, v))
+            elif k in drive_server.DRIVE_TUNABLES:
+                lo, hi = drive_server.DRIVE_TUNABLES[k][1], drive_server.DRIVE_TUNABLES[k][2]
+                dr_over[k] = max(lo, min(hi, v))
+            else:
+                return web.json_response({"error": "unknown field %s" % k}, status=400)
+        if pl_over:
+            save_config(pl_over)
+            request.app["trackmap"].set_planner(**pl_over)
+        if dr_over:
+            _drive_tuning_save(dr_over)
+            try:
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+                s.sendto(json.dumps({"cfg": dr_over}).encode(), drive_server.SOCK)
+                s.close()
+            except OSError as e:
+                log.warning("drive tuning not sent: %s", e)
+        log.info("autonomy tuning: %s", ", ".join("%s %g" % kv for kv in sorted({**pl_over, **dr_over}.items())))
+    pp, p0 = PlannerParams.load(), PlannerParams()
+    dt = drive_server.load_drive_tuning()
+    planner = {k: {"value": getattr(pp, k), "default": getattr(p0, k), "min": v[0], "max": v[1], "step": v[2],
+                   "label": v[3], "help": v[4]}
+               for k, v in TUNABLES.items()}
+    drive = {k: {"value": dt[k], "default": v[0], "min": v[1], "max": v[2], "step": v[3], "label": v[4], "help": v[5]}
+             for k, v in drive_server.DRIVE_TUNABLES.items()}
+    return web.json_response({"steer_gain": pp.steer_gain, "planner": planner, "drive": drive})
+
+
 async def ws_map(request):
     """Track map snapshots as the worker serialised them (vision/map_worker.py), each one once."""
     ws = web.WebSocketResponse(heartbeat=5)
@@ -1289,6 +1380,8 @@ def main():
         web.post("/api/imu/zero_yaw", api_imu_zero_yaw),
         web.get("/ws/map", ws_map),
         web.post("/api/map", api_map),
+        web.get("/api/planner", api_planner),
+        web.post("/api/planner", api_planner),
         web.get("/api/telemetry", api_telemetry),
         web.post("/api/mode", api_mode),
         web.post("/api/record", api_record),
@@ -1303,6 +1396,7 @@ def main():
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
+        drive.closing = True                 # no child restarts while shutting down
         telem.close()
         preview.close()
         camera.stop_recording()  # a running take is finalised first (its map log included)

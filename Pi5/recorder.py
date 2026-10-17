@@ -17,7 +17,8 @@ gets copied out alone still says where it came from; deleting the folder deletes
                        CameraModel conventions), encoder turns / speed, steering, ESC pulse
     <id>_imu.csv       every IMU sample (game_rv, gyro, linear_accel, accel, gravity at ~200 Hz),
                        raw board frame, same clock: re-interpolate it any way you like
-    <id>_drive.csv     encoder turns / speed, steering, ESC pulse, commanded throttle at DRIVE_HZ
+    <id>_drive.csv     encoder turns / speed, steering, ESC pulse, commanded throttle at DRIVE_HZ, and (with the
+                       drive server) the active link, age of the newest command, WiFi signal, autonomy state
     <id>_meta.json     what / where / how: camera (sensor, port, mount pose, intrinsics, the full
                        config/camera.json), this stream's ScalerCrop + K + distortion, IMU mount
                        (config/imu.json), column descriptions, git commit, and a summary at stop
@@ -57,6 +58,13 @@ CAMERA_ID = "cam0"              # CSI port; the only camera on the car (front, I
 CAMERA_NAME = "front"
 IMU_SENSORS = ("game_rv", "gyro", "linear_accel", "accel", "gravity")
 DRIVE_HZ = 100
+# extra _drive.csv columns from the drive server (DriveLink.link_sample): link that sent the command now applied,
+# age of the newest command from any link (a WiFi stall shows as a growing age; dead-man at 400 ms), WiFi
+# signal, autonomy state (0 off / 1 driving / 2 braking to a stop) and the planner's target speed
+LINK_COLUMNS = ("link", "cmd_age_ms", "wifi_dbm", "auto_state", "auto_v_target",
+                # autonomy internals (2026-10-16): throttle as a fraction of the ceiling, filtered motor speed, the
+                # page's throttle ceiling, and the last plan as the drive server got it
+                "auto_u", "auto_v_meas", "throttle_ceiling", "plan_mode", "plan_steer", "plan_v", "plan_age_ms")
 BITS_PER_PIXEL = 0.2            # H.264 bitrate = bpp * w * h * fps: ~11 Mbit/s at 720p60
 BITRATE_MIN, BITRATE_MAX = 6e6, 40e6
 WRITE_PERIOD_S = 0.1            # writer thread: drain, interpolate, write
@@ -331,7 +339,9 @@ class Recording:
         self.csv = {k: csv.writer(f) for k, f in self.files.items()}
         self.csv["frames"].writerow([c for c, _ in FRAME_COLUMNS])
         self.csv["imu"].writerow(["t_ns", "sensor", "accuracy", "seq", "v0", "v1", "v2", "v3"])
-        self.csv["drive"].writerow(["t_ns", "odo_turns", "motor_rps", "steer", "esc_us", "throttle_cmd"])
+        self.link_cols = control is not None and hasattr(control, "link_sample")
+        self.csv["drive"].writerow(["t_ns", "odo_turns", "motor_rps", "steer", "esc_us", "throttle_cmd"]
+                                   + (list(LINK_COLUMNS) if self.link_cols else []))
         self.meta = self._meta()
         _write_json(self.path("_meta.json"), self.meta)
         self._subscribe()
@@ -436,7 +446,7 @@ class Recording:
         nxt = time.monotonic()
         while not self._stop.is_set():
             self._drive_q.append((time.monotonic_ns(), d.turns, d.rps, d.steering.position, d.esc.current_us,
-                                  c.throttle if c is not None else None))
+                                  c.throttle if c is not None else None, c.link_sample() if self.link_cols else ()))
             nxt += period
             time.sleep(max(0.0, nxt - time.monotonic()))
 
@@ -476,8 +486,8 @@ class Recording:
             self.imu_overflow = self.sub.overflow
         w = self.csv["drive"]
         while self._drive_q:
-            t, turns, rps, st, us, thr = self._drive_q.popleft()
-            w.writerow([t, "%.4f" % turns, "%.3f" % rps, _fmt(st, 3), _fmt(us, 1), _fmt(thr, 3)])
+            t, turns, rps, st, us, thr, extra = self._drive_q.popleft()
+            w.writerow([t, "%.4f" % turns, "%.3f" % rps, _fmt(st, 3), _fmt(us, 1), _fmt(thr, 3)] + list(extra))
             self.drive_series.add(t * 1e-9, (turns, rps, st if st is not None else float("nan"), us or float("nan")))
             self.n_drive += 1
 

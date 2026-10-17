@@ -9,6 +9,7 @@ pkill -f "python3 dashboard.py"
 for _ in $(seq 1 40); do pgrep -f "python3 dashboard.py" >/dev/null || break; sleep 0.25; done
 pkill -9 -f "python3 dashboard.py"; sleep 1
 
+[ -s logs/dashboard.log ] && mv -f logs/dashboard.log logs/dashboard.log.1   # keep the previous run's log
 nohup python3 dashboard.py > logs/dashboard.log 2>&1 &
 PID=$!
 for _ in $(seq 1 60); do

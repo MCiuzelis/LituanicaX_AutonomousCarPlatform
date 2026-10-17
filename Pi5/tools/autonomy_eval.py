@@ -26,7 +26,7 @@ import numpy as np
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # Pi5/
 sys.path.insert(0, ROOT)
 from tools.replay_map import load_take                               # noqa: E402
-from vision.planner import Planner                                   # noqa: E402
+from vision.planner import Planner, cast_like, plan_with_map           # noqa: E402
 from vision.track_map import TrackMapper, load_params                # noqa: E402
 
 FUTURE_MM = 1500.0      # driven path checked against the boundaries
@@ -57,9 +57,15 @@ def evaluate(take, args):
     f, meta, events = load_take(take)
     p = load_params()
     p.window_s, p.window_behind_mm = args.window_s, args.behind_mm
+    for kv in args.map:
+        k, v = kv.split("=", 1)
+        setattr(p, k, cast_like(getattr(p, k), v))
     m = TrackMapper(params=p)
     planner = Planner()
     planner.p.gates = not args.no_gates
+    for kv in args.set:
+        k, v = kv.split("=", 1)
+        setattr(planner.p, k, cast_like(getattr(planner.p, k), v))
     ticks = []
 
     next_tick = None
@@ -78,9 +84,12 @@ def evaluate(take, args):
             o = m.odo_pose(next_tick)
             prev = m.odo_pose(next_tick - 0.1)
             v = math.hypot(o[0] - prev[0], o[1] - prev[1]) / 0.1 if o and prev else 0.0
-            plan = planner.update(b, v, next_tick, apples=m.local_apples) if b is not None else None
+            plan = plan_with_map(planner, m, v, next_tick) if b is not None else None
+            lf = m.last_frame
             ticks.append({"t": next_tick, "odo": o, "v": v, "bounds": b, "plan": plan,
-                          "n_lms": sum(1 for lm in m.lms if lm.state == 1)})
+                          "n_lms": sum(1 for lm in m.lms if lm.state == 1),
+                          "n_tent": sum(1 for lm in m.lms if lm.state == 0),
+                          "n_dets": len(lf["idx"]) if lf is not None and next_tick - lf["t"] < 0.2 else 0})
             next_tick += 0.1
 
     # the car's real curvature and the driver's steering, by time
@@ -128,8 +137,8 @@ def evaluate(take, args):
         human = float(np.mean(st_fr[max(0, int(np.searchsorted(ft, k["t"])) - 3):int(np.searchsorted(ft, k["t"])) + 4])) \
             if j < len(ft) else np.nan
         rows.append({"t": k["t"] - ticks[0]["t"], "v": k["v"], "mode": pl["mode"], "known_mm": pl["known_mm"],
-                     "plan_k": pl.get("curvature"), "plan_steer": pl.get("steer"), "plan_v": pl.get("speed_mm_s"),
-                     "real_k": real_k, "human_steer": human, "n_lms": k["n_lms"],
+                     "plan_k": pl.get("curvature"), "plan_steer": pl.get("steer"), "plan_v": pl.get("speed_mm_s"), "why": pl.get("why", ""), "n_dets": k.get("n_dets"),
+                     "real_k": real_k, "human_steer": human, "n_lms": k["n_lms"], "n_tent": k["n_tent"],
                      "width": (b or {}).get("width"), "left_err": left_err, "right_err": right_err,
                      "clear_l": clear_l, "clear_r": clear_r})
     return f["id"], rows, m
@@ -148,21 +157,26 @@ def summarize(rid, rows):
     corr = float(np.corrcoef(pk[ok], rk[ok])[0, 1]) if ok.sum() > 10 else np.nan
     turn = ok & (np.abs(rk) > 0.7)
     sign = float(np.mean(np.sign(pk[turn]) == np.sign(rk[turn]))) if turn.any() else np.nan
+    # steering asked for in corners vs what the car needed there: commanded curvature (gain + trim
+    # included, servo model 1.45 1/m at full lock) / driven curvature, where both turn the same way
+    ck = -a("plan_steer") * 1.45
+    same = turn & ~np.isnan(ck) & (np.sign(ck) == np.sign(rk))
+    corner_ratio = float(np.median(np.abs(ck[same]) / np.abs(rk[same]))) if same.sum() > 3 else np.nan
     known = a("known_mm")
-    s = {"ticks": n, "gates": modes.count("gates") / n, "center": modes.count("center") / n, "one_side": (modes.count("left") + modes.count("right")) / n,
+    s = {"ticks": n, "gates": modes.count("gates") / n, "center": modes.count("center") / n, "one_side": modes.count("row") / n,
          "lost": modes.count("lost") / n, "known_p10": float(np.nanpercentile(known, 10)),
          "known_p50": float(np.nanpercentile(known, 50)),
          "left_checked": int((~np.isnan(le)).sum()), "left_wrong": float(np.nanmean(le)) if (~np.isnan(le)).any() else np.nan,
          "right_checked": int((~np.isnan(re_)).sum()), "right_wrong": float(np.nanmean(re_)) if (~np.isnan(re_)).any() else np.nan,
          "k_corr": corr, "k_mae": float(np.nanmedian(np.abs(pk[ok] - rk[ok]))) if ok.any() else np.nan,
-         "turn_sign_agree": sign, "lms_p50": float(np.median(a("n_lms"))), "lms_max": float(np.max(a("n_lms"))),
+         "turn_sign_agree": sign, "corner_ratio": corner_ratio, "lms_p50": float(np.median(a("n_lms"))), "lms_max": float(np.max(a("n_lms"))),
          "width_p50": float(np.nanmedian(a("width")))}
-    print("%s: %d moving ticks | path: gates %.0f%% centre %.0f%% one side %.0f%% lost %.0f%% | known ahead p10 %.2f p50 %.2f m | "
+    print("%s: %d moving ticks | path: gates %.0f%% centre %.0f%% one row %.0f%% lost %.0f%% | known ahead p10 %.2f p50 %.2f m | "
           "boundary on the wrong side of the driven path: left %.1f%% of %d, right %.1f%% of %d | planner vs driven "
-          "curvature: r %.2f, median |err| %.2f 1/m, turn direction agrees %.0f%% | apples in map p50 %.0f max %.0f | "
+          "curvature: r %.2f, median |err| %.2f 1/m, turn direction agrees %.0f%%, corners asked/needed %.2f | apples in map p50 %.0f max %.0f | "
           "width %.2f m" % (rid, n, 100 * s["gates"], 100 * s["center"], 100 * s["one_side"], 100 * s["lost"], s["known_p10"] / 1000,
                             s["known_p50"] / 1000, 100 * s["left_wrong"], s["left_checked"], 100 * s["right_wrong"],
-                            s["right_checked"], s["k_corr"], s["k_mae"], 100 * s["turn_sign_agree"], s["lms_p50"],
+                            s["right_checked"], s["k_corr"], s["k_mae"], 100 * s["turn_sign_agree"], s["corner_ratio"], s["lms_p50"],
                             s["lms_max"], s["width_p50"] / 1000))
     return s
 
@@ -199,7 +213,11 @@ def main():
     ap.add_argument("--behind-mm", type=float, default=load_params().window_behind_mm)
     ap.add_argument("--csv", help="per-tick rows of all takes")
     ap.add_argument("--plot", help="curvature plot (png)")
-    ap.add_argument("--no-gates", action="store_true", help="planner on the map's chained boundaries only")
+    ap.add_argument("--no-gates", action="store_true", help="planner without the gate search (one-row fallback only)")
+    ap.add_argument("--set", nargs="*", default=[], metavar="FIELD=VALUE",
+                    help="override PlannerParams, e.g. --set steer_gain=1.0 lookahead_mm=500")
+    ap.add_argument("--map", nargs="*", default=[], metavar="FIELD=VALUE",
+                    help="override track map Params, e.g. --map attitude=absolute imu_lag_s=0")
     args = ap.parse_args()
     results = []
     for take in args.takes:

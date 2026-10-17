@@ -1,0 +1,12 @@
+{
+  "steer_gain": 1.0,
+  "max_lat_acc_mm_s2": 2300.0,
+  "max_speed_mm_s": 2500.0,
+  "min_speed_mm_s": 250.0,
+  "brake_mm_s2": 2000.0,
+  "known_end_frac": 0.65,
+  "ff_dist_mm": 650.0,
+  "racing_margin_mm": 240.0,
+  "conf_one_side": 0.55,
+  "conf_memory": 0.6
+}

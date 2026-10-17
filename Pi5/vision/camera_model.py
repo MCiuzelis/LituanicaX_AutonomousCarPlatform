@@ -104,7 +104,10 @@ class CameraModel:
         x, y = xd, yd
         for _ in range(iters):                         # fixed point; converges in < 10 on this lens
             ex, ey = self._distort(x, y)
-            x, y = x + (xd - ex), y + (yd - ey)
+            dx, dy = xd - ex, yd - ey
+            x, y = x + dx, y + dy
+            if np.size(dx) == 0 or max(float(np.max(np.abs(dx))), float(np.max(np.abs(dy)))) < 1e-9:
+                break                                  # < 0.000002 px
         return x, y
 
     def distort(self, x, y):
