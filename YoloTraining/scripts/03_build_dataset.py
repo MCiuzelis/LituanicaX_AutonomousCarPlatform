@@ -25,7 +25,7 @@ def main():
     ap.add_argument("--frames", type=Path, default=ROOT / "data/frames")
     ap.add_argument("--labels", type=Path, default=ROOT / "data/labels")
     ap.add_argument("--out", type=Path, default=ROOT / "data/yolo")
-    ap.add_argument("--val-videos", nargs="+", default=["20261010_131416", "20261010_131458", "20261010_131840"],
+    ap.add_argument("--val-videos", nargs="+", default=["20261010_131416", "20261010_131458", "20261010_131840", "20261011_083825"],
                     help="video stems held out for validation")
     args = ap.parse_args()
 

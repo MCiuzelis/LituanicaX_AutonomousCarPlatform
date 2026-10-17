@@ -8,6 +8,8 @@ compute. Ultralytics validates with rect batches, i.e. at 960x544 too.
 
     uv run scripts/04_train.py                      # yolov8s, 150 epochs
     uv run scripts/04_train.py --model yolov8n.pt   # faster/smaller fallback
+    uv run scripts/04_train.py --model runs/apple_yolov8s_r2/weights/best.pt --finetune --epochs 60 --name ...
+                                                    # continue from a trained model on a grown dataset
 """
 import argparse
 from pathlib import Path
@@ -26,10 +28,14 @@ def main():
     ap.add_argument("--batch", type=int, default=8, help="8 fits yolov8s@960 in 8 GB")
     ap.add_argument("--name", default="apple_yolov8s")
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--finetune", action="store_true",
+                    help="start point is already an apple model: SGD at lr0=0.002, 1 warmup epoch")
     args = ap.parse_args()
 
     model = YOLO(args.model)
+    lr = dict(optimizer="SGD", lr0=0.002, warmup_epochs=1.0) if args.finetune else {}
     model.train(
+        **lr,
         data=str(args.data),
         epochs=args.epochs,
         imgsz=args.imgsz,

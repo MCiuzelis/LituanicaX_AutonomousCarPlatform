@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--weights", type=Path, default=ROOT / "runs/apple_yolov8s_r2/weights/best.pt")
+    ap.add_argument("--weights", type=Path, default=ROOT / "runs/apple_yolov8s_r3/weights/best.pt")
     ap.add_argument("--imgsz", type=int, nargs=2, default=(544, 960), help="h w")
     ap.add_argument("--out", type=Path, default=ROOT / "export")
     ap.add_argument("--n-calib", type=int, default=1024)

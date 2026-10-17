@@ -33,7 +33,7 @@ YoloTraining/
 | 0. get videos | `scp 'rp5:LituanicaX_InteligentRobotCompetition/Pi5/recordings/*/*' data/videos/` | 9 sessions (2026-10-10), 1536x864 @ 60 fps + sensor CSVs |
 | 1. frames | `uv run scripts/01_extract_frames.py` | `data/frames/`: every 3rd frame while driving (motor >= 5 rev/s from `_frames.csv`), blurry + near-duplicate frames dropped |
 | 2. auto-label | `uv run scripts/02_autolabel.py --preview` | `data/labels/`, `data/preview/` |
-| 3. dataset | `uv run scripts/03_build_dataset.py` | `data/yolo/` split by video (val = sessions `131416`, `131458`, `131840`) |
+| 3. dataset | `uv run scripts/03_build_dataset.py` | `data/yolo/` split by video (val = sessions `20261010_131416`, `_131458`, `_131840`, `20261011_083825`) |
 | 4. train | `uv run scripts/04_train.py` | `runs/apple_yolov8s/weights/best.pt` |
 | 4b. round-2 labels | `uv run scripts/07_refine_labels.py --preview`, then 3 + 4 with `--labels data/labels_r2` / `--name apple_yolov8s_r2` | `data/labels_r2/`, `runs/apple_yolov8s_r2/` |
 | 5. export | `uv run scripts/05_export_hailo.py` | `export/apple_yolov8s.onnx` + `export/calib/` |
@@ -42,13 +42,16 @@ YoloTraining/
 | check | `uv run scripts/06_predict_video.py data/videos/<clip>.mp4` | annotated mp4 in `runs/` |
 | check | `scripts/08_compare_hef.py` (instructions in its docstring) | HEF-on-Hailo vs PyTorch accuracy |
 
-## Staged, not trained yet: 2026-10-11 (morning light, new layouts)
+## 2026-10-11 data (morning light, new layouts) - merged, fine-tuned
 `data/videos_20261011/` (6 takes, 1536x864 @ 60 + sensor CSVs + live map logs) went through steps 1, 2
-and 4b into `data/staging_20261011/` (`frames/` 995 deduplicated driving frames, `labels/` Grounding
-DINO 18003 boxes, `labels_r2/` + 555 boxes from the current model, `preview*/`); kept out of `data/frames`
-so the training set is unchanged until it is merged: copy `frames/*` -> `data/frames/` and
-`labels_r2/*` -> `data/labels_r2/`, then steps 3 + 4 (pick a 20261011 take for val, e.g. `083825`).
-Steps 02 / 07 now write their previews next to their `--labels` / `--out` folder.
+and 4b in `data/staging_20261011/` (995 frames, 18003 DINO boxes + 555 round-2 boxes), then was copied
+into `data/frames`, `data/labels`, `data/labels_r2` (3966 frames total). `083825` joined the val set.
+Fine-tuned from the r2 model instead of COCO (60 epochs, SGD lr0=0.002, ~92 s/epoch, 1.5 h):
+```
+uv run scripts/03_build_dataset.py --labels data/labels_r2
+uv run scripts/04_train.py --model runs/apple_yolov8s_r2/weights/best.pt --finetune --epochs 60 --name apple_yolov8s_r3
+```
+Further takes: stage them the same way, merge, and fine-tune from the newest `best.pt`.
 
 ## Labeling notes
 - Grounding DINO base (`IDEA-Research/grounding-dino-base`), prompt
@@ -72,6 +75,19 @@ Held-out sessions `131416` + `131458` + `131840` (441 frames, 7826 apples, never
 |---|---|---|---|---|
 | round 1 (`runs/apple_yolov8s`, DINO labels) | 0.994 | 0.918 | 0.983 | 0.986 |
 | final (`runs/apple_yolov8s_r2`, round-2 labels) | 0.994 | 0.920 | 0.991 | 0.986 |
+
+2026-10-11 fine-tune (`runs/apple_yolov8s_r3`, best epoch 44/60), 960x544, val = the 3 sessions above + `20261011_083825`
+(577 frames, 10637 apples; `083825` labels_r2 partly come from r2, so r2 is a little favoured on it):
+
+| | val set | mAP50 | mAP50-95 | P | R |
+|---|---|---|---|---|---|
+| r2 | all 4 sessions | 0.994 | 0.917 | 0.989 | 0.983 |
+| r3 | all 4 sessions | 0.994 | 0.918 | 0.989 | 0.984 |
+| r2 | `083825` only (136 frames) | 0.992 | 0.906 | 0.987 | 0.972 |
+| r3 | `083825` only | 0.993 | 0.912 | 0.986 | 0.977 |
+
+r3 is deployed (2026-10-11) as `models/apple_yolov8s.hef` (`hailortcli run` 145.4 FPS); r2 kept as
+`models/apple_yolov8s_r2_20261010.hef` on the car and `export/old_20261010_apple_yolov8s.hef` here.
 
 | HEF int8 on the car's Hailo-8 (AP50 / P / R at 0.35, `08_compare_hef.py`) | 0.9885 | | 0.980 | 0.991 |
 | PyTorch fp32, same matcher | 0.9893 | | 0.982 | 0.991 |
